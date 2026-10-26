@@ -15,13 +15,21 @@ pub fn constant_time_eq(a: &str, b: &str) -> bool {
         == 0
 }
 
+/// The key a request carries: `Authorization: Bearer <key>`, or
+/// `X-API-Key: <key>`.
+///
+/// The scheme is matched ignoring case, as RFC 9110 says it is and as
+/// mapi-lite matches it (CS-623): `bearer <key>` used to be refused (CS-663).
+/// The key itself is compared exactly.
 pub fn extract_api_key(req: &HttpRequest) -> Option<String> {
     if let Some(auth_header) = req.headers().get(header::AUTHORIZATION) {
         if let Ok(auth_str) = auth_header.to_str() {
-            if let Some(token) = auth_str.strip_prefix(BEARER_PREFIX) {
-                if !token.is_empty() {
-                    return Some(token.to_string());
-                }
+            let token = auth_str
+                .split_once(' ')
+                .filter(|(scheme, _)| scheme.eq_ignore_ascii_case(BEARER_PREFIX.trim_end()))
+                .map(|(_, token)| token);
+            if let Some(token) = token.filter(|t| !t.is_empty()) {
+                return Some(token.to_string());
             }
         }
     }
@@ -100,6 +108,24 @@ mod tests {
             .insert_header(("Authorization", format!("{BEARER_PREFIX}secret")))
             .to_http_request();
         assert_eq!(extract_api_key(&req).as_deref(), Some("secret"));
+    }
+
+    /// CS-663: the scheme in any case is Bearer (RFC 9110); another scheme,
+    /// or none, carries no key.
+    #[actix_web::test]
+    async fn extract_api_key_matches_the_scheme_ignoring_case() {
+        for scheme in ["Bearer", "bearer", "BEARER", "bEaReR"] {
+            let req = test::TestRequest::get()
+                .insert_header(("Authorization", format!("{scheme} secret")))
+                .to_http_request();
+            assert_eq!(extract_api_key(&req).as_deref(), Some("secret"), "{scheme}");
+        }
+        for value in ["Basic secret", "Bearersecret", "secret", "Bearer "] {
+            let req = test::TestRequest::get()
+                .insert_header(("Authorization", value))
+                .to_http_request();
+            assert_eq!(extract_api_key(&req), None, "{value}");
+        }
     }
 
     #[actix_web::test]
