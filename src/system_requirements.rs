@@ -447,6 +447,20 @@ mod tests {
         assert!(workflow.contains("persist-credentials: false"));
     }
 
+    /// The image is built and pushed for a version bump only: a `vX.Y.Z`
+    /// tag, never a pull request or a push to a branch (CS-606).
+    #[test]
+    fn sr_sec_028_the_image_job_runs_on_release_tags_only() {
+        let workflow = workflow();
+        let image = &workflow[workflow.find("\n  image:\n").expect("the image job")..];
+        let condition = image
+            .lines()
+            .map(str::trim)
+            .find(|l| l.starts_with("if:"))
+            .expect("the image job's condition");
+        assert_eq!(condition, "if: startsWith(github.ref, 'refs/tags/v')");
+    }
+
     /// The audit installer is third-party code: it runs before the deploy
     /// key is in the agent, not after.
     #[test]
