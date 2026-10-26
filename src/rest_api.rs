@@ -612,7 +612,11 @@ fn replay(outcome: Outcome) -> HttpResponse {
 /// mapi-lite `503`, or a refusal the node said was worth retrying -- because
 /// every failure that may have delivered it is `broadcast_outcome_unknown`.
 /// Its documented advice is "retry may succeed", and holding the key made
-/// that retry impossible with the same key.
+/// that retry impossible with the same key. `broadcaster_untrusted` is refused
+/// before anything is sent (CS-618), so it spent nothing either; holding the
+/// key and the hold meant that, once an operator fixed mapi-lite's key, the
+/// retry was refused `key_in_progress` for the key's TTL and the amount counted
+/// against the client's window for its whole period (CS-660).
 ///
 /// Everything else is left to expire. `broadcast_outcome_unknown` is unknown
 /// by definition, and a commit failure means the transaction is definitely on
@@ -631,6 +635,7 @@ async fn release_if_nothing_was_spent(
             | ErrorCode::FundsInFlight
             | ErrorCode::BroadcastRejected
             | ErrorCode::BroadcastFailed
+            | ErrorCode::BroadcasterUntrusted
     );
     if certainly_pre_broadcast {
         if let Some((key, _)) = record {
@@ -2857,6 +2862,61 @@ mod tests {
             let json: Value = test::read_body_json(resp).await;
             assert_eq!(json["code"], "broadcast_failed");
         }
+    }
+
+    /// An app whose broadcaster is untrusted for the first funding and accepts
+    /// after, as when an operator fixes mapi-lite's key (CS-660).
+    async fn build_app_untrusted_once(
+        config: &Config,
+    ) -> impl ActixService<Request, Response = ServiceResponse, Error = Error> {
+        use crate::broadcaster::BroadcastError;
+        let blockchain = test_blockchain_interface(config).await;
+        let broadcaster = crate::test_support::ScriptedBroadcaster::new(vec![
+            Some(BroadcastError::Untrusted(
+                "mapi-lite signs with 02ab…, which [mapi_lite] miner_id_public_keys does not list"
+                    .to_string(),
+            )),
+            None,
+        ]);
+        build_app_over(config, blockchain, broadcaster).await.0
+    }
+
+    /// CS-660: `broadcaster_untrusted` sends nothing (CS-618), so the
+    /// `idempotency_key` is free: once mapi-lite is trusted again the same
+    /// request, key and all, is funded. It used to be refused
+    /// `key_in_progress` for the key's TTL.
+    #[actix_web::test]
+    async fn cs_660_an_untrusted_broadcaster_releases_the_idempotency_key() {
+        let app = build_app_untrusted_once(&test_config(&unique_dynamic_config_path())).await;
+        let mut body = fund_body(TEST_CLIENT_ID, 150, 1, LOCKING_SCRIPT_HEX);
+        body["idempotency_key"] = json!("untrusted-1");
+
+        let (http, json) = post_fund(&app, body.clone()).await;
+        assert_eq!(http, StatusCode::SERVICE_UNAVAILABLE, "{json}");
+        assert_eq!(json["code"], "broadcaster_untrusted");
+
+        let (http, json) = post_fund(&app, body.clone()).await;
+        assert_eq!(http, StatusCode::OK, "{json}");
+        assert_ne!(json["replayed"], json!(true), "{json}");
+    }
+
+    /// CS-660: nor does it count against `[funding_limits]`. It used to stay
+    /// held for the whole period: with a limit of 200, a second 150 was over
+    /// it.
+    #[actix_web::test]
+    async fn cs_660_an_untrusted_broadcaster_releases_the_funding_limit_hold() {
+        let mut config = test_config(&unique_dynamic_config_path());
+        config.funding_limits.max_satoshis_per_period = Some(200);
+        let app = build_app_untrusted_once(&config).await;
+
+        let (http, json) =
+            post_fund(&app, fund_body(TEST_CLIENT_ID, 150, 1, LOCKING_SCRIPT_HEX)).await;
+        assert_eq!(http, StatusCode::SERVICE_UNAVAILABLE, "{json}");
+        assert_eq!(json["code"], "broadcaster_untrusted");
+
+        let (http, json) =
+            post_fund(&app, fund_body(TEST_CLIENT_ID, 150, 1, LOCKING_SCRIPT_HEX)).await;
+        assert_eq!(http, StatusCode::OK, "{json}");
     }
 
     /// The reservation is not released for an outcome that might have spent
