@@ -53,6 +53,31 @@ pub async fn authorize_client(
     }
 }
 
+/// [`authorize_client`] for a `client_id` that may not exist, answering
+/// `unknown` for one that does not only where it gives nothing away.
+///
+/// Checking the id first answered an anonymous caller 401 for a real client
+/// and 404 for an unknown one, so anyone could find out which client ids
+/// exist (CS-661). Once any client has an API key, an unknown id is answered
+/// exactly as a missing or wrong key is: there is no key it could match. With
+/// no client keys at all nothing is authenticated, nothing is hidden, and
+/// `unknown_client` is the more useful answer.
+pub async fn authorize_known_client(
+    req: &HttpRequest,
+    client_id: &str,
+    service: &Service,
+    unknown: impl FnOnce() -> HttpResponse,
+) -> Option<HttpResponse> {
+    if service.is_client_id_valid(client_id).await {
+        return authorize_client(req, client_id, service).await;
+    }
+    Some(if service.any_client_has_api_key().await {
+        unauthorized_response()
+    } else {
+        unknown()
+    })
+}
+
 /// Returns `Some(HttpResponse)` when the admin request is unauthorized.
 pub fn authorize_admin(req: &HttpRequest, service: &Service) -> Option<HttpResponse> {
     if !service.admin_auth_required() {
