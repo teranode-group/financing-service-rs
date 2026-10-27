@@ -41,12 +41,13 @@ actix-governor = "0.10.0"
 # to the system git). They MUST name the same rev, and that rev's chain-gang
 # requirement must be satisfiable by the chain-gang line above, or the graph
 # carries two chain-gangs and their types stop unifying. This is the commit
-# mapi-lite tagged v0.6.1, on chain-gang 0.13 -- pinned by rev, which unlike a
+# mapi-lite tagged v0.7.0, on chain-gang 0.13 -- pinned by rev, which unlike a
 # tag cannot move. v0.6.0 publishes the nodes' network in /ready (CS-624);
-# v0.6.1 reports a 4xx after a landed attempt as an unknown outcome (CS-637).
+# v0.6.1 reports a 4xx after a landed attempt as an unknown outcome (CS-637);
+# v0.7.0 reports unmined and stuck transactions, server-side (CS-640, CS-641).
 # See docs/Dependencies.md before changing it.
-uls-client = { git = "ssh://git@github.com/nchain-innovation/mapi-lite.git", rev = "454e9ca6b887e389c76f63906988f9988f2514ee" }
-uls-core = { git = "ssh://git@github.com/nchain-innovation/mapi-lite.git", rev = "454e9ca6b887e389c76f63906988f9988f2514ee" }
+uls-client = { git = "ssh://git@github.com/nchain-innovation/mapi-lite.git", rev = "e1a03cad02e7531764d0ec76f2390a56c2caccf5" }
+uls-core = { git = "ssh://git@github.com/nchain-innovation/mapi-lite.git", rev = "e1a03cad02e7531764d0ec76f2390a56c2caccf5" }
 # For the HTTP client the mapi-lite chain reader (mapi_lite_interface) hands
 # uls-client; the broadcaster uses uls-client's own timeouts (v0.5.0). Same
 # major.minor as mapi-lite's so one reqwest resolves; its TLS backend is
