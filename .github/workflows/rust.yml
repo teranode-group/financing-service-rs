@@ -96,29 +96,23 @@ jobs:
     - name: Run tests
       run: cargo test --verbose
 
-  # The container image (CS-606). Built for every pull request, so one that
-  # breaks the Dockerfile fails here, and pushed to ghcr.io only from main and
-  # from vX.Y.Z tags, once `build` has passed. A push to any other branch is
-  # already built by its pull request, so it skips this. Tagged :sha-<commit>
-  # always, :main from main, and :X.Y.Z and :latest from a release tag; the OCI
-  # labels name the source repository and commit.
+  # The container image (CS-606), built and pushed to ghcr.io only for a
+  # version bump: a vX.Y.Z tag, once `build` has passed. Pull requests and
+  # pushes to main build no image, so a change that breaks the Dockerfile shows
+  # at the next release, or in a local `./build.sh`. Tagged :X.Y.Z, :latest and
+  # :sha-<commit>; the OCI labels name the source repository and commit.
   image:
     name: container image
     needs: build
-    if: >-
-      github.event_name == 'pull_request' ||
-      github.ref == 'refs/heads/main' ||
-      startsWith(github.ref, 'refs/tags/v')
+    if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-26.04
-    # A release tag also builds arm64, under QEMU: several times slower.
-    timeout-minutes: ${{ startsWith(github.ref, 'refs/tags/v') && 180 || 45 }}
+    # amd64 and arm64, arm64 under QEMU: several times slower.
+    timeout-minutes: 180
     # The one write permission in this workflow (SR-SEC-028), and only this
-    # job's: nothing is pushed from a pull request.
+    # job's, which runs on release tags alone.
     permissions:
       contents: read  # for actions/checkout
       packages: write  # to push to ghcr.io
-    env:
-      PUBLISH: ${{ github.event_name == 'push' }}
     steps:
     - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       with:
@@ -131,11 +125,8 @@ jobs:
       uses: webfactory/ssh-agent@e83874834305fe9a4a2997156cb26c5de65a8555 # v0.10.0
       with:
         ssh-private-key: ${{ secrets.MAPI_LITE_DEPLOY_KEY }}
-    # Release tags publish amd64 and arm64, as multi-build.sh does. arm64 is
-    # emulated, so only a tag builds it; pull requests and main build amd64
-    # alone, natively.
+    # amd64 and arm64, as multi-build.sh publishes. arm64 is emulated.
     - name: Set up QEMU for arm64
-      if: startsWith(github.ref, 'refs/tags/v')
       uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
       with:
         platforms: arm64
@@ -145,27 +136,24 @@ jobs:
       uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
       with:
         images: ghcr.io/${{ github.repository }}
-        # :latest only from a release tag, never from main.
         flavor: latest=false
         tags: |
           type=sha
-          type=ref,event=branch
           type=semver,pattern={{version}}
-          type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/v') }}
+          type=raw,value=latest
     - name: Log in to ghcr.io
-      if: env.PUBLISH == 'true'
       uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
       with:
         registry: ghcr.io
         username: ${{ github.actor }}
         password: ${{ secrets.GITHUB_TOKEN }}
-    - name: Build, and push from main or a release tag
+    - name: Build and push
       uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
       with:
         context: .
         ssh: default
-        platforms: ${{ startsWith(github.ref, 'refs/tags/v') && 'linux/amd64,linux/arm64' || 'linux/amd64' }}
-        push: ${{ env.PUBLISH == 'true' }}
+        platforms: linux/amd64,linux/arm64
+        push: true
         tags: ${{ steps.meta.outputs.tags }}
         labels: ${{ steps.meta.outputs.labels }}
         cache-from: type=gha
