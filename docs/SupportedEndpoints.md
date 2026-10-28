@@ -256,13 +256,13 @@ The status is derived from the code, so a caller that cannot read the body — a
 | `insufficient_balance` | 409 | The balance cannot cover the request once fees are paid, however the UTXOs were arranged | Top the wallet up; the description gives the ceiling |
 | `no_suitable_utxo` | 409 | The balance would cover it, but not split the way it is — spending the extra UTXOs costs more in fees than they add | Consolidate the wallet's UTXOs; the description gives both limits |
 | `funds_in_flight` | 503 | Every UTXO that could fund the request is claimed by funding requests still being broadcast, and the change they return will cover it | **Retry unchanged** after `Retry-After` (1 second) — see below |
-| `unknown_client` | 404 / 400 | No such `client_id`. 404 where the id is a path segment, 400 where it is a body field | Fix configuration; never retryable as-is |
+| `unknown_client` | 404 / 400 | No such `client_id`. 404 where the id is a path segment, 400 where it is a body field. Only while no client has an API key: once any does, an unknown `client_id` is `401 unauthorized`, the same answer as a missing or wrong key, so the id of a client with a key cannot be discovered without that key; the service log names the unknown id at `info` (CS-661) | Fix configuration; never retryable as-is |
 | `client_exists` | 409 | `client_id` is already configured | `POST /client` only |
 | `invalid_request` | 400 | The request is malformed | Fix the request; never retryable unchanged |
 | `broadcast_failed` | 502 | The transaction certainly did not reach a node: the upstream could not be reached, answered that no node can have received it, or refused it in a way it said was worth retrying. Anything that may have landed is `broadcast_outcome_unknown` instead (CS-501) | Nothing was spent; retry may succeed, with the same `idempotency_key` |
 | `broadcast_rejected` | 409 | The upstream looked at the transaction and refused it finally — either because it said so, or because it named a conflicting transaction | Nothing was spent, and **retrying will not help** — see below |
 | `broadcast_outcome_unknown` | 504 | The transaction was handed over and its fate is unknown — it may be on the network | **Do not retry with a new `idempotency_key`**; see below |
-| `broadcaster_untrusted` | 503 | Nothing was sent: the broadcaster (mapi-lite) signs with a key `[mapi_lite] miner_id_public_keys` does not list, so its answers cannot be believed (CS-618). `GET /ready` reports the same | Nothing was spent. Retrying cannot help until an operator fixes the key list or mapi-lite's key |
+| `broadcaster_untrusted` | 503 | Nothing was sent: the broadcaster (mapi-lite) signs with a key `[mapi_lite] miner_id_public_keys` does not list, so its answers cannot be believed (CS-618). `GET /ready` reports the same | Nothing was spent, so the `idempotency_key` is released and the amount does not count against `[funding_limits]` (CS-660). Retrying cannot help until an operator fixes the key list or mapi-lite's key; then the same request, key and all, is funded |
 | `partial_broadcast` | 422 | Some of the requested transactions broadcast, some did not | **Read the body** — the successful ones are in it |
 | `chain_unavailable` | 503 | The blockchain interface could not be reached. The description is fixed; the read's own error, which names the interface's address, is in the service log | Retryable |
 | `internal` | 500 | Unexpected internal failure | Report it |
@@ -307,7 +307,7 @@ A caller that needs to know what happened should look at the chain for the trans
 Examples:
 
 * Unauthorized — `{"code": "unauthorized", "description": "Unauthorized"}` (missing or invalid `api_key` for the client)
-* Unknown client — `{"code": "unknown_client", "description": "Unknown client_id client1"}`
+* Unknown client — `{"code": "unknown_client", "description": "Unknown client_id client1"}`, only while no client has an API key; otherwise the Unauthorized answer above (CS-661)
 * Insufficient total balance — `{"code": "insufficient_balance", "description": "Insufficient client balance: 480 satoshi requested, but of the 1230 satoshi available at most 479 can be paid out once fees are covered."}`
 * No suitable UTXO set — `{"code": "no_suitable_utxo", "description": "Unable to fund 470 satoshi from this UTXO set: at most 379 can be paid out, because spending more of these 7 UTXOs costs more in fees than the inputs are worth. The balance of 1230 satoshi would support up to 479 if it were consolidated into one UTXO."}`
 

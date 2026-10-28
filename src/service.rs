@@ -1237,6 +1237,18 @@ impl Service {
         }
     }
 
+    /// Whether any client has an API key: whether this service authenticates
+    /// clients at all (CS-661).
+    pub async fn any_client_has_api_key(&self) -> bool {
+        let clients = self.clients.read().await;
+        for client in clients.values() {
+            if client.read().await.api_key().is_some() {
+                return true;
+            }
+        }
+        false
+    }
+
     pub async fn clients_without_api_key(&self) -> Vec<String> {
         let clients = self.clients.read().await;
         let mut without = Vec::new();

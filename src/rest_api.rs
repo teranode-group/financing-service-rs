@@ -5,7 +5,7 @@ use serde::Deserialize;
 use std::sync::Arc;
 
 use crate::{
-    auth::{authorize_admin, authorize_client},
+    auth::{authorize_admin, authorize_known_client},
     client::FundRequest,
     client::MAX_SATOSHIS,
     config::ClientConfig,
@@ -269,17 +269,19 @@ async fn fund(
     // built (CS-519). Expanding the scripts first let an anonymous caller ask
     // for `no_of_outpoints` copies of a script -- 2^32 of them -- and the
     // allocation killed the process before the API key was ever looked at.
-    if !data.service.is_client_id_valid(client_id).await {
+    // An unknown client_id is a 401 like a wrong key wherever clients have
+    // keys, so it cannot be told from a real one (CS-661).
+    let unknown = || {
         // 400 rather than the code's default 404: the client_id arrives in the
         // request body, so this is a malformed request, not a missing
         // resource. A 404 here would read as "/fund does not exist".
-        return error_response_with_status(
+        error_response_with_status(
             StatusCode::BAD_REQUEST,
             ErrorCode::UnknownClient,
             format!("Unknown client_id {client_id}"),
-        );
-    }
-    if let Some(response) = authorize_client(&req, client_id, &data.service).await {
+        )
+    };
+    if let Some(response) = authorize_known_client(&req, client_id, &data.service, unknown).await {
         return response;
     }
 
@@ -612,7 +614,11 @@ fn replay(outcome: Outcome) -> HttpResponse {
 /// mapi-lite `503`, or a refusal the node said was worth retrying -- because
 /// every failure that may have delivered it is `broadcast_outcome_unknown`.
 /// Its documented advice is "retry may succeed", and holding the key made
-/// that retry impossible with the same key.
+/// that retry impossible with the same key. `broadcaster_untrusted` is refused
+/// before anything is sent (CS-618), so it spent nothing either; holding the
+/// key and the funding-limit hold meant that, once an operator fixed mapi-lite's key, the
+/// retry was refused `key_in_progress` for the key's TTL and the amount counted
+/// against the client's window for its whole period (CS-660).
 ///
 /// Everything else is left to expire. `broadcast_outcome_unknown` is unknown
 /// by definition, and a commit failure means the transaction is definitely on
@@ -631,6 +637,7 @@ async fn release_if_nothing_was_spent(
             | ErrorCode::FundsInFlight
             | ErrorCode::BroadcastRejected
             | ErrorCode::BroadcastFailed
+            | ErrorCode::BroadcasterUntrusted
     );
     if certainly_pre_broadcast {
         if let Some((key, _)) = record {
@@ -695,13 +702,15 @@ pub async fn delete_client(
     let client_id: String = info.to_string();
     log::info!("delete_client {}", client_id);
 
-    if !data.service.is_client_id_valid(&client_id).await {
-        return error_response(
+    // An unknown client_id is a 401 like a wrong key wherever clients have
+    // keys, so it cannot be told from a real one (CS-661).
+    let unknown = || {
+        error_response(
             ErrorCode::UnknownClient,
             format!("Unknown client_id {client_id}"),
-        );
-    }
-    if let Some(response) = authorize_client(&req, &client_id, &data.service).await {
+        )
+    };
+    if let Some(response) = authorize_known_client(&req, &client_id, &data.service, unknown).await {
         return response;
     }
 
@@ -721,13 +730,15 @@ pub async fn get_address(
     let client_id: String = info.to_string();
     log::info!("get address {}", client_id);
 
-    if !data.service.is_client_id_valid(&client_id).await {
-        return error_response(
+    // An unknown client_id is a 401 like a wrong key wherever clients have
+    // keys, so it cannot be told from a real one (CS-661).
+    let unknown = || {
+        error_response(
             ErrorCode::UnknownClient,
             format!("Unknown client_id {client_id}"),
-        );
-    }
-    if let Some(response) = authorize_client(&req, &client_id, &data.service).await {
+        )
+    };
+    if let Some(response) = authorize_known_client(&req, &client_id, &data.service, unknown).await {
         return response;
     }
 
@@ -750,13 +761,15 @@ pub async fn balance(
     let client_id: String = info.to_string();
     log::info!("get balance {}", client_id);
 
-    if !data.service.is_client_id_valid(&client_id).await {
-        return error_response(
+    // An unknown client_id is a 401 like a wrong key wherever clients have
+    // keys, so it cannot be told from a real one (CS-661).
+    let unknown = || {
+        error_response(
             ErrorCode::UnknownClient,
             format!("Unknown client_id {client_id}"),
-        );
-    }
-    if let Some(response) = authorize_client(&req, &client_id, &data.service).await {
+        )
+    };
+    if let Some(response) = authorize_known_client(&req, &client_id, &data.service, unknown).await {
         return response;
     }
 
@@ -2416,6 +2429,61 @@ mod tests {
         assert_eq!(body["description"], "Unauthorized");
     }
 
+    /// One of the four client routes, for `client_id`, with `key` if any.
+    fn client_route_request(route: &str, client_id: &str, key: Option<&str>) -> Request {
+        let request = match route {
+            "balance" => test::TestRequest::get().uri(&format!("/client/{client_id}/balance")),
+            "address" => test::TestRequest::get().uri(&format!("/client/{client_id}/address")),
+            "delete" => test::TestRequest::delete().uri(&format!("/client/{client_id}")),
+            "fund" => test::TestRequest::post().uri("/fund").set_json(fund_body(
+                client_id,
+                123,
+                1,
+                LOCKING_SCRIPT_HEX,
+            )),
+            other => panic!("no route {other}"),
+        };
+        match key {
+            Some(key) => request.insert_header(("X-API-Key", key)).to_request(),
+            None => request.to_request(),
+        }
+    }
+
+    /// CS-661: with client keys in use, an unknown `client_id` is answered
+    /// exactly as a real one with a missing or wrong key, on every route that
+    /// takes one, so a caller cannot tell which ids exist. It used to be 404
+    /// (400 on `/fund`) where a real one was 401. A real client's own key does
+    /// not open an unknown id either.
+    #[actix_web::test]
+    async fn cs_661_an_unknown_client_id_is_answered_like_a_wrong_key() {
+        let (app, _service) = build_app_with_service(test_config_with_keys(
+            &unique_dynamic_config_path(),
+            Some(TEST_API_KEY),
+            None,
+        ))
+        .await;
+        let unauthorized = json!({"code": "unauthorized", "description": "Unauthorized"});
+
+        for route in ["balance", "address", "delete", "fund"] {
+            for key in [None, Some("wrong-key"), Some(TEST_API_KEY)] {
+                let resp =
+                    test::call_service(&app, client_route_request(route, "no-such-client", key))
+                        .await;
+                assert_eq!(resp.status(), StatusCode::UNAUTHORIZED, "{route} {key:?}");
+                let body: Value = test::read_body_json(resp).await;
+                assert_eq!(body, unauthorized, "{route} {key:?}");
+            }
+            for key in [None, Some("wrong-key")] {
+                let resp =
+                    test::call_service(&app, client_route_request(route, TEST_CLIENT_ID, key))
+                        .await;
+                assert_eq!(resp.status(), StatusCode::UNAUTHORIZED, "{route} {key:?}");
+                let body: Value = test::read_body_json(resp).await;
+                assert_eq!(body, unauthorized, "{route} {key:?}");
+            }
+        }
+    }
+
     #[actix_web::test]
     async fn sr_sec_010_invalid_wif_error_does_not_echo_secret() {
         let secret_wif = "cSecretWifValueThatMustNotAppearInErrors123456789";
@@ -2550,9 +2618,11 @@ mod tests {
         assert_eq!(http, StatusCode::UNAUTHORIZED);
         assert_eq!(code, "unauthorized");
 
+        // With client keys in use, an unknown client is the same 401, so it
+        // cannot be told from a real one (CS-661).
         let (http, code) = fund_code(&app, huge("no-such-client"), None).await;
-        assert_eq!(http, StatusCode::BAD_REQUEST);
-        assert_eq!(code, "unknown_client");
+        assert_eq!(http, StatusCode::UNAUTHORIZED);
+        assert_eq!(code, "unauthorized");
 
         // And authenticated, the count is refused without being built.
         let (http, code) = fund_code(&app, huge(TEST_CLIENT_ID), Some(TEST_API_KEY)).await;
@@ -2857,6 +2927,106 @@ mod tests {
             let json: Value = test::read_body_json(resp).await;
             assert_eq!(json["code"], "broadcast_failed");
         }
+    }
+
+    /// An app whose broadcaster is untrusted for the first funding and accepts
+    /// after, as when an operator fixes mapi-lite's key (CS-660).
+    async fn build_app_untrusted_once(
+        config: &Config,
+    ) -> impl ActixService<Request, Response = ServiceResponse, Error = Error> {
+        use crate::broadcaster::BroadcastError;
+        let blockchain = test_blockchain_interface(config).await;
+        let broadcaster = crate::test_support::ScriptedBroadcaster::new(vec![
+            Some(BroadcastError::Untrusted(
+                "mapi-lite signs with 02ab…, which [mapi_lite] miner_id_public_keys does not list"
+                    .to_string(),
+            )),
+            None,
+        ]);
+        build_app_over(config, blockchain, broadcaster).await.0
+    }
+
+    /// CS-660: `broadcaster_untrusted` sends nothing (CS-618), so the
+    /// `idempotency_key` is free: once mapi-lite is trusted again the same
+    /// request, key and all, is funded. It used to be refused
+    /// `key_in_progress` for the key's TTL.
+    #[actix_web::test]
+    async fn cs_660_an_untrusted_broadcaster_releases_the_idempotency_key() {
+        let app = build_app_untrusted_once(&test_config(&unique_dynamic_config_path())).await;
+        let mut body = fund_body(TEST_CLIENT_ID, 150, 1, LOCKING_SCRIPT_HEX);
+        body["idempotency_key"] = json!("untrusted-1");
+
+        let (http, json) = post_fund(&app, body.clone()).await;
+        assert_eq!(http, StatusCode::SERVICE_UNAVAILABLE, "{json}");
+        assert_eq!(json["code"], "broadcaster_untrusted");
+
+        let (http, json) = post_fund(&app, body.clone()).await;
+        assert_eq!(http, StatusCode::OK, "{json}");
+        assert_ne!(json["replayed"], json!(true), "{json}");
+    }
+
+    /// CS-660: nor does it count against `[funding_limits]`. It used to stay
+    /// held for the whole period: with a limit of 200, a second 150 was over
+    /// it.
+    #[actix_web::test]
+    async fn cs_660_an_untrusted_broadcaster_releases_the_funding_limit_hold() {
+        let mut config = test_config(&unique_dynamic_config_path());
+        config.funding_limits.max_satoshis_per_period = Some(200);
+        let app = build_app_untrusted_once(&config).await;
+
+        let (http, json) =
+            post_fund(&app, fund_body(TEST_CLIENT_ID, 150, 1, LOCKING_SCRIPT_HEX)).await;
+        assert_eq!(http, StatusCode::SERVICE_UNAVAILABLE, "{json}");
+        assert_eq!(json["code"], "broadcaster_untrusted");
+
+        let (http, json) =
+            post_fund(&app, fund_body(TEST_CLIENT_ID, 150, 1, LOCKING_SCRIPT_HEX)).await;
+        assert_eq!(http, StatusCode::OK, "{json}");
+    }
+
+    /// CS-660: with `multiple_tx`, an untrusted broadcaster after the first
+    /// transaction went out is `partial_broadcast`, not `broadcaster_untrusted`,
+    /// so the key is kept and a resend is answered with what happened. Only the
+    /// all-or-nothing code releases it; were a mid-batch untrusted reported as
+    /// `broadcaster_untrusted`, the resend would fund the first output twice.
+    #[actix_web::test]
+    async fn cs_660_an_untrusted_broadcaster_mid_batch_keeps_the_idempotency_key() {
+        use crate::broadcaster::BroadcastError;
+        let config = test_config(&unique_dynamic_config_path());
+        let blockchain = test_blockchain_interface(&config).await;
+        // A third answer accepts, so a resend that funded again would succeed
+        // and show up in `sent`.
+        let broadcaster = crate::test_support::ScriptedBroadcaster::new(vec![
+            None,
+            Some(BroadcastError::Untrusted(
+                "mapi-lite signs with 02ab…, which [mapi_lite] miner_id_public_keys does not list"
+                    .to_string(),
+            )),
+            None,
+            None,
+        ]);
+        let (app, _service) = build_app_over(&config, blockchain, broadcaster.clone()).await;
+        let body = json!({
+            "client_id": TEST_CLIENT_ID,
+            "satoshi": 150,
+            "no_of_outpoints": 2,
+            "multiple_tx": true,
+            "locking_script": LOCKING_SCRIPT_HEX,
+            "idempotency_key": "untrusted-mid-batch",
+        });
+
+        let (http, json) = post_fund(&app, body.clone()).await;
+        assert_eq!(http, StatusCode::UNPROCESSABLE_ENTITY, "{json}");
+        assert_eq!(json["code"], "partial_broadcast");
+        assert_eq!(json["outpoints"].as_array().unwrap().len(), 1, "{json}");
+        let sent = broadcaster.sent().len();
+
+        let (http, replayed) = post_fund(&app, body).await;
+        assert_eq!(http, StatusCode::UNPROCESSABLE_ENTITY, "{replayed}");
+        assert_eq!(replayed["code"], "partial_broadcast");
+        assert_eq!(replayed["replayed"], json!(true), "{replayed}");
+        assert_eq!(replayed["outpoints"], json["outpoints"]);
+        assert_eq!(broadcaster.sent().len(), sent, "the resend broadcast again");
     }
 
     /// The reservation is not released for an outcome that might have spent
