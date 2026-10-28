@@ -1,6 +1,6 @@
 # Project status
 
-High-level status and known limitations for the Financing Service Rust implementation (v5.0.1).
+High-level status and known limitations for the Financing Service Rust implementation (v5.1.0).
 
 For API details see [SupportedEndpoints.md](SupportedEndpoints.md). For configuration see [Configuration.md](Configuration.md). For build and test instructions see [Development.md](Development.md).
 
