@@ -551,7 +551,7 @@ api_key = "your-client-secret"
 * `wif_key` — WIF private key for the client's funding wallet. It must be a key for `blockchain_interface.network` (CS-634): a mainnet key on mainnet, a test-network key on testnet, regtest or STN, which share a WIF version. A key for the other network stops startup, naming the client and both networks, and `POST /client` refuses one with HTTP 400 `invalid_request`. Its address would be on the other network, so its wallet would read empty and every funding would fail.
 * `api_key` — optional shared secret for this client's API endpoints
 
-When `api_key` is set for a client, requests for that client must include either `Authorization: Bearer <api_key>` (the scheme in any case, `bearer` too: CS-663) or `X-API-Key: <api_key>`. Clients without an `api_key` remain unauthenticated; restrict them via network isolation. The service logs a warning at startup listing clients without an `api_key`.
+When `api_key` is set for a client, requests for that client must include either `Authorization: Bearer <api_key>` (the scheme in any case, `bearer` too: CS-663) or `X-API-Key: <api_key>`. A request carrying both is judged on the Bearer key alone, so a proxy that adds its own `Authorization: Bearer` header, in any case, replaces the caller's `X-API-Key`. Clients without an `api_key` remain unauthenticated; restrict them via network isolation. The service logs a warning at startup listing clients without an `api_key`.
 
 ## Secret management
 

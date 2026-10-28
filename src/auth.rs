@@ -2,7 +2,7 @@ use actix_web::{http::header, HttpRequest, HttpResponse};
 
 use crate::{responses::unauthorized_response, service::Service};
 
-const BEARER_PREFIX: &str = "Bearer ";
+const BEARER_SCHEME: &str = "Bearer";
 const API_KEY_HEADER: &str = "X-API-Key";
 
 pub fn constant_time_eq(a: &str, b: &str) -> bool {
@@ -20,14 +20,18 @@ pub fn constant_time_eq(a: &str, b: &str) -> bool {
 ///
 /// The scheme is matched ignoring case, as RFC 9110 says it is and as
 /// mapi-lite matches it (CS-623): `bearer <key>` used to be refused (CS-663).
-/// The key itself is compared exactly.
+/// Any number of spaces may follow it (RFC 9110's `1*SP`); a key cannot
+/// contain one. The key itself is compared exactly.
+///
+/// A Bearer `Authorization` header is read first, so it wins over
+/// `X-API-Key`: a request carrying both is judged on the Bearer key alone.
 pub fn extract_api_key(req: &HttpRequest) -> Option<String> {
     if let Some(auth_header) = req.headers().get(header::AUTHORIZATION) {
         if let Ok(auth_str) = auth_header.to_str() {
             let token = auth_str
                 .split_once(' ')
-                .filter(|(scheme, _)| scheme.eq_ignore_ascii_case(BEARER_PREFIX.trim_end()))
-                .map(|(_, token)| token);
+                .filter(|(scheme, _)| scheme.eq_ignore_ascii_case(BEARER_SCHEME))
+                .map(|(_, token)| token.trim_start_matches(' '));
             if let Some(token) = token.filter(|t| !t.is_empty()) {
                 return Some(token.to_string());
             }
@@ -91,7 +95,7 @@ mod unit_tests {
 
 #[cfg(test)]
 mod tests {
-    use super::{authorize_admin, authorize_client, extract_api_key, BEARER_PREFIX};
+    use super::{authorize_admin, authorize_client, extract_api_key, BEARER_SCHEME};
     use actix_web::{http::StatusCode, test};
 
     use crate::{
@@ -105,13 +109,13 @@ mod tests {
     #[actix_web::test]
     async fn extract_api_key_from_bearer_header() {
         let req = test::TestRequest::get()
-            .insert_header(("Authorization", format!("{BEARER_PREFIX}secret")))
+            .insert_header(("Authorization", format!("{BEARER_SCHEME} secret")))
             .to_http_request();
         assert_eq!(extract_api_key(&req).as_deref(), Some("secret"));
     }
 
-    /// CS-663: the scheme in any case is Bearer (RFC 9110); another scheme,
-    /// or none, carries no key.
+    /// CS-663: the scheme in any case is Bearer (RFC 9110), followed by one
+    /// space or more; another scheme, or none, carries no key.
     #[actix_web::test]
     async fn extract_api_key_matches_the_scheme_ignoring_case() {
         for scheme in ["Bearer", "bearer", "BEARER", "bEaReR"] {
@@ -120,7 +124,19 @@ mod tests {
                 .to_http_request();
             assert_eq!(extract_api_key(&req).as_deref(), Some("secret"), "{scheme}");
         }
-        for value in ["Basic secret", "Bearersecret", "secret", "Bearer "] {
+        for value in ["Bearer  secret", "Bearer   secret"] {
+            let req = test::TestRequest::get()
+                .insert_header(("Authorization", value))
+                .to_http_request();
+            assert_eq!(extract_api_key(&req).as_deref(), Some("secret"), "{value}");
+        }
+        for value in [
+            "Basic secret",
+            "Bearersecret",
+            "secret",
+            "Bearer ",
+            "Bearer   ",
+        ] {
             let req = test::TestRequest::get()
                 .insert_header(("Authorization", value))
                 .to_http_request();
@@ -219,7 +235,7 @@ mod tests {
         let blockchain = test_blockchain_interface(&config).await;
         let service = Service::new_for_test(&config, blockchain).await;
         let req = test::TestRequest::get()
-            .insert_header(("Authorization", format!("{BEARER_PREFIX}admin-secret")))
+            .insert_header(("Authorization", format!("{BEARER_SCHEME} admin-secret")))
             .to_http_request();
 
         assert!(authorize_admin(&req, &service).is_none());
