@@ -62,6 +62,11 @@ pub async fn authorize_client(
 /// exactly as a missing or wrong key is: there is no key it could match. With
 /// no client keys at all nothing is authenticated, nothing is hidden, and
 /// `unknown_client` is the more useful answer.
+///
+/// The caller is told nothing, so the reason goes to the log: a mistyped
+/// `client_id` otherwise looks exactly like a wrong key from both sides. It
+/// is `info`, not `warn`, so someone probing for ids does not flood the log,
+/// and `{:?}` because the id is the caller's.
 pub async fn authorize_known_client(
     req: &HttpRequest,
     client_id: &str,
@@ -72,6 +77,7 @@ pub async fn authorize_known_client(
         return authorize_client(req, client_id, service).await;
     }
     Some(if service.any_client_has_api_key().await {
+        log::info!("unauthorized: unknown client_id {client_id:?}");
         unauthorized_response()
     } else {
         unknown()
