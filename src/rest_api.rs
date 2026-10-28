@@ -5,7 +5,7 @@ use serde::Deserialize;
 use std::sync::Arc;
 
 use crate::{
-    auth::{authorize_admin, authorize_client},
+    auth::{authorize_admin, authorize_known_client},
     client::FundRequest,
     client::MAX_SATOSHIS,
     config::ClientConfig,
@@ -269,17 +269,19 @@ async fn fund(
     // built (CS-519). Expanding the scripts first let an anonymous caller ask
     // for `no_of_outpoints` copies of a script -- 2^32 of them -- and the
     // allocation killed the process before the API key was ever looked at.
-    if !data.service.is_client_id_valid(client_id).await {
+    // An unknown client_id is a 401 like a wrong key wherever clients have
+    // keys, so it cannot be told from a real one (CS-661).
+    let unknown = || {
         // 400 rather than the code's default 404: the client_id arrives in the
         // request body, so this is a malformed request, not a missing
         // resource. A 404 here would read as "/fund does not exist".
-        return error_response_with_status(
+        error_response_with_status(
             StatusCode::BAD_REQUEST,
             ErrorCode::UnknownClient,
             format!("Unknown client_id {client_id}"),
-        );
-    }
-    if let Some(response) = authorize_client(&req, client_id, &data.service).await {
+        )
+    };
+    if let Some(response) = authorize_known_client(&req, client_id, &data.service, unknown).await {
         return response;
     }
 
@@ -700,13 +702,15 @@ pub async fn delete_client(
     let client_id: String = info.to_string();
     log::info!("delete_client {}", client_id);
 
-    if !data.service.is_client_id_valid(&client_id).await {
-        return error_response(
+    // An unknown client_id is a 401 like a wrong key wherever clients have
+    // keys, so it cannot be told from a real one (CS-661).
+    let unknown = || {
+        error_response(
             ErrorCode::UnknownClient,
             format!("Unknown client_id {client_id}"),
-        );
-    }
-    if let Some(response) = authorize_client(&req, &client_id, &data.service).await {
+        )
+    };
+    if let Some(response) = authorize_known_client(&req, &client_id, &data.service, unknown).await {
         return response;
     }
 
@@ -726,13 +730,15 @@ pub async fn get_address(
     let client_id: String = info.to_string();
     log::info!("get address {}", client_id);
 
-    if !data.service.is_client_id_valid(&client_id).await {
-        return error_response(
+    // An unknown client_id is a 401 like a wrong key wherever clients have
+    // keys, so it cannot be told from a real one (CS-661).
+    let unknown = || {
+        error_response(
             ErrorCode::UnknownClient,
             format!("Unknown client_id {client_id}"),
-        );
-    }
-    if let Some(response) = authorize_client(&req, &client_id, &data.service).await {
+        )
+    };
+    if let Some(response) = authorize_known_client(&req, &client_id, &data.service, unknown).await {
         return response;
     }
 
@@ -755,13 +761,15 @@ pub async fn balance(
     let client_id: String = info.to_string();
     log::info!("get balance {}", client_id);
 
-    if !data.service.is_client_id_valid(&client_id).await {
-        return error_response(
+    // An unknown client_id is a 401 like a wrong key wherever clients have
+    // keys, so it cannot be told from a real one (CS-661).
+    let unknown = || {
+        error_response(
             ErrorCode::UnknownClient,
             format!("Unknown client_id {client_id}"),
-        );
-    }
-    if let Some(response) = authorize_client(&req, &client_id, &data.service).await {
+        )
+    };
+    if let Some(response) = authorize_known_client(&req, &client_id, &data.service, unknown).await {
         return response;
     }
 
@@ -2421,6 +2429,61 @@ mod tests {
         assert_eq!(body["description"], "Unauthorized");
     }
 
+    /// One of the four client routes, for `client_id`, with `key` if any.
+    fn client_route_request(route: &str, client_id: &str, key: Option<&str>) -> Request {
+        let request = match route {
+            "balance" => test::TestRequest::get().uri(&format!("/client/{client_id}/balance")),
+            "address" => test::TestRequest::get().uri(&format!("/client/{client_id}/address")),
+            "delete" => test::TestRequest::delete().uri(&format!("/client/{client_id}")),
+            "fund" => test::TestRequest::post().uri("/fund").set_json(fund_body(
+                client_id,
+                123,
+                1,
+                LOCKING_SCRIPT_HEX,
+            )),
+            other => panic!("no route {other}"),
+        };
+        match key {
+            Some(key) => request.insert_header(("X-API-Key", key)).to_request(),
+            None => request.to_request(),
+        }
+    }
+
+    /// CS-661: with client keys in use, an unknown `client_id` is answered
+    /// exactly as a real one with a missing or wrong key, on every route that
+    /// takes one, so a caller cannot tell which ids exist. It used to be 404
+    /// (400 on `/fund`) where a real one was 401. A real client's own key does
+    /// not open an unknown id either.
+    #[actix_web::test]
+    async fn cs_661_an_unknown_client_id_is_answered_like_a_wrong_key() {
+        let (app, _service) = build_app_with_service(test_config_with_keys(
+            &unique_dynamic_config_path(),
+            Some(TEST_API_KEY),
+            None,
+        ))
+        .await;
+        let unauthorized = json!({"code": "unauthorized", "description": "Unauthorized"});
+
+        for route in ["balance", "address", "delete", "fund"] {
+            for key in [None, Some("wrong-key"), Some(TEST_API_KEY)] {
+                let resp =
+                    test::call_service(&app, client_route_request(route, "no-such-client", key))
+                        .await;
+                assert_eq!(resp.status(), StatusCode::UNAUTHORIZED, "{route} {key:?}");
+                let body: Value = test::read_body_json(resp).await;
+                assert_eq!(body, unauthorized, "{route} {key:?}");
+            }
+            for key in [None, Some("wrong-key")] {
+                let resp =
+                    test::call_service(&app, client_route_request(route, TEST_CLIENT_ID, key))
+                        .await;
+                assert_eq!(resp.status(), StatusCode::UNAUTHORIZED, "{route} {key:?}");
+                let body: Value = test::read_body_json(resp).await;
+                assert_eq!(body, unauthorized, "{route} {key:?}");
+            }
+        }
+    }
+
     #[actix_web::test]
     async fn sr_sec_010_invalid_wif_error_does_not_echo_secret() {
         let secret_wif = "cSecretWifValueThatMustNotAppearInErrors123456789";
@@ -2555,9 +2618,11 @@ mod tests {
         assert_eq!(http, StatusCode::UNAUTHORIZED);
         assert_eq!(code, "unauthorized");
 
+        // With client keys in use, an unknown client is the same 401, so it
+        // cannot be told from a real one (CS-661).
         let (http, code) = fund_code(&app, huge("no-such-client"), None).await;
-        assert_eq!(http, StatusCode::BAD_REQUEST);
-        assert_eq!(code, "unknown_client");
+        assert_eq!(http, StatusCode::UNAUTHORIZED);
+        assert_eq!(code, "unauthorized");
 
         // And authenticated, the count is refused without being built.
         let (http, code) = fund_code(&app, huge(TEST_CLIENT_ID), Some(TEST_API_KEY)).await;
