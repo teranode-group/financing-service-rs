@@ -4,7 +4,7 @@ The service listens on `listen_addr` (default `127.0.0.1:8080`; the examples bel
 
 When a client has an `api_key` configured, that client's endpoints require authentication via either:
 
-* `Authorization: Bearer <api_key>`
+* `Authorization: Bearer <api_key>`, the scheme in any case (`bearer` too, CS-663)
 * `X-API-Key: <api_key>`
 
 The key must match the `client_id` being accessed. Using another client's key returns `401`.
