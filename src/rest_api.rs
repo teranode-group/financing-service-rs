@@ -614,7 +614,7 @@ fn replay(outcome: Outcome) -> HttpResponse {
 /// Its documented advice is "retry may succeed", and holding the key made
 /// that retry impossible with the same key. `broadcaster_untrusted` is refused
 /// before anything is sent (CS-618), so it spent nothing either; holding the
-/// key and the hold meant that, once an operator fixed mapi-lite's key, the
+/// key and the funding-limit hold meant that, once an operator fixed mapi-lite's key, the
 /// retry was refused `key_in_progress` for the key's TTL and the amount counted
 /// against the client's window for its whole period (CS-660).
 ///
@@ -2917,6 +2917,51 @@ mod tests {
         let (http, json) =
             post_fund(&app, fund_body(TEST_CLIENT_ID, 150, 1, LOCKING_SCRIPT_HEX)).await;
         assert_eq!(http, StatusCode::OK, "{json}");
+    }
+
+    /// CS-660: with `multiple_tx`, an untrusted broadcaster after the first
+    /// transaction went out is `partial_broadcast`, not `broadcaster_untrusted`,
+    /// so the key is kept and a resend is answered with what happened. Only the
+    /// all-or-nothing code releases it; were a mid-batch untrusted reported as
+    /// `broadcaster_untrusted`, the resend would fund the first output twice.
+    #[actix_web::test]
+    async fn cs_660_an_untrusted_broadcaster_mid_batch_keeps_the_idempotency_key() {
+        use crate::broadcaster::BroadcastError;
+        let config = test_config(&unique_dynamic_config_path());
+        let blockchain = test_blockchain_interface(&config).await;
+        // A third answer accepts, so a resend that funded again would succeed
+        // and show up in `sent`.
+        let broadcaster = crate::test_support::ScriptedBroadcaster::new(vec![
+            None,
+            Some(BroadcastError::Untrusted(
+                "mapi-lite signs with 02ab…, which [mapi_lite] miner_id_public_keys does not list"
+                    .to_string(),
+            )),
+            None,
+            None,
+        ]);
+        let (app, _service) = build_app_over(&config, blockchain, broadcaster.clone()).await;
+        let body = json!({
+            "client_id": TEST_CLIENT_ID,
+            "satoshi": 150,
+            "no_of_outpoints": 2,
+            "multiple_tx": true,
+            "locking_script": LOCKING_SCRIPT_HEX,
+            "idempotency_key": "untrusted-mid-batch",
+        });
+
+        let (http, json) = post_fund(&app, body.clone()).await;
+        assert_eq!(http, StatusCode::UNPROCESSABLE_ENTITY, "{json}");
+        assert_eq!(json["code"], "partial_broadcast");
+        assert_eq!(json["outpoints"].as_array().unwrap().len(), 1, "{json}");
+        let sent = broadcaster.sent().len();
+
+        let (http, replayed) = post_fund(&app, body).await;
+        assert_eq!(http, StatusCode::UNPROCESSABLE_ENTITY, "{replayed}");
+        assert_eq!(replayed["code"], "partial_broadcast");
+        assert_eq!(replayed["replayed"], json!(true), "{replayed}");
+        assert_eq!(replayed["outpoints"], json["outpoints"]);
+        assert_eq!(broadcaster.sent().len(), sent, "the resend broadcast again");
     }
 
     /// The reservation is not released for an outcome that might have spent
