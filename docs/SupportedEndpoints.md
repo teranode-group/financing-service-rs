@@ -214,10 +214,10 @@ The first call reserves the key and, once the transaction is broadcast, retains 
 | Situation | Result |
 |---|---|
 | New key | Funds normally, and the response is retained |
-| Same key, same request, already funded | Replays the first response with `"replayed": true`; nothing is broadcast |
+| Same key, same request, already funded | Replays the first response with `"replayed": true`; nothing is broadcast, and the chain is not read, so a replay is answered while the blockchain interface is down (CS-654) |
 | Same key, still being processed | `409` `key_in_progress` — retry shortly |
 | Same key, materially different request | `409` `idempotency_key_reused` — use a fresh `idempotency_key` |
-| Refused before anything was built (`insufficient_balance`, `no_suitable_utxo`, `funds_in_flight`), or the broadcast certainly did not land (`broadcast_rejected`, `broadcast_failed`) | The key is freed, so it can be retried |
+| Refused before anything was built (`chain_unavailable`, `insufficient_balance`, `no_suitable_utxo`, `funds_in_flight`), or the broadcast certainly did not land (`broadcast_rejected`, `broadcast_failed`) | The key is freed, so it can be retried |
 
 **A replayed response is marked.** It carries `"replayed": true`; an ordinary funding response omits the field entirely, so read its absence as false.
 

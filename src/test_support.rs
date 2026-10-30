@@ -1,5 +1,5 @@
 use std::sync::{
-    atomic::{AtomicU32, Ordering},
+    atomic::{AtomicBool, AtomicU32, Ordering},
     Arc, Mutex, MutexGuard,
 };
 
@@ -372,13 +372,20 @@ pub const UNREADABLE_CHAIN_URL: &str = "http://10.20.30.40:18332/";
 /// address it could not reach, as reqwest's does.
 pub struct UnreadableBlockchain {
     inner: Arc<CountingBlockchain>,
+    readable: AtomicBool,
 }
 
 impl UnreadableBlockchain {
     pub async fn new(config: &Config) -> Arc<Self> {
         Arc::new(Self {
             inner: CountingBlockchain::new(config).await,
+            readable: AtomicBool::new(false),
         })
+    }
+
+    /// Let reads through from now on, or fail them again.
+    pub fn set_readable(&self, readable: bool) {
+        self.readable.store(readable, Ordering::SeqCst);
     }
 }
 
@@ -394,7 +401,10 @@ impl BlockchainInterface for UnreadableBlockchain {
         self.inner.get_balance(address).await
     }
 
-    async fn get_utxo(&self, _address: &str) -> Result<Utxo, ChainGangError> {
+    async fn get_utxo(&self, address: &str) -> Result<Utxo, ChainGangError> {
+        if self.readable.load(Ordering::SeqCst) {
+            return self.inner.get_utxo(address).await;
+        }
         Err(ChainGangError::BadArgument(format!(
             "error sending request for url ({UNREADABLE_CHAIN_URL})"
         )))
