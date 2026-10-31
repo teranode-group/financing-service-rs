@@ -329,20 +329,12 @@ async fn fund(
         locking_scripts,
     };
 
-    // Refreshed only if the cache has gone stale, and with `[mapi_lite]` not
-    // waited for unless the cache is unusable. See
-    // `Service::prepare_chain_state_for_funding` for why, and
-    // `service.chain_state_max_age_seconds` for the window.
-    if let Err(description) =
-        Service::prepare_chain_state_for_funding(&data.service, client_id).await
-    {
-        log::warn!("refresh_client_chain_state failed: {}", description);
-        return error_response(ErrorCode::ChainUnavailable, CHAIN_UNAVAILABLE);
-    }
-
     // Claim the `idempotency_key`, if the client supplied one, before anything
     // is prepared or broadcast. Reserving first is what makes a concurrent
-    // duplicate visible rather than letting two calls both fund.
+    // duplicate visible rather than letting two calls both fund. It comes
+    // before the chain read too (CS-654): a stored answer is replayed from the
+    // record, and a resend after a lost answer is when the chain is most
+    // likely to be unreadable -- an unknown outcome marks the cache unusable.
     let fingerprint = request_fingerprint(satoshi, no_of_outpoints, multiple_tx, &scripts_hex);
     let record = info
         .idempotency_key
@@ -373,6 +365,21 @@ async fn fund(
                 );
             }
         }
+    }
+
+    // Refreshed only if the cache has gone stale, and with `[mapi_lite]` not
+    // waited for unless the cache is unusable. See
+    // `Service::prepare_chain_state_for_funding` for why, and
+    // `service.chain_state_max_age_seconds` for the window. Nothing has been
+    // built if it fails, so the key is given back.
+    if let Err(description) =
+        Service::prepare_chain_state_for_funding(&data.service, client_id).await
+    {
+        log::warn!("refresh_client_chain_state failed: {}", description);
+        if let Some((key, _)) = &record {
+            data.service.release_idempotency(key).await;
+        }
+        return error_response(ErrorCode::ChainUnavailable, CHAIN_UNAVAILABLE);
     }
 
     // `[funding_limits]` (CS-530). After the idempotency check, so a replayed
@@ -2815,6 +2822,44 @@ mod tests {
                 assert!(!text.contains(leak), "{name} disclosed {leak:?}: {text}");
             }
         }
+    }
+
+    /// CS-654: a stored answer is replayed without reading the chain. The
+    /// resend after a lost answer is when the chain is likeliest to be down,
+    /// and answering it `chain_unavailable` left the caller unable to learn
+    /// which outpoint it had been given. A new key still needs the read, and
+    /// is given back when it fails, so it can be retried once the chain is up.
+    #[actix_web::test]
+    async fn cs_654_a_stored_answer_is_replayed_while_the_chain_is_unreadable() {
+        use crate::test_support::{CountingBroadcaster, UnreadableBlockchain};
+
+        let mut config = test_config(&unique_dynamic_config_path());
+        // Every request reads the chain, so none is served from the cache.
+        config.service.chain_state_max_age_seconds = Some(0);
+        let blockchain = UnreadableBlockchain::new(&config).await;
+        blockchain.set_readable(true);
+        let (app, _service) =
+            build_app_over(&config, blockchain.clone(), CountingBroadcaster::new()).await;
+        let first_body = fund_body_with_key(TEST_CLIENT_ID, 123, LOCKING_SCRIPT_HEX, "first");
+
+        let (http, first) = post_fund(&app, first_body.clone()).await;
+        assert_eq!(http, StatusCode::OK, "{first}");
+
+        blockchain.set_readable(false);
+        let (http, replayed) = post_fund(&app, first_body).await;
+        assert_eq!(http, StatusCode::OK, "{replayed}");
+        assert_eq!(replayed["replayed"], true);
+        assert_eq!(replayed["outpoints"], first["outpoints"]);
+
+        let second_body = fund_body_with_key(TEST_CLIENT_ID, 123, LOCKING_SCRIPT_HEX, "second");
+        let (http, refused) = post_fund(&app, second_body.clone()).await;
+        assert_eq!(http, StatusCode::SERVICE_UNAVAILABLE, "{refused}");
+        assert_eq!(refused["code"], "chain_unavailable");
+
+        blockchain.set_readable(true);
+        let (http, funded) = post_fund(&app, second_body).await;
+        assert_eq!(http, StatusCode::OK, "{funded}");
+        assert!(funded.get("replayed").is_none(), "{funded}");
     }
 
     #[actix_web::test]
