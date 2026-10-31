@@ -9,9 +9,9 @@ When a client has an `api_key` configured, that client's endpoints require authe
 
 The key must match the `client_id` being accessed. Using another client's key returns `401`.
 
-This applies to `POST /fund`, `GET /client/{client_id}/balance`, `GET /client/{client_id}/address`, and `DELETE /client/{client_id}` when that client has an `api_key`. `/`, `/health`, `/ready`, and `/status` remain unauthenticated.
+This applies to `POST /fund`, `GET /client/{client_id}/balance` and `GET /client/{client_id}/address` when that client has an `api_key`. `/`, `/health`, `/ready`, and `/status` remain unauthenticated.
 
-`POST /client` requires `web_interface.admin_api_key` when configured. Send the admin key via `Authorization: Bearer <admin_api_key>` or `X-API-Key: <admin_api_key>`. The request body may include an optional `api_key` field that is stored for the new client. See [Configuration](Configuration.md).
+`POST /client` and `DELETE /client/{client_id}` require `web_interface.admin_api_key` when configured; a client's own key does not delete it (CS-653). Send the admin key via `Authorization: Bearer <admin_api_key>` or `X-API-Key: <admin_api_key>`. The request body may include an optional `api_key` field that is stored for the new client. See [Configuration](Configuration.md).
 
 Missing or invalid credentials return HTTP `401`:
 
@@ -258,6 +258,7 @@ The status is derived from the code, so a caller that cannot read the body — a
 | `funds_in_flight` | 503 | Every UTXO that could fund the request is claimed by funding requests still being broadcast, and the change they return will cover it | **Retry unchanged** after `Retry-After` (1 second) — see below |
 | `unknown_client` | 404 / 400 | No such `client_id`. 404 where the id is a path segment, 400 where it is a body field. Only while no client has an API key: once any does, an unknown `client_id` is `401 unauthorized`, the same answer as a missing or wrong key, so the id of a client with a key cannot be discovered without that key; the service log names the unknown id at `info` (CS-661) | Fix configuration; never retryable as-is |
 | `client_exists` | 409 | `client_id` is already configured | `POST /client` only |
+| `static_client` | 409 | `DELETE /client` named a client from the configuration file, which the service cannot remove: it would be back at the next restart (CS-653) | `DELETE /client` only. Remove it from the file and restart |
 | `invalid_request` | 400 | The request is malformed | Fix the request; never retryable unchanged |
 | `broadcast_failed` | 502 | The transaction certainly did not reach a node: the upstream could not be reached, answered that no node can have received it, or refused it in a way it said was worth retrying. Anything that may have landed is `broadcast_outcome_unknown` instead (CS-501) | Nothing was spent; retry may succeed, with the same `idempotency_key` |
 | `broadcast_rejected` | 409 | The upstream looked at the transaction and refused it finally — either because it said so, or because it named a conflicting transaction | Nothing was spent, and **retrying will not help** — see below |
@@ -366,16 +367,22 @@ Common error responses:
 
 `DELETE /client/{client_id}`
 
-Remove a dynamically added client. Requires the target client's `api_key` when configured.
+Remove a client added at runtime with `POST /client`, from memory and from the dynamic config file. Requires `web_interface.admin_api_key` when configured, as `POST /client` does; the client's own `api_key` does not delete it (CS-653).
 
 ```bash
-curl -H "Authorization: Bearer your-client-api-key" \
-     -X DELETE http://127.0.0.1:8080/client/client1
+curl -H "Authorization: Bearer your-admin-api-key" \
+     -X DELETE http://127.0.0.1:8080/client/client15
 ```
 
 ```json
 {"status": "Success"}
 ```
+
+Common error responses:
+
+* Unauthorized — `{"code": "unauthorized", "description": "Unauthorized"}` (missing or invalid admin key)
+* `unknown_client` (404) — no client has that id
+* `static_client` (409) — the client is in the configuration file. It goes on being served; remove it from the file and restart
 
 ## Get address
 
