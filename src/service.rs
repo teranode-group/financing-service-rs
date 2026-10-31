@@ -858,8 +858,32 @@ impl Service {
         Ok(())
     }
 
-    pub async fn delete_client(&self, client_id: &str) -> Result<(), String> {
-        self.dynamic_config.lock().await.remove(client_id)?;
+    /// Removes a client added at runtime (CS-653). A client from the
+    /// configuration file is refused rather than dropped from memory: it
+    /// would be back at the next restart, and until then its funding stops.
+    pub async fn delete_client(&self, client_id: &str) -> Result<(), CodedError> {
+        // Held across the check and both removals, so a concurrent add or
+        // delete of the same id cannot land between them.
+        let mut dynamic_config = self.dynamic_config.lock().await;
+        if !dynamic_config.contains(client_id) {
+            return Err(if self.is_client_id_valid(client_id).await {
+                CodedError::new(
+                    ErrorCode::StaticClient,
+                    format!(
+                        "Client {client_id} is in the configuration file, not added at runtime; \
+                         remove it there and restart"
+                    ),
+                )
+            } else {
+                CodedError::new(
+                    ErrorCode::UnknownClient,
+                    format!("Unknown client_id {client_id}"),
+                )
+            });
+        }
+        dynamic_config
+            .remove(client_id)
+            .map_err(CodedError::internal)?;
         self.clients.write().await.remove(client_id);
         Ok(())
     }
@@ -2156,10 +2180,9 @@ mod tests {
             .await
             .expect("broadcast");
 
-        service
-            .delete_client(TEST_CLIENT_ID)
-            .await
-            .expect("deleted while the broadcast was in flight");
+        // As `DELETE /client` does to a runtime client; this one is from the
+        // configuration, which that refuses (CS-653).
+        service.clients.write().await.remove(TEST_CLIENT_ID);
 
         let settled = Service::conclude_broadcast(&service, &prepared, response)
             .await

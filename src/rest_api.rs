@@ -697,33 +697,30 @@ pub async fn add_client(
     }
 }
 
-/// Delete client
+/// Delete a client added at runtime
 /// Example:
-///     curl -X POST http://127.0.0.1:8080/client/client_1/
+///     curl -H "Authorization: Bearer <admin_api_key>" \
+///     -X DELETE http://127.0.0.1:8080/client/client15
+/// {"status": "Success"}
+///
+/// Takes the admin key, as `POST /client` does, not the client's own (CS-653):
+/// a client's key funds that client, and must not be able to take it offline.
+/// A client from the configuration file is refused with `static_client`.
 #[delete("/client/{client_id}")]
 pub async fn delete_client(
     req: HttpRequest,
     data: web::Data<AppState>,
     info: web::Path<String>,
 ) -> impl Responder {
+    if let Some(response) = authorize_admin(&req, &data.service) {
+        return response;
+    }
     let client_id: String = info.to_string();
     log::info!("delete_client {}", client_id);
 
-    // An unknown client_id is a 401 like a wrong key wherever clients have
-    // keys, so it cannot be told from a real one (CS-661).
-    let unknown = || {
-        error_response(
-            ErrorCode::UnknownClient,
-            format!("Unknown client_id {client_id}"),
-        )
-    };
-    if let Some(response) = authorize_known_client(&req, &client_id, &data.service, unknown).await {
-        return response;
-    }
-
     match data.service.delete_client(&client_id).await {
         Ok(()) => json_ok(&SuccessResponse::new()),
-        Err(description) => error_response(ErrorCode::Internal, description),
+        Err(error) => coded_error_response(error),
     }
 }
 
@@ -1360,17 +1357,28 @@ mod tests {
 
     #[actix_web::test]
     async fn test_delete_client_success() {
-        let app = build_app().await;
+        let (app, service) =
+            build_app_with_service(test_config(&unique_dynamic_config_path())).await;
+        service
+            .add_client(&ClientConfig {
+                client_id: "client2".to_string(),
+                wif_key: OTHER_TEST_WIF.to_string(),
+                api_key: None,
+            })
+            .await
+            .expect("add client2");
+
         let resp = test::call_service(
             &app,
             test::TestRequest::delete()
-                .uri(&format!("/client/{TEST_CLIENT_ID}"))
+                .uri("/client/client2")
                 .to_request(),
         )
         .await;
         assert_eq!(resp.status(), StatusCode::OK);
         let body: Value = test::read_body_json(resp).await;
         assert_eq!(body["status"], "Success");
+        assert!(!service.is_client_id_valid("client2").await);
     }
 
     #[actix_web::test]
@@ -2394,30 +2402,94 @@ mod tests {
     }
 
     #[actix_web::test]
-    async fn sr_sec_001_address_and_delete_require_client_api_key_when_enabled() {
-        let path = unique_dynamic_config_path();
-        let config = test_config_with_keys(&path, Some(TEST_API_KEY), None);
+    async fn sr_sec_001_address_requires_client_api_key_when_enabled() {
+        let app = build_app_with_api_key(Some(TEST_API_KEY)).await;
+        let resp = test::call_service(
+            &app,
+            test::TestRequest::get()
+                .uri(&format!("/client/{TEST_CLIENT_ID}/address"))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    /// DELETE with `key`, if any, as status and error code.
+    async fn delete_code(
+        app: &impl ActixService<Request, Response = ServiceResponse, Error = Error>,
+        client_id: &str,
+        key: Option<&str>,
+    ) -> (StatusCode, Value) {
+        let mut req = test::TestRequest::delete().uri(&format!("/client/{client_id}"));
+        if let Some(key) = key {
+            req = req.insert_header(("Authorization", format!("Bearer {key}")));
+        }
+        let resp = test::call_service(app, req.to_request()).await;
+        let http = resp.status();
+        let body: Value = test::read_body_json(resp).await;
+        (http, body["code"].clone())
+    }
+
+    /// CS-653: `DELETE /client` takes the admin key, as `POST /client` does.
+    /// A client's own key funds it; it used to be able to delete it too, and
+    /// with it the funding of whatever service held that key.
+    #[actix_web::test]
+    async fn cs_653_delete_takes_the_admin_key_not_the_client_s_own() {
+        let config = test_config_with_keys(
+            &unique_dynamic_config_path(),
+            Some(TEST_API_KEY),
+            Some(TEST_ADMIN_API_KEY),
+        );
         let (app, service) = build_app_with_service(config).await;
         service
             .add_client(&ClientConfig {
-                client_id: "deletable".to_string(),
+                client_id: "runtime".to_string(),
                 wif_key: OTHER_TEST_WIF.to_string(),
-                api_key: Some(TEST_API_KEY.to_string()),
+                api_key: Some("runtime-key".to_string()),
             })
             .await
-            .expect("add deletable client");
+            .expect("add a runtime client");
 
-        for uri in [
-            format!("/client/{TEST_CLIENT_ID}/address"),
-            "/client/deletable".to_string(),
-        ] {
-            let resp = if uri.contains("/address") {
-                test::call_service(&app, test::TestRequest::get().uri(&uri).to_request()).await
-            } else {
-                test::call_service(&app, test::TestRequest::delete().uri(&uri).to_request()).await
-            };
-            assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        for key in [None, Some("runtime-key"), Some(TEST_API_KEY), Some("wrong")] {
+            let (http, code) = delete_code(&app, "runtime", key).await;
+            assert_eq!(http, StatusCode::UNAUTHORIZED, "{key:?}");
+            assert_eq!(code, "unauthorized", "{key:?}");
         }
+        assert!(service.is_client_id_valid("runtime").await);
+
+        let (http, _) = delete_code(&app, "runtime", Some(TEST_ADMIN_API_KEY)).await;
+        assert_eq!(http, StatusCode::OK);
+        assert!(!service.is_client_id_valid("runtime").await);
+
+        // The admin may know which ids exist, so an unknown one is named.
+        let (http, code) = delete_code(&app, "runtime", Some(TEST_ADMIN_API_KEY)).await;
+        assert_eq!(http, StatusCode::NOT_FOUND);
+        assert_eq!(code, "unknown_client");
+    }
+
+    /// CS-653: a client from the configuration file is refused, not dropped
+    /// from memory until the next restart brings it back, and goes on being
+    /// served.
+    #[actix_web::test]
+    async fn cs_653_a_client_from_the_configuration_file_is_not_deleted() {
+        let config = test_config_with_keys(
+            &unique_dynamic_config_path(),
+            Some(TEST_API_KEY),
+            Some(TEST_ADMIN_API_KEY),
+        );
+        let (app, service) = build_app_with_service(config).await;
+
+        let (http, code) = delete_code(&app, TEST_CLIENT_ID, Some(TEST_ADMIN_API_KEY)).await;
+        assert_eq!(http, StatusCode::CONFLICT);
+        assert_eq!(code, "static_client");
+        assert!(service.is_client_id_valid(TEST_CLIENT_ID).await);
+
+        let resp = test::call_service(
+            &app,
+            client_route_request("address", TEST_CLIENT_ID, Some(TEST_API_KEY)),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
     }
 
     #[actix_web::test]
@@ -2436,12 +2508,11 @@ mod tests {
         assert_eq!(body["description"], "Unauthorized");
     }
 
-    /// One of the four client routes, for `client_id`, with `key` if any.
+    /// One of the three client routes, for `client_id`, with `key` if any.
     fn client_route_request(route: &str, client_id: &str, key: Option<&str>) -> Request {
         let request = match route {
             "balance" => test::TestRequest::get().uri(&format!("/client/{client_id}/balance")),
             "address" => test::TestRequest::get().uri(&format!("/client/{client_id}/address")),
-            "delete" => test::TestRequest::delete().uri(&format!("/client/{client_id}")),
             "fund" => test::TestRequest::post().uri("/fund").set_json(fund_body(
                 client_id,
                 123,
@@ -2458,7 +2529,8 @@ mod tests {
 
     /// CS-661: with client keys in use, an unknown `client_id` is answered
     /// exactly as a real one with a missing or wrong key, on every route that
-    /// takes one, so a caller cannot tell which ids exist. It used to be 404
+    /// takes one, so a caller cannot tell which ids exist. `DELETE /client`
+    /// takes the admin key instead (CS-653). It used to be 404
     /// (400 on `/fund`) where a real one was 401. A real client's own key does
     /// not open an unknown id either.
     #[actix_web::test]
@@ -2471,7 +2543,7 @@ mod tests {
         .await;
         let unauthorized = json!({"code": "unauthorized", "description": "Unauthorized"});
 
-        for route in ["balance", "address", "delete", "fund"] {
+        for route in ["balance", "address", "fund"] {
             for key in [None, Some("wrong-key"), Some(TEST_API_KEY)] {
                 let resp =
                     test::call_service(&app, client_route_request(route, "no-such-client", key))

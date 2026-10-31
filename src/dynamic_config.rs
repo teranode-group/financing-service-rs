@@ -94,6 +94,15 @@ impl DynamicConfig {
         Ok(())
     }
 
+    /// Whether `client_id` was added at runtime, and so is this file's to
+    /// remove (CS-653).
+    pub fn contains(&self, client_id: &str) -> bool {
+        self.contents
+            .clients
+            .iter()
+            .any(|c| c.client_id == client_id)
+    }
+
     /// Removes a client. Memory changes only once the file has been written.
     pub fn remove(&mut self, client_id: &str) -> Result<(), String> {
         let mut next = self.contents.clone();
@@ -289,7 +298,9 @@ mod tests {
             api_key: None,
         };
         dynamic_config.add(&client).unwrap();
+        assert!(dynamic_config.contains("to-remove"));
         dynamic_config.remove("to-remove").unwrap();
+        assert!(!dynamic_config.contains("to-remove"));
         let saved = std::fs::read_to_string(&path).unwrap();
         assert!(!saved.contains("to-remove"));
     }

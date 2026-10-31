@@ -36,6 +36,11 @@ pub enum ErrorCode {
     UnknownClient,
     /// The `client_id` is already configured.
     ClientExists,
+    /// `DELETE /client` named a client from the configuration file rather
+    /// than one added at runtime (CS-653). The service cannot remove it: the
+    /// file is not its to edit, and the client would be back at the next
+    /// restart. An operator removes it from the file and restarts.
+    StaticClient,
     /// The request itself is malformed. Never retryable unchanged.
     InvalidRequest,
     /// The funding transaction was built and signed but the upstream could
@@ -98,6 +103,7 @@ impl ErrorCode {
             ErrorCode::FundsInFlight => "funds_in_flight",
             ErrorCode::UnknownClient => "unknown_client",
             ErrorCode::ClientExists => "client_exists",
+            ErrorCode::StaticClient => "static_client",
             ErrorCode::InvalidRequest => "invalid_request",
             ErrorCode::BroadcastFailed => "broadcast_failed",
             ErrorCode::BroadcastRejected => "broadcast_rejected",
@@ -132,6 +138,7 @@ impl ErrorCode {
             // upstream failures: the service and the upstream both did their
             // job, and what has to change is the state they were working on.
             ErrorCode::ClientExists
+            | ErrorCode::StaticClient
             | ErrorCode::InsufficientBalance
             | ErrorCode::NoSuitableUtxo
             | ErrorCode::BroadcastRejected
@@ -479,6 +486,7 @@ mod tests {
             (ErrorCode::FundsInFlight, "funds_in_flight"),
             (ErrorCode::UnknownClient, "unknown_client"),
             (ErrorCode::ClientExists, "client_exists"),
+            (ErrorCode::StaticClient, "static_client"),
             (ErrorCode::InvalidRequest, "invalid_request"),
             (ErrorCode::BroadcastFailed, "broadcast_failed"),
             (ErrorCode::PartialBroadcast, "partial_broadcast"),
@@ -507,6 +515,7 @@ mod tests {
             ErrorCode::FundsInFlight,
             ErrorCode::UnknownClient,
             ErrorCode::ClientExists,
+            ErrorCode::StaticClient,
             ErrorCode::InvalidRequest,
             ErrorCode::BroadcastFailed,
             ErrorCode::BroadcastRejected,
