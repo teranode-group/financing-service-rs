@@ -467,7 +467,7 @@ The quote is refreshed on the same sweep that refreshes balances (`service.utxo_
 
 ## [mapi_lite]
 
-Optional. When this section is present, funding transactions are **broadcast through a [mapi-lite](https://github.com/nchain-innovation/mapi-lite) server** instead of through the `[blockchain_interface]`. Chain reads — balances and UTXO refreshes — are unaffected and keep using `[blockchain_interface]`. Leave the section out and the service behaves exactly as before: transactions are broadcast via WhatsOnChain (or whichever interface is configured).
+Optional. When this section is present, funding transactions are **broadcast through a [mapi-lite](https://github.com/teranode-group/mapi-rs) server** instead of through the `[blockchain_interface]`. Chain reads — balances and UTXO refreshes — are unaffected and keep using `[blockchain_interface]`. Leave the section out and the service behaves exactly as before: transactions are broadcast via WhatsOnChain (or whichever interface is configured).
 
 ```toml
 [mapi_lite]

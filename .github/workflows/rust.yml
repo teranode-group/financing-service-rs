@@ -72,7 +72,7 @@ jobs:
       run: |
         if [ -z "$KEY" ]; then
           echo "::error::Secret MAPI_LITE_DEPLOY_KEY is not set. This build fetches" \
-               "uls-client from the private nchain-innovation/mapi-lite repo over SSH." \
+               "uls-client from the private teranode-group/mapi-rs repo over SSH." \
                "Add a read-only deploy key for that repo as this repository's" \
                "MAPI_LITE_DEPLOY_KEY secret. See docs/Dependencies.md."
           exit 1

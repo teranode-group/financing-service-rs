@@ -35,7 +35,7 @@ cargo test
 
 ### SSH access to mapi-lite
 
-The optional mapi-lite broadcaster depends on the `uls-client` and `uls-core` crates, which live in the **private** `nchain-innovation/mapi-lite` repository and are pinned in `Cargo.toml` as `git+ssh` dependencies. Building therefore needs an SSH key with read access to that repository loaded in your agent:
+The optional mapi-lite broadcaster depends on the `uls-client` and `uls-core` crates, which live in the **private** `teranode-group/mapi-rs` repository and are pinned in `Cargo.toml` as `git+ssh` dependencies. Building therefore needs an SSH key with read access to that repository loaded in your agent:
 
 ```bash
 eval "$(ssh-agent)" && ssh-add ~/.ssh/<your-key>

@@ -1,6 +1,6 @@
 [package]
 name = "financing-service"
-version = "5.1.0"
+version = "6.0.0"
 edition = "2021"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
@@ -36,18 +36,19 @@ actix-governor = "0.10.0"
 
 # The optional mapi-lite transaction broadcaster ([mapi_lite] in config).
 # uls-client is mapi-lite's typed HTTP client and uls-core its wire types; both
-# live in the PRIVATE nchain-innovation/mapi-lite repo, so they are git+ssh
+# live in the PRIVATE teranode-group/mapi-rs repo, so they are git+ssh
 # pins (cargo needs the ssh:// URL form, and .cargo/config.toml hands the fetch
 # to the system git). They MUST name the same rev, and that rev's chain-gang
 # requirement must be satisfiable by the chain-gang line above, or the graph
 # carries two chain-gangs and their types stop unifying. This is the commit
-# mapi-lite tagged v0.7.0, on chain-gang 0.13 -- pinned by rev, which unlike a
+# mapi-lite tagged v0.9.0, on chain-gang 0.13 -- pinned by rev, which unlike a
 # tag cannot move. v0.6.0 publishes the nodes' network in /ready (CS-624);
 # v0.6.1 reports a 4xx after a landed attempt as an unknown outcome (CS-637);
-# v0.7.0 reports unmined and stuck transactions, server-side (CS-640, CS-641).
+# v0.7.0 reports unmined and stuck transactions, server-side (CS-640, CS-641);
+# v0.9.0 refuses a transaction paying less than its fee quote (CS-643).
 # See docs/Dependencies.md before changing it.
-uls-client = { git = "ssh://git@github.com/nchain-innovation/mapi-lite.git", rev = "e1a03cad02e7531764d0ec76f2390a56c2caccf5" }
-uls-core = { git = "ssh://git@github.com/nchain-innovation/mapi-lite.git", rev = "e1a03cad02e7531764d0ec76f2390a56c2caccf5" }
+uls-client = { git = "ssh://git@github.com/teranode-group/mapi-rs.git", rev = "59332eead81d82b1e55afea6e4e2b18f670f8414" }
+uls-core = { git = "ssh://git@github.com/teranode-group/mapi-rs.git", rev = "59332eead81d82b1e55afea6e4e2b18f670f8414" }
 # For the HTTP client the mapi-lite chain reader (mapi_lite_interface) hands
 # uls-client; the broadcaster uses uls-client's own timeouts (v0.5.0). Same
 # major.minor as mapi-lite's so one reqwest resolves; its TLS backend is
