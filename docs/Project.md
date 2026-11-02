@@ -21,7 +21,7 @@ For API details see [SupportedEndpoints.md](SupportedEndpoints.md). For configur
 | Same-client concurrent funding (plan-then-commit) | 2026 |
 | Optional mapi-lite transaction broadcaster | September 2026 |
 
-The Rust service uses the [`chain-gang`](https://github.com/nchain-innovation/chain-gang) library for blockchain access (WhatsOnChain, UaaS, a node's JSON-RPC endpoint, or the test interface) and wallet operations. Optionally it broadcasts through [mapi-lite](https://github.com/nchain-innovation/mapi-lite) via that project's `uls-client` crate.
+The Rust service uses the [`chain-gang`](https://github.com/nchain-innovation/chain-gang) library for blockchain access (WhatsOnChain, UaaS, a node's JSON-RPC endpoint, or the test interface) and wallet operations. Optionally it broadcasts through [mapi-lite](https://github.com/teranode-group/mapi-rs) via that project's `uls-client` crate.
 
 ## Current architecture
 

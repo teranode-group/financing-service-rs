@@ -83,7 +83,7 @@ mod tests {
             "uls-client and uls-core pin different revs"
         );
         assert!(
-            manifest.contains("git = \"ssh://git@github.com/nchain-innovation/mapi-lite.git\""),
+            manifest.contains("git = \"ssh://git@github.com/teranode-group/mapi-rs.git\""),
             "cargo needs the ssh:// URL form for the private mapi-lite repo"
         );
     }
