@@ -49,29 +49,30 @@ const DURATION_BOUNDARIES: [f64; 14] = [
     0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 15.0, 30.0, 60.0,
 ];
 
-/// Every `code` a `POST /fund` answer can carry in `fs_fund_requests`: the
-/// list in uls-rs `observability/telemetry-inventory.md`. `client_exists` and
-/// `static_client` are answered by the `/client` routes only, and
-/// `unclassified` should never happen, so none of them is created up front.
-pub const FUND_CODES: [&str; 17] = [
-    "funded",
-    ErrorCode::InsufficientBalance.as_str(),
-    ErrorCode::NoSuitableUtxo.as_str(),
-    ErrorCode::FundsInFlight.as_str(),
-    ErrorCode::BroadcastRejected.as_str(),
-    ErrorCode::BroadcastFailed.as_str(),
-    ErrorCode::BroadcastOutcomeUnknown.as_str(),
-    ErrorCode::BroadcasterUntrusted.as_str(),
-    ErrorCode::PartialBroadcast.as_str(),
-    ErrorCode::ChainUnavailable.as_str(),
-    ErrorCode::InvalidRequest.as_str(),
-    ErrorCode::UnknownClient.as_str(),
-    ErrorCode::Unauthorized.as_str(),
-    ErrorCode::RateLimited.as_str(),
-    ErrorCode::KeyInProgress.as_str(),
-    ErrorCode::IdempotencyKeyReused.as_str(),
-    ErrorCode::Internal.as_str(),
-];
+/// Every `code` a `POST /fund` answer can carry in `fs_fund_requests`:
+/// `funded`, then each [`ErrorCode::ALL`] that [`ErrorCode::is_fund_answer`],
+/// worked out at compile time. `unclassified` should never happen, so it is
+/// not created up front. The list must match uls-rs
+/// `observability/telemetry-inventory.md`.
+pub const FUND_CODES: [&str; 17] = fund_codes();
+
+/// Fails to compile when the number of codes `/fund` answers with is not the
+/// length of [`FUND_CODES`].
+const fn fund_codes() -> [&'static str; 17] {
+    let mut codes = [""; 17];
+    codes[0] = "funded";
+    let mut n = 1;
+    let mut i = 0;
+    while i < ErrorCode::ALL.len() {
+        if ErrorCode::ALL[i].is_fund_answer() {
+            codes[n] = ErrorCode::ALL[i].as_str();
+            n += 1;
+        }
+        i += 1;
+    }
+    assert!(n == codes.len(), "FUND_CODES has the wrong length");
+    codes
+}
 
 /// The synchronous instruments, built once at startup and cloned cheaply.
 #[derive(Clone)]
@@ -610,21 +611,34 @@ mod tests {
         assert!(points.iter().all(|p| p.value == 0.0), "{points:?}");
     }
 
-    /// The codes are distinct and leave out the ones `POST /fund` never
-    /// answers with. That each is a real code is checked at compile time.
+    /// `FUND_CODES` is the list in uls-rs `observability/telemetry-inventory.md`,
+    /// which the dashboards and alerts are built from. Changing what
+    /// `is_fund_answer` says fails here until the inventory changes too.
     #[test]
-    fn fund_codes_are_distinct_and_fund_answers_only() {
-        let mut codes = FUND_CODES.to_vec();
+    fn fund_codes_match_the_telemetry_inventory() {
+        let mut inventory = [
+            "funded",
+            "insufficient_balance",
+            "no_suitable_utxo",
+            "funds_in_flight",
+            "broadcast_rejected",
+            "broadcast_failed",
+            "broadcast_outcome_unknown",
+            "broadcaster_untrusted",
+            "partial_broadcast",
+            "chain_unavailable",
+            "invalid_request",
+            "unknown_client",
+            "unauthorized",
+            "rate_limited",
+            "key_in_progress",
+            "idempotency_key_reused",
+            "internal",
+        ];
+        inventory.sort();
+        let mut codes = FUND_CODES;
         codes.sort();
-        codes.dedup();
-        assert_eq!(codes.len(), FUND_CODES.len());
-        for code in [
-            ErrorCode::ClientExists.as_str(),
-            ErrorCode::StaticClient.as_str(),
-            "unclassified",
-        ] {
-            assert!(!FUND_CODES.contains(&code), "{code}");
-        }
+        assert_eq!(codes, inventory);
     }
 
     #[actix_web::test]

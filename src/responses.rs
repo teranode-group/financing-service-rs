@@ -94,6 +94,59 @@ pub enum ErrorCode {
 }
 
 impl ErrorCode {
+    /// Every code, for anything that must cover each one -- the codes
+    /// `fs_fund_requests` creates at 0 (CS-667), say. `all_holds_every_code`
+    /// stops compiling when a variant is added, until it is given its place
+    /// here.
+    pub const ALL: [ErrorCode; 18] = [
+        ErrorCode::InsufficientBalance,
+        ErrorCode::NoSuitableUtxo,
+        ErrorCode::FundsInFlight,
+        ErrorCode::UnknownClient,
+        ErrorCode::ClientExists,
+        ErrorCode::StaticClient,
+        ErrorCode::InvalidRequest,
+        ErrorCode::BroadcastFailed,
+        ErrorCode::BroadcastRejected,
+        ErrorCode::BroadcastOutcomeUnknown,
+        ErrorCode::BroadcasterUntrusted,
+        ErrorCode::PartialBroadcast,
+        ErrorCode::ChainUnavailable,
+        ErrorCode::Internal,
+        ErrorCode::Unauthorized,
+        ErrorCode::RateLimited,
+        ErrorCode::KeyInProgress,
+        ErrorCode::IdempotencyKeyReused,
+    ];
+
+    /// Whether `POST /fund` can answer with this code, so whether
+    /// `fs_fund_requests` creates it at 0 (CS-667). No catch-all arm: a new
+    /// variant does not compile until someone decides.
+    pub const fn is_fund_answer(self) -> bool {
+        match self {
+            ErrorCode::InsufficientBalance
+            | ErrorCode::NoSuitableUtxo
+            | ErrorCode::FundsInFlight
+            | ErrorCode::UnknownClient
+            | ErrorCode::InvalidRequest
+            | ErrorCode::BroadcastFailed
+            | ErrorCode::BroadcastRejected
+            | ErrorCode::BroadcastOutcomeUnknown
+            | ErrorCode::BroadcasterUntrusted
+            | ErrorCode::PartialBroadcast
+            | ErrorCode::ChainUnavailable
+            | ErrorCode::Internal
+            | ErrorCode::Unauthorized
+            // the per-client `[funding_limits]` refusal; the per-IP limiter
+            // answers before the handler and is not counted here
+            | ErrorCode::RateLimited
+            | ErrorCode::KeyInProgress
+            | ErrorCode::IdempotencyKeyReused => true,
+            // the `/client` routes only
+            ErrorCode::ClientExists | ErrorCode::StaticClient => false,
+        }
+    }
+
     /// The code as it is serialised, for a metric attribute (CS-608) without
     /// going through serde on every request.
     pub const fn as_str(self) -> &'static str {
@@ -509,31 +562,43 @@ mod tests {
     /// code a client is answered with -- for every variant.
     #[test]
     fn as_str_matches_the_serialised_code_for_every_variant() {
-        let all = [
-            ErrorCode::InsufficientBalance,
-            ErrorCode::NoSuitableUtxo,
-            ErrorCode::FundsInFlight,
-            ErrorCode::UnknownClient,
-            ErrorCode::ClientExists,
-            ErrorCode::StaticClient,
-            ErrorCode::InvalidRequest,
-            ErrorCode::BroadcastFailed,
-            ErrorCode::BroadcastRejected,
-            ErrorCode::BroadcastOutcomeUnknown,
-            ErrorCode::BroadcasterUntrusted,
-            ErrorCode::PartialBroadcast,
-            ErrorCode::ChainUnavailable,
-            ErrorCode::Internal,
-            ErrorCode::Unauthorized,
-            ErrorCode::RateLimited,
-            ErrorCode::KeyInProgress,
-            ErrorCode::IdempotencyKeyReused,
-        ];
-        for code in all {
+        for code in ErrorCode::ALL {
             assert_eq!(
                 serde_json::to_value(code).unwrap(),
                 serde_json::Value::String(code.as_str().to_string()),
             );
+        }
+    }
+
+    /// Each variant's place in [`ErrorCode::ALL`]. No catch-all arm, so a new
+    /// variant stops this compiling until it is given one.
+    fn index(code: ErrorCode) -> usize {
+        match code {
+            ErrorCode::InsufficientBalance => 0,
+            ErrorCode::NoSuitableUtxo => 1,
+            ErrorCode::FundsInFlight => 2,
+            ErrorCode::UnknownClient => 3,
+            ErrorCode::ClientExists => 4,
+            ErrorCode::StaticClient => 5,
+            ErrorCode::InvalidRequest => 6,
+            ErrorCode::BroadcastFailed => 7,
+            ErrorCode::BroadcastRejected => 8,
+            ErrorCode::BroadcastOutcomeUnknown => 9,
+            ErrorCode::BroadcasterUntrusted => 10,
+            ErrorCode::PartialBroadcast => 11,
+            ErrorCode::ChainUnavailable => 12,
+            ErrorCode::Internal => 13,
+            ErrorCode::Unauthorized => 14,
+            ErrorCode::RateLimited => 15,
+            ErrorCode::KeyInProgress => 16,
+            ErrorCode::IdempotencyKeyReused => 17,
+        }
+    }
+
+    #[test]
+    fn all_holds_every_code() {
+        for (i, code) in ErrorCode::ALL.into_iter().enumerate() {
+            assert_eq!(index(code), i, "{code:?}");
         }
     }
 
