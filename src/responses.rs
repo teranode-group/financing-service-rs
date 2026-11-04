@@ -96,7 +96,7 @@ pub enum ErrorCode {
 impl ErrorCode {
     /// The code as it is serialised, for a metric attribute (CS-608) without
     /// going through serde on every request.
-    pub fn as_str(self) -> &'static str {
+    pub const fn as_str(self) -> &'static str {
         match self {
             ErrorCode::InsufficientBalance => "insufficient_balance",
             ErrorCode::NoSuitableUtxo => "no_suitable_utxo",

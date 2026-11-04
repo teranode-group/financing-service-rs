@@ -28,7 +28,7 @@ use opentelemetry::{
 };
 
 use crate::{
-    responses::response_code,
+    responses::{response_code, ErrorCode},
     rest_api::{readiness, AppState},
     service::Service,
 };
@@ -49,6 +49,30 @@ const DURATION_BOUNDARIES: [f64; 14] = [
     0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 15.0, 30.0, 60.0,
 ];
 
+/// Every `code` a `POST /fund` answer can carry in `fs_fund_requests`: the
+/// list in uls-rs `observability/telemetry-inventory.md`. `client_exists` and
+/// `static_client` are answered by the `/client` routes only, and
+/// `unclassified` should never happen, so none of them is created up front.
+pub const FUND_CODES: [&str; 17] = [
+    "funded",
+    ErrorCode::InsufficientBalance.as_str(),
+    ErrorCode::NoSuitableUtxo.as_str(),
+    ErrorCode::FundsInFlight.as_str(),
+    ErrorCode::BroadcastRejected.as_str(),
+    ErrorCode::BroadcastFailed.as_str(),
+    ErrorCode::BroadcastOutcomeUnknown.as_str(),
+    ErrorCode::BroadcasterUntrusted.as_str(),
+    ErrorCode::PartialBroadcast.as_str(),
+    ErrorCode::ChainUnavailable.as_str(),
+    ErrorCode::InvalidRequest.as_str(),
+    ErrorCode::UnknownClient.as_str(),
+    ErrorCode::Unauthorized.as_str(),
+    ErrorCode::RateLimited.as_str(),
+    ErrorCode::KeyInProgress.as_str(),
+    ErrorCode::IdempotencyKeyReused.as_str(),
+    ErrorCode::Internal.as_str(),
+];
+
 /// The synchronous instruments, built once at startup and cloned cheaply.
 #[derive(Clone)]
 pub struct Metrics {
@@ -58,7 +82,20 @@ pub struct Metrics {
 }
 
 impl Metrics {
+    /// Builds the instruments and creates `fs_fund_requests` at 0 for every
+    /// code in [`FUND_CODES`] (CS-667). A series that first appears at 1 has
+    /// no earlier sample, so `increase()` and `rate()` would miss the first
+    /// `broadcast_outcome_unknown` after every start. Adding 0 again (another
+    /// `Metrics` from the same meter) changes nothing.
     pub fn new(meter: &Meter) -> Self {
+        let metrics = Self::build(meter);
+        for code in FUND_CODES {
+            metrics.fund_requests.add(0, &[KeyValue::new("code", code)]);
+        }
+        metrics
+    }
+
+    fn build(meter: &Meter) -> Self {
         Self {
             http_requests: meter
                 .u64_counter("http_requests")
@@ -550,6 +587,44 @@ mod tests {
         assert_eq!(total(&points, "code", "insufficient_balance"), 1.0);
         assert_eq!(total(&points, "code", "invalid_request"), 1.0);
         assert!(points.iter().all(|p| p.attributes.len() == 1));
+        // the codes nothing answered with are still there, at 0
+        assert_eq!(points.len(), FUND_CODES.len(), "{points:?}");
+        assert_eq!(total(&points, "code", "broadcast_outcome_unknown"), 0.0);
+    }
+
+    /// Before any request, every `fs_fund_requests` code is exported at 0, so
+    /// the first real one is an increase from 0 rather than a new series.
+    #[test]
+    fn sr_tele_012_fund_request_codes_start_at_zero() {
+        let meter = TestMeter::new();
+        let _metrics = Metrics::new(&meter.meter());
+        // a second set of instruments from the same meter adds nothing
+        let _again = Metrics::new(&meter.meter());
+
+        let (_, points) = meter.points("fs_fund_requests");
+        let mut codes: Vec<&str> = points.iter().map(|p| p.attr("code").unwrap()).collect();
+        codes.sort();
+        let mut expected = FUND_CODES.to_vec();
+        expected.sort();
+        assert_eq!(codes, expected);
+        assert!(points.iter().all(|p| p.value == 0.0), "{points:?}");
+    }
+
+    /// The codes are distinct and leave out the ones `POST /fund` never
+    /// answers with. That each is a real code is checked at compile time.
+    #[test]
+    fn fund_codes_are_distinct_and_fund_answers_only() {
+        let mut codes = FUND_CODES.to_vec();
+        codes.sort();
+        codes.dedup();
+        assert_eq!(codes.len(), FUND_CODES.len());
+        for code in [
+            ErrorCode::ClientExists.as_str(),
+            ErrorCode::StaticClient.as_str(),
+            "unclassified",
+        ] {
+            assert!(!FUND_CODES.contains(&code), "{code}");
+        }
     }
 
     #[actix_web::test]
