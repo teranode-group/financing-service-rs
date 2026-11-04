@@ -28,7 +28,7 @@ use opentelemetry::{
 };
 
 use crate::{
-    responses::response_code,
+    responses::{response_code, ErrorCode},
     rest_api::{readiness, AppState},
     service::Service,
 };
@@ -49,6 +49,31 @@ const DURATION_BOUNDARIES: [f64; 14] = [
     0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 15.0, 30.0, 60.0,
 ];
 
+/// Every `code` a `POST /fund` answer can carry in `fs_fund_requests`:
+/// `funded`, then each [`ErrorCode::ALL`] that [`ErrorCode::is_fund_answer`],
+/// worked out at compile time. `unclassified` should never happen, so it is
+/// not created up front. The list must match uls-rs
+/// `observability/telemetry-inventory.md`.
+pub const FUND_CODES: [&str; 17] = fund_codes();
+
+/// Fails to compile when the number of codes `/fund` answers with is not the
+/// length of [`FUND_CODES`].
+const fn fund_codes() -> [&'static str; 17] {
+    let mut codes = [""; 17];
+    codes[0] = "funded";
+    let mut n = 1;
+    let mut i = 0;
+    while i < ErrorCode::ALL.len() {
+        if ErrorCode::ALL[i].is_fund_answer() {
+            codes[n] = ErrorCode::ALL[i].as_str();
+            n += 1;
+        }
+        i += 1;
+    }
+    assert!(n == codes.len(), "FUND_CODES has the wrong length");
+    codes
+}
+
 /// The synchronous instruments, built once at startup and cloned cheaply.
 #[derive(Clone)]
 pub struct Metrics {
@@ -58,7 +83,20 @@ pub struct Metrics {
 }
 
 impl Metrics {
+    /// Builds the instruments and creates `fs_fund_requests` at 0 for every
+    /// code in [`FUND_CODES`] (CS-667). A series that first appears at 1 has
+    /// no earlier sample, so `increase()` and `rate()` would miss the first
+    /// `broadcast_outcome_unknown` after every start. Adding 0 again (another
+    /// `Metrics` from the same meter) changes nothing.
     pub fn new(meter: &Meter) -> Self {
+        let metrics = Self::build(meter);
+        for code in FUND_CODES {
+            metrics.fund_requests.add(0, &[KeyValue::new("code", code)]);
+        }
+        metrics
+    }
+
+    fn build(meter: &Meter) -> Self {
         Self {
             http_requests: meter
                 .u64_counter("http_requests")
@@ -550,6 +588,57 @@ mod tests {
         assert_eq!(total(&points, "code", "insufficient_balance"), 1.0);
         assert_eq!(total(&points, "code", "invalid_request"), 1.0);
         assert!(points.iter().all(|p| p.attributes.len() == 1));
+        // the codes nothing answered with are still there, at 0
+        assert_eq!(points.len(), FUND_CODES.len(), "{points:?}");
+        assert_eq!(total(&points, "code", "broadcast_outcome_unknown"), 0.0);
+    }
+
+    /// Before any request, every `fs_fund_requests` code is exported at 0, so
+    /// the first real one is an increase from 0 rather than a new series.
+    #[test]
+    fn sr_tele_012_fund_request_codes_start_at_zero() {
+        let meter = TestMeter::new();
+        let _metrics = Metrics::new(&meter.meter());
+        // a second set of instruments from the same meter adds nothing
+        let _again = Metrics::new(&meter.meter());
+
+        let (_, points) = meter.points("fs_fund_requests");
+        let mut codes: Vec<&str> = points.iter().map(|p| p.attr("code").unwrap()).collect();
+        codes.sort();
+        let mut expected = FUND_CODES.to_vec();
+        expected.sort();
+        assert_eq!(codes, expected);
+        assert!(points.iter().all(|p| p.value == 0.0), "{points:?}");
+    }
+
+    /// `FUND_CODES` is the list in uls-rs `observability/telemetry-inventory.md`,
+    /// which the dashboards and alerts are built from. Changing what
+    /// `is_fund_answer` says fails here until the inventory changes too.
+    #[test]
+    fn fund_codes_match_the_telemetry_inventory() {
+        let mut inventory = [
+            "funded",
+            "insufficient_balance",
+            "no_suitable_utxo",
+            "funds_in_flight",
+            "broadcast_rejected",
+            "broadcast_failed",
+            "broadcast_outcome_unknown",
+            "broadcaster_untrusted",
+            "partial_broadcast",
+            "chain_unavailable",
+            "invalid_request",
+            "unknown_client",
+            "unauthorized",
+            "rate_limited",
+            "key_in_progress",
+            "idempotency_key_reused",
+            "internal",
+        ];
+        inventory.sort();
+        let mut codes = FUND_CODES;
+        codes.sort();
+        assert_eq!(codes, inventory);
     }
 
     #[actix_web::test]

@@ -186,6 +186,7 @@ Requirement IDs appear in test function names (for example `sr_fund_008_*`) or a
 | SR-TELE-009 | Each client's cached balance SHALL be reported in `fs_client_balance` (unit `sat`) by `client_id` and `kind` (`confirmed`/`unconfirmed`), and the age of its last chain read in `fs_client_chain_state_age` (unit `s`) by `client_id`, sampled by a background task so no gauge callback waits or does I/O. | Must | **AT:** `metrics::tests::sr_tele_009_client_gauges_report_each_client_s_balance_and_chain_state_age` |
 | SR-TELE-010 | The `GET /ready` verdict SHALL be reported in the `ready` gauge (0/1) by `check`: each readiness check by name, plus `check="overall"`. | Must | **AT:** `metrics::tests::sr_tele_010_ready_gauge_reports_each_check_and_overall` |
 | SR-TELE-011 | The metrics SHALL be documented in Configuration.md: how to enable them, each metric's type, unit, attributes and Prometheus name, and the suggested alerts. | Must | **AT:** `system_requirements::tests::sr_tele_011_configuration_documents_every_metric` |
+| SR-TELE-012 | At startup, before any request, `fs_fund_requests` SHALL be exported at 0 for every `code` a `POST /fund` answer can carry, so that `increase()` and `rate()` see the first occurrence of each after a start. | Must | **AT:** `metrics::tests::sr_tele_012_fund_request_codes_start_at_zero` |
 
 ## Non-functional requirements
 
