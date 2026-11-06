@@ -342,7 +342,9 @@ impl TelemetryConfig {
     /// `telemetry.resource_attributes`, with a key `env_attributes` (the
     /// value of `OTEL_RESOURCE_ATTRIBUTES`) also sets taken from it (CS-674).
     /// `env_attributes` is parsed as the SDK's `EnvResourceDetector` parses
-    /// it: `key=value` pairs split on `,`, each side trimmed.
+    /// it: `key=value` pairs split on `,`, each side trimmed. An empty key,
+    /// as in `=orphan`, is skipped, which the SDK does not do but mapi-lite
+    /// does (CS-673).
     pub fn effective_resource_attributes(
         &self,
         env_attributes: Option<&str>,
@@ -363,7 +365,7 @@ impl TelemetryConfig {
             });
         from_table
             .chain(from_env)
-            .filter(|(key, _)| key != SERVICE_NAME && key != SERVICE_VERSION)
+            .filter(|(key, _)| !key.is_empty() && key != SERVICE_NAME && key != SERVICE_VERSION)
             .collect()
     }
 
@@ -654,7 +656,7 @@ mod tests {
         );
         assert_eq!(
             config.effective_resource_attributes(Some(
-                " deployment.environment.name = dev ,region=eu,broken"
+                " deployment.environment.name = dev ,region=eu,broken,=orphan, = blank"
             )),
             BTreeMap::from([
                 (
