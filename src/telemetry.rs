@@ -70,7 +70,7 @@ pub fn init(config: &TelemetryConfig) -> Result<Option<TelemetryGuard>, String> 
     };
     let otel_layer = tracer_provider
         .as_ref()
-        .map(|provider| OpenTelemetryLayer::new(provider.tracer("financing-service")));
+        .map(|provider| OpenTelemetryLayer::new(provider.tracer("financing-service-rs")));
 
     tracing_subscriber::registry()
         .with(filter)
@@ -282,7 +282,7 @@ impl TelemetryConfig {
             .ok()
             .filter(|value| !value.is_empty())
             .or_else(|| self.service_name.clone().filter(|value| !value.is_empty()))
-            .unwrap_or_else(|| "financing-service".to_string())
+            .unwrap_or_else(|| "financing-service-rs".to_string())
     }
 
     pub fn effective_otlp_endpoint(&self) -> String {
@@ -446,6 +446,23 @@ mod tests {
         };
         assert_eq!(config.effective_service_name(), "from-env");
         unsafe { env::remove_var("OTEL_SERVICE_NAME") };
+    }
+
+    /// The default is the deployed name, as the image and compose service
+    /// are named; `telemetry.service_name` overrides it.
+    #[test]
+    fn effective_service_name_defaults_to_the_deployed_name() {
+        let _env = env_lock();
+        unsafe { env::remove_var("OTEL_SERVICE_NAME") };
+        assert_eq!(
+            TelemetryConfig::default().effective_service_name(),
+            "financing-service-rs"
+        );
+        let config = TelemetryConfig {
+            service_name: Some("from-config".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(config.effective_service_name(), "from-config");
     }
 
     #[test]
@@ -711,7 +728,7 @@ mod tests {
         let plain = resource(&TelemetryConfig::default());
         assert_eq!(
             get(&plain, "service.name").as_deref(),
-            Some("financing-service")
+            Some("financing-service-rs")
         );
         assert_eq!(
             get(&plain, "service.version").as_deref(),
@@ -726,7 +743,7 @@ mod tests {
         );
         assert_eq!(
             get(&from_table, "service.name").as_deref(),
-            Some("financing-service")
+            Some("financing-service-rs")
         );
 
         unsafe {
