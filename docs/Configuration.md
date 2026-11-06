@@ -260,11 +260,15 @@ Optional OpenTelemetry export via OTLP (gRPC): traces, and metrics (see [Metrics
 enabled = true
 service_name = "financing-service"
 otlp_endpoint = "http://localhost:4317"
+export_interval_sec = 10
+resource_attributes = { "deployment.environment.name" = "local" }
 ```
 
 * `enabled` — export traces and metrics to an OTLP collector (default: `false`)
 * `service_name` — `service.name` resource attribute (default: `financing-service`)
 * `otlp_endpoint` — OTLP gRPC endpoint (default: `http://localhost:4317`)
+* `export_interval_sec` — seconds between metrics exports, at least 1 (default: the SDK's 60). Metrics only: traces are batched by the SDK, set with `OTEL_BSP_*`. `FS__TELEMETRY__EXPORT_INTERVAL_SEC` overrides it as any `FS__` variable does
+* `resource_attributes` — extra resource attributes on traces and metrics, such as `deployment.environment.name` (default: none). `service.name` here is ignored with a startup warning (use `service_name`), and so is `service.version`, which is always the service's version
 
 When enabled, the service:
 
@@ -280,10 +284,11 @@ Standard OpenTelemetry environment variables are also supported:
 | `OTEL_TRACES_EXPORTER=otlp` | Enable trace export when `telemetry.enabled` is `false` |
 | `OTEL_METRICS_EXPORTER=otlp` | Enable metrics export when `telemetry.enabled` is `false` |
 | `OTEL_SERVICE_NAME` | Overrides `telemetry.service_name` |
+| `OTEL_RESOURCE_ATTRIBUTES` | `key=value,...`; each key overrides the same key in `telemetry.resource_attributes`, and keys only the table sets are kept |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | Overrides `telemetry.otlp_endpoint` |
 | `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` | Trace-specific OTLP endpoint |
 | `OTEL_EXPORTER_OTLP_METRICS_ENDPOINT` | Metrics-specific OTLP endpoint |
-| `OTEL_METRIC_EXPORT_INTERVAL` | Metrics export interval in milliseconds (SDK default: 60000) |
+| `OTEL_METRIC_EXPORT_INTERVAL` | Overrides `telemetry.export_interval_sec`, in milliseconds (SDK default: 60000) |
 
 Traces and metrics have separate switches: `OTEL_TRACES_EXPORTER=otlp` turns on traces only and `OTEL_METRICS_EXPORTER=otlp` metrics only; `enabled = true` turns on both.
 
@@ -299,7 +304,7 @@ Then enable telemetry in config or set `OTEL_TRACES_EXPORTER=otlp` and `OTEL_EXP
 
 The service pushes metrics over OTLP (CS-608). There is no `/metrics` endpoint to scrape: point the export at an OpenTelemetry Collector and let it forward to Prometheus (or any other backend).
 
-**Enabling.** Off by default. Set `OTEL_METRICS_EXPORTER=otlp`, or `[telemetry] enabled = true` (which also turns on traces). The endpoint is `OTEL_EXPORTER_OTLP_METRICS_ENDPOINT`, else `OTEL_EXPORTER_OTLP_ENDPOINT`, else `telemetry.otlp_endpoint`, else `http://localhost:4317`; the resource carries `service.name` (`OTEL_SERVICE_NAME`, default `financing-service`) and `service.version`. With export off no meter provider is installed and recording costs nothing. Startup logs one line, `OpenTelemetry metrics export on (...)` or `... off`, naming the endpoint without any credential or query string. Metrics are flushed on shutdown.
+**Enabling.** Off by default. Set `OTEL_METRICS_EXPORTER=otlp`, or `[telemetry] enabled = true` (which also turns on traces). The endpoint is `OTEL_EXPORTER_OTLP_METRICS_ENDPOINT`, else `OTEL_EXPORTER_OTLP_ENDPOINT`, else `telemetry.otlp_endpoint`, else `http://localhost:4317`; the resource carries `service.name` (`OTEL_SERVICE_NAME`, else `telemetry.service_name`, default `financing-service`), `service.version` and any `telemetry.resource_attributes` / `OTEL_RESOURCE_ATTRIBUTES`. Metrics are exported every `OTEL_METRIC_EXPORT_INTERVAL` ms, else `telemetry.export_interval_sec`, else 60s. With export off no meter provider is installed and recording costs nothing. Startup logs one line, `OpenTelemetry metrics export on (...)` or `... off`, naming the endpoint without any credential or query string, the export interval and where it came from, and each resource attribute key and where it came from (never its value). Metrics are flushed on shutdown.
 
 Names follow OpenTelemetry conventions: counters have no `_total` and units are set on the instrument, not in the name. An OTLP-to-Prometheus conversion adds both, so `http_requests` becomes `http_requests_total` and `http_request_duration` (unit `s`) becomes `http_request_duration_seconds`. Attribute values come from fixed sets -- never raw paths, addresses, txids or keys -- so cardinality is bounded by the routes and clients configured.
 
