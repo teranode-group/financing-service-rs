@@ -1,9 +1,11 @@
-use std::env;
+use std::{collections::BTreeMap, env, time::Duration};
 
 use opentelemetry::{global, trace::TracerProvider as _, KeyValue};
 use opentelemetry_otlp::{MetricExporter, SpanExporter, WithExportConfig};
 use opentelemetry_sdk::{
-    metrics::SdkMeterProvider, propagation::TraceContextPropagator, resource::Resource,
+    metrics::{PeriodicReader, SdkMeterProvider},
+    propagation::TraceContextPropagator,
+    resource::{Resource, SdkProvidedResourceDetector, TelemetryResourceDetector},
     trace::SdkTracerProvider,
 };
 use tracing_opentelemetry::OpenTelemetryLayer;
@@ -78,6 +80,9 @@ pub fn init(config: &TelemetryConfig) -> Result<Option<TelemetryGuard>, String> 
         .map_err(|e| format!("failed to initialise tracing subscriber: {e}"))?;
 
     bridge_log_crate()?;
+    for warning in config.ignored_resource_attribute_warnings() {
+        log::warn!("{warning}");
+    }
     if tracer_provider.is_some() {
         log::info!(
             "OpenTelemetry enabled (service.name={}, otlp.endpoint={})",
@@ -104,21 +109,52 @@ pub fn init(config: &TelemetryConfig) -> Result<Option<TelemetryGuard>, String> 
     }))
 }
 
-/// `service.name` and `service.version`, on traces and metrics alike.
+/// The resource on traces and metrics alike: the SDK's own attributes, then
+/// [`TelemetryConfig::effective_resource_attributes`], then `service.name` and
+/// `service.version`, each later one winning a key.
+///
+/// Not `Resource::builder()`: its `EnvResourceDetector` adds
+/// `OTEL_RESOURCE_ATTRIBUTES` first, so the table added after it would beat
+/// the variable (CS-674). The variable is merged into the table instead.
 fn resource(config: &TelemetryConfig) -> Resource {
-    Resource::builder()
+    let env_attributes = env::var(OTEL_RESOURCE_ATTRIBUTES).ok();
+    Resource::builder_empty()
+        .with_detectors(&[
+            Box::new(SdkProvidedResourceDetector),
+            Box::new(TelemetryResourceDetector),
+        ])
+        .with_attributes(
+            config
+                .effective_resource_attributes(env_attributes.as_deref())
+                .into_iter()
+                .map(|(key, (value, _))| KeyValue::new(key, value)),
+        )
         .with_attributes(vec![
-            KeyValue::new("service.name", config.effective_service_name()),
-            KeyValue::new("service.version", env!("CARGO_PKG_VERSION")),
+            KeyValue::new(SERVICE_NAME, config.effective_service_name()),
+            KeyValue::new(SERVICE_VERSION, env!("CARGO_PKG_VERSION")),
         ])
         .build()
 }
 
+const SERVICE_NAME: &str = "service.name";
+const SERVICE_VERSION: &str = "service.version";
+const OTEL_RESOURCE_ATTRIBUTES: &str = "OTEL_RESOURCE_ATTRIBUTES";
+const OTEL_METRIC_EXPORT_INTERVAL: &str = "OTEL_METRIC_EXPORT_INTERVAL";
+
+/// The SDK's metrics export interval when nothing sets one.
+pub const DEFAULT_METRIC_EXPORT_INTERVAL: Duration = Duration::from_secs(60);
+
+/// Where a resource attribute or the export interval came from, for the
+/// startup line.
+const FROM_TABLE_ATTRIBUTES: &str = "telemetry.resource_attributes";
+const FROM_TABLE_INTERVAL: &str = "telemetry.export_interval_sec";
+const FROM_DEFAULT: &str = "default";
+
 /// The OTLP metrics pipeline, or `None` when metrics export is off -- in which
 /// case nothing is installed and `global::meter` stays the no-op meter.
 ///
-/// The `PeriodicReader` exports at the SDK's default interval, which
-/// `OTEL_METRIC_EXPORT_INTERVAL` (milliseconds) overrides.
+/// The `PeriodicReader` exports at
+/// [`TelemetryConfig::metric_export_interval`].
 pub fn build_meter_provider(config: &TelemetryConfig) -> Result<Option<SdkMeterProvider>, String> {
     if !config.metrics_enabled() {
         return Ok(None);
@@ -128,21 +164,39 @@ pub fn build_meter_provider(config: &TelemetryConfig) -> Result<Option<SdkMeterP
         .with_endpoint(config.effective_metrics_otlp_endpoint())
         .build()
         .map_err(|e| format!("failed to create OTLP metric exporter: {e}"))?;
+    // `with_interval` overrides `OTEL_METRIC_EXPORT_INTERVAL`, which the
+    // builder has read; it is passed the variable's own value when that is
+    // set, and ignores a zero.
+    let (interval, _) = config.metric_export_interval();
+    let reader = PeriodicReader::builder(exporter)
+        .with_interval(interval)
+        .build();
     Ok(Some(
         SdkMeterProvider::builder()
-            .with_periodic_exporter(exporter)
+            .with_reader(reader)
             .with_resource(resource(config))
             .build(),
     ))
 }
 
-/// The one startup line saying whether metrics are exported, and where to.
+/// The one startup line saying whether metrics are exported, where to and how
+/// often, and which resource attributes they carry and from where -- keys
+/// only, not values (CS-674).
 pub fn metrics_startup_line(config: &TelemetryConfig) -> String {
     if config.metrics_enabled() {
+        let (interval, interval_source) = config.metric_export_interval();
+        let env_attributes = env::var(OTEL_RESOURCE_ATTRIBUTES).ok();
+        let attributes = config
+            .effective_resource_attributes(env_attributes.as_deref())
+            .into_iter()
+            .map(|(key, (_, source))| format!("{key} from {source}"))
+            .collect::<Vec<_>>();
         format!(
-            "OpenTelemetry metrics export on (service.name={}, otlp.endpoint={})",
+            "OpenTelemetry metrics export on (service.name={}, otlp.endpoint={}, \
+             export.interval={interval:?} from {interval_source}, resource.attributes=[{}])",
             config.effective_service_name(),
-            redact_endpoint(&config.effective_metrics_otlp_endpoint())
+            redact_endpoint(&config.effective_metrics_otlp_endpoint()),
+            attributes.join(", ")
         )
     } else {
         "OpenTelemetry metrics export off (enable with [telemetry] enabled = true or \
@@ -260,7 +314,86 @@ impl TelemetryConfig {
             .unwrap_or_else(|| "http://localhost:4317".to_string())
     }
 
+    /// The metrics export interval and where it came from:
+    /// `OTEL_METRIC_EXPORT_INTERVAL` (milliseconds), else
+    /// `telemetry.export_interval_sec`, else the SDK's 60s (CS-674), as
+    /// mapi-lite resolves it.
+    ///
+    /// The variable counts only as a whole number of milliseconds above 0.
+    /// The SDK's builder takes a `0` as given, and `with_interval` ignores a
+    /// zero, so passing on the variable's 0 would leave the reader exporting
+    /// in a tight loop; skipping it lets `with_interval` replace it.
+    pub fn metric_export_interval(&self) -> (Duration, &'static str) {
+        if let Some(millis) = env::var(OTEL_METRIC_EXPORT_INTERVAL)
+            .ok()
+            .and_then(|value| value.trim().parse::<u64>().ok())
+            .filter(|&millis| millis > 0)
+        {
+            return (Duration::from_millis(millis), OTEL_METRIC_EXPORT_INTERVAL);
+        }
+        match self.export_interval_sec {
+            Some(secs) => (Duration::from_secs(secs), FROM_TABLE_INTERVAL),
+            None => (DEFAULT_METRIC_EXPORT_INTERVAL, FROM_DEFAULT),
+        }
+    }
+
+    /// The resource attributes besides `service.name` and `service.version`,
+    /// by key, with each value and where it came from:
+    /// `telemetry.resource_attributes`, with a key `env_attributes` (the
+    /// value of `OTEL_RESOURCE_ATTRIBUTES`) also sets taken from it (CS-674).
+    /// `env_attributes` is parsed as the SDK's `EnvResourceDetector` parses
+    /// it: `key=value` pairs split on `,`, each side trimmed.
+    pub fn effective_resource_attributes(
+        &self,
+        env_attributes: Option<&str>,
+    ) -> BTreeMap<String, (String, &'static str)> {
+        let from_table = self
+            .resource_attributes
+            .iter()
+            .map(|(key, value)| (key.clone(), (value.clone(), FROM_TABLE_ATTRIBUTES)));
+        let from_env = env_attributes
+            .unwrap_or_default()
+            .split_terminator(',')
+            .filter_map(|entry| entry.split_once('='))
+            .map(|(key, value)| {
+                (
+                    key.trim().to_string(),
+                    (value.trim().to_string(), OTEL_RESOURCE_ATTRIBUTES),
+                )
+            });
+        from_table
+            .chain(from_env)
+            .filter(|(key, _)| key != SERVICE_NAME && key != SERVICE_VERSION)
+            .collect()
+    }
+
+    /// A warning for each key of `telemetry.resource_attributes` that is
+    /// ignored because the service sets it itself.
+    pub fn ignored_resource_attribute_warnings(&self) -> Vec<String> {
+        let mut warnings = Vec::new();
+        if self.resource_attributes.contains_key(SERVICE_NAME) {
+            warnings.push(format!(
+                "telemetry.resource_attributes \"{SERVICE_NAME}\" is ignored: set it with \
+                 telemetry.service_name or OTEL_SERVICE_NAME"
+            ));
+        }
+        if self.resource_attributes.contains_key(SERVICE_VERSION) {
+            warnings.push(format!(
+                "telemetry.resource_attributes \"{SERVICE_VERSION}\" is ignored: it is always \
+                 the service's version"
+            ));
+        }
+        warnings
+    }
+
     pub fn validate(&self) -> Result<(), String> {
+        if self.export_interval_sec == Some(0) {
+            return Err(
+                "telemetry.export_interval_sec must be at least 1 (seconds); leave it out for \
+                 the SDK's 60s"
+                    .to_string(),
+            );
+        }
         if (self.is_enabled() || self.metrics_enabled())
             && self.otlp_endpoint.as_deref().is_some_and(str::is_empty)
         {
@@ -327,10 +460,12 @@ mod tests {
         unsafe { env::remove_var("OTEL_EXPORTER_OTLP_ENDPOINT") };
     }
 
-    const METRICS_ENV: [&str; 3] = [
+    const METRICS_ENV: [&str; 5] = [
         "OTEL_METRICS_EXPORTER",
         "OTEL_EXPORTER_OTLP_METRICS_ENDPOINT",
         "OTEL_EXPORTER_OTLP_ENDPOINT",
+        OTEL_METRIC_EXPORT_INTERVAL,
+        OTEL_RESOURCE_ATTRIBUTES,
     ];
 
     fn clear_metrics_env() {
@@ -443,6 +578,212 @@ mod tests {
             TelemetryConfig::default().effective_metrics_otlp_endpoint(),
             "http://localhost:4317"
         );
+    }
+
+    fn with_table_attributes(pairs: &[(&str, &str)]) -> TelemetryConfig {
+        TelemetryConfig {
+            resource_attributes: pairs
+                .iter()
+                .map(|(key, value)| (key.to_string(), value.to_string()))
+                .collect(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn sr_tele_013_export_interval_is_the_variable_else_the_table_else_60s() {
+        let _env = env_lock();
+        clear_metrics_env();
+        assert_eq!(
+            TelemetryConfig::default().metric_export_interval(),
+            (Duration::from_secs(60), "default")
+        );
+        let config = TelemetryConfig {
+            export_interval_sec: Some(10),
+            ..Default::default()
+        };
+        assert_eq!(
+            config.metric_export_interval(),
+            (Duration::from_secs(10), "telemetry.export_interval_sec")
+        );
+        unsafe { env::set_var(OTEL_METRIC_EXPORT_INTERVAL, "5000") };
+        assert_eq!(
+            config.metric_export_interval(),
+            (Duration::from_secs(5), "OTEL_METRIC_EXPORT_INTERVAL")
+        );
+        unsafe { env::set_var(OTEL_METRIC_EXPORT_INTERVAL, " 5000 ") };
+        assert_eq!(
+            config.metric_export_interval(),
+            (Duration::from_secs(5), "OTEL_METRIC_EXPORT_INTERVAL")
+        );
+        // Neither one the SDK cannot read, nor 0, nor empty hides the table's.
+        for value in ["5s", "0", ""] {
+            unsafe { env::set_var(OTEL_METRIC_EXPORT_INTERVAL, value) };
+            assert_eq!(
+                config.metric_export_interval(),
+                (Duration::from_secs(10), "telemetry.export_interval_sec"),
+                "{value:?}"
+            );
+        }
+        unsafe { env::set_var(OTEL_METRIC_EXPORT_INTERVAL, "0") };
+        assert_eq!(
+            TelemetryConfig::default().metric_export_interval(),
+            (Duration::from_secs(60), "default")
+        );
+        clear_metrics_env();
+    }
+
+    #[test]
+    fn sr_tele_013_otel_resource_attributes_override_the_table_key_by_key() {
+        let config = with_table_attributes(&[
+            ("deployment.environment.name", "local"),
+            ("team", "payments"),
+        ]);
+        assert_eq!(
+            config.effective_resource_attributes(None),
+            BTreeMap::from([
+                (
+                    "deployment.environment.name".to_string(),
+                    ("local".to_string(), FROM_TABLE_ATTRIBUTES)
+                ),
+                (
+                    "team".to_string(),
+                    ("payments".to_string(), FROM_TABLE_ATTRIBUTES)
+                ),
+            ])
+        );
+        assert_eq!(
+            config.effective_resource_attributes(Some(
+                " deployment.environment.name = dev ,region=eu,broken"
+            )),
+            BTreeMap::from([
+                (
+                    "deployment.environment.name".to_string(),
+                    ("dev".to_string(), OTEL_RESOURCE_ATTRIBUTES)
+                ),
+                (
+                    "region".to_string(),
+                    ("eu".to_string(), OTEL_RESOURCE_ATTRIBUTES)
+                ),
+                (
+                    "team".to_string(),
+                    ("payments".to_string(), FROM_TABLE_ATTRIBUTES)
+                ),
+            ])
+        );
+    }
+
+    #[test]
+    fn sr_tele_013_service_name_and_version_in_the_table_are_ignored_with_a_warning() {
+        let config = with_table_attributes(&[
+            ("service.name", "other"),
+            ("service.version", "9.9.9"),
+            ("team", "payments"),
+        ]);
+        let attributes =
+            config.effective_resource_attributes(Some("service.name=env,service.version=0"));
+        assert_eq!(attributes.keys().collect::<Vec<_>>(), ["team"]);
+        let warnings = config.ignored_resource_attribute_warnings();
+        assert_eq!(warnings.len(), 2, "{warnings:?}");
+        assert!(warnings[0].contains("\"service.name\" is ignored"));
+        assert!(warnings[1].contains("\"service.version\" is ignored"));
+        assert!(with_table_attributes(&[("team", "payments")])
+            .ignored_resource_attribute_warnings()
+            .is_empty());
+    }
+
+    /// The resource both providers carry: the table, overridden key by key
+    /// by `OTEL_RESOURCE_ATTRIBUTES`, and `service.name` from its own chain.
+    #[test]
+    fn sr_tele_013_the_resource_carries_the_merged_attributes() {
+        let _env = env_lock();
+        clear_metrics_env();
+        unsafe { env::remove_var("OTEL_SERVICE_NAME") };
+        let config = with_table_attributes(&[
+            ("deployment.environment.name", "local"),
+            ("team", "payments"),
+            ("service.name", "ignored"),
+        ]);
+        let get = |resource: &Resource, key: &'static str| {
+            resource.get(&key.into()).map(|value| value.to_string())
+        };
+
+        let plain = resource(&TelemetryConfig::default());
+        assert_eq!(
+            get(&plain, "service.name").as_deref(),
+            Some("financing-service")
+        );
+        assert_eq!(
+            get(&plain, "service.version").as_deref(),
+            Some(env!("CARGO_PKG_VERSION"))
+        );
+        assert_eq!(get(&plain, "deployment.environment.name"), None);
+
+        let from_table = resource(&config);
+        assert_eq!(
+            get(&from_table, "deployment.environment.name").as_deref(),
+            Some("local")
+        );
+        assert_eq!(
+            get(&from_table, "service.name").as_deref(),
+            Some("financing-service")
+        );
+
+        unsafe {
+            env::set_var(
+                OTEL_RESOURCE_ATTRIBUTES,
+                "deployment.environment.name=dev,service.version=0",
+            )
+        };
+        let overridden = resource(&config);
+        clear_metrics_env();
+        assert_eq!(
+            get(&overridden, "deployment.environment.name").as_deref(),
+            Some("dev")
+        );
+        assert_eq!(get(&overridden, "team").as_deref(), Some("payments"));
+        assert_eq!(
+            get(&overridden, "service.version").as_deref(),
+            Some(env!("CARGO_PKG_VERSION"))
+        );
+    }
+
+    /// The startup line names the interval, and each attribute key with its
+    /// source, but no attribute value.
+    #[test]
+    fn sr_tele_013_the_startup_line_names_interval_and_attribute_sources() {
+        let _env = env_lock();
+        clear_metrics_env();
+        unsafe { env::set_var(OTEL_RESOURCE_ATTRIBUTES, "region=eu-secret") };
+        let config = TelemetryConfig {
+            enabled: true,
+            export_interval_sec: Some(10),
+            ..with_table_attributes(&[("deployment.environment.name", "local-secret")])
+        };
+        let line = metrics_startup_line(&config);
+        clear_metrics_env();
+        assert!(
+            line.contains("export.interval=10s from telemetry.export_interval_sec"),
+            "{line}"
+        );
+        assert!(
+            line.contains(
+                "resource.attributes=[deployment.environment.name from \
+                 telemetry.resource_attributes, region from OTEL_RESOURCE_ATTRIBUTES]"
+            ),
+            "{line}"
+        );
+        assert!(!line.contains("secret"), "{line}");
+    }
+
+    #[test]
+    fn sr_cfg_007_an_export_interval_of_zero_is_refused() {
+        let config = TelemetryConfig {
+            export_interval_sec: Some(0),
+            ..Default::default()
+        };
+        let err = config.validate().unwrap_err();
+        assert!(err.contains("telemetry.export_interval_sec"), "{err}");
     }
 
     #[test]

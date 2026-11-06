@@ -1,4 +1,4 @@
-use std::{env, net::SocketAddr, time::Duration};
+use std::{collections::BTreeMap, env, net::SocketAddr, time::Duration};
 
 use chain_gang::network::Network;
 use log::debug;
@@ -192,6 +192,16 @@ pub struct TelemetryConfig {
     pub service_name: Option<String>,
     #[serde(default)]
     pub otlp_endpoint: Option<String>,
+    /// Seconds between metrics exports (CS-674). `OTEL_METRIC_EXPORT_INTERVAL`
+    /// (milliseconds) overrides it; unset, the SDK's 60s.
+    #[serde(default)]
+    pub export_interval_sec: Option<u64>,
+    /// Resource attributes on traces and metrics, such as
+    /// `deployment.environment.name` (CS-674). A key `OTEL_RESOURCE_ATTRIBUTES`
+    /// also sets is taken from the variable. `service.name` and
+    /// `service.version` are ignored here.
+    #[serde(default)]
+    pub resource_attributes: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Default, Deserialize, Clone)]
@@ -1673,6 +1683,46 @@ filename = "./data/dynamic.toml"
 
         let err = load_config(path.to_str().unwrap()).unwrap_err();
         assert!(err.contains("telemetry.otlp_endpoint"));
+    }
+
+    /// The two CS-674 fields as an operator writes them: a dotted attribute
+    /// key stays one key, `FS__TELEMETRY__EXPORT_INTERVAL_SEC` overrides the
+    /// interval, 0 is refused, and a misspelt key is still named.
+    #[test]
+    fn sr_tele_013_telemetry_reads_export_interval_and_resource_attributes() {
+        let toml = format!(
+            "{MINIMAL_TOML}\n[telemetry]\nexport_interval_sec = 10\n\
+             resource_attributes = {{ \"deployment.environment.name\" = \"local\" }}\n"
+        );
+        let path = write_temp_config("telemetry-fields", &toml);
+        let path = path.to_str().unwrap();
+
+        let config = with_env(&[], || load_config(path).unwrap());
+        assert_eq!(config.telemetry.export_interval_sec, Some(10));
+        assert_eq!(
+            config.telemetry.resource_attributes,
+            BTreeMap::from([(
+                "deployment.environment.name".to_string(),
+                "local".to_string()
+            )])
+        );
+
+        let config = with_env(&[("FS__TELEMETRY__EXPORT_INTERVAL_SEC", "30")], || {
+            load_config(path).unwrap()
+        });
+        assert_eq!(config.telemetry.export_interval_sec, Some(30));
+
+        let err = with_env(&[("FS__TELEMETRY__EXPORT_INTERVAL_SEC", "0")], || {
+            load_config(path).unwrap_err()
+        });
+        assert!(err.contains("telemetry.export_interval_sec"), "{err}");
+
+        let misspelt = write_temp_config(
+            "telemetry-misspelt",
+            &format!("{MINIMAL_TOML}\n[telemetry]\nexport_interval_secs = 10\n"),
+        );
+        let err = with_env(&[], || load_config(misspelt.to_str().unwrap()).unwrap_err());
+        assert!(err.contains("telemetry.export_interval_secs"), "{err}");
     }
 
     /// The smallest config the service accepts, for the [mapi_lite] tests to

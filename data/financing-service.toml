@@ -52,6 +52,8 @@ network = "testnet"
 # enabled = true
 # service_name = "financing-service"
 # otlp_endpoint = "http://localhost:4317"
+# export_interval_sec = 60                 # metrics only; OTEL_METRIC_EXPORT_INTERVAL overrides
+# resource_attributes = { "deployment.environment.name" = "local" }
 
 [service]
 utxo_refresh_period = 60
