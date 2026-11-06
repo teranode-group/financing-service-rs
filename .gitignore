@@ -6,3 +6,4 @@ tree.txt
 
 /data/dynamic*.toml
 /certs
+/data/local.toml

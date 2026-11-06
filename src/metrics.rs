@@ -34,7 +34,7 @@ use crate::{
 };
 
 /// The instrumentation scope every instrument is created under.
-pub const METER_NAME: &str = "financing-service";
+pub const METER_NAME: &str = "financing-service-rs";
 
 /// How often the gauges' sampler reads the service.
 pub const SAMPLE_PERIOD: Duration = Duration::from_secs(15);

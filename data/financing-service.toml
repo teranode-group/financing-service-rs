@@ -50,7 +50,7 @@ network = "testnet"
 
 # [telemetry]
 # enabled = true
-# service_name = "financing-service"
+# service_name = "financing-service-rs"
 # otlp_endpoint = "http://localhost:4317"
 # export_interval_sec = 60                 # metrics only; OTEL_METRIC_EXPORT_INTERVAL overrides
 # resource_attributes = { "deployment.environment.name" = "local" }
