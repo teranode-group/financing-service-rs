@@ -60,6 +60,20 @@ pub enum BroadcastError {
 }
 
 impl BroadcastError {
+    /// Whether the upstream refused the transaction because an input is
+    /// already spent by another transaction (CS-691), as SV Node's
+    /// `258 txn-mempool-conflict` or a double-spend reason says. Only a
+    /// definite refusal says this.
+    pub fn inputs_conflicted(&self) -> bool {
+        let BroadcastError::Rejected { description, .. } = self else {
+            return false;
+        };
+        let description = description.to_ascii_lowercase();
+        description.contains("txn-mempool-conflict")
+            || description.contains("double-spend")
+            || description.contains("conflicted with")
+    }
+
     /// Whether the upstream refused the transaction because an input does not
     /// exist (CS-506).
     ///
@@ -177,6 +191,16 @@ mod tests {
         assert!(rejected("Missing inputs").inputs_missing());
         assert!(rejected("bad-txns-inputs-missingorspent").inputs_missing());
         assert!(!rejected("258 txn-mempool-conflict").inputs_missing());
+        assert!(rejected("258 txn-mempool-conflict").inputs_conflicted());
+        assert!(
+            rejected("Mempool error (details: 258 txn-mempool-conflict) (conflicted with ab)")
+                .inputs_conflicted()
+        );
+        assert!(!rejected("16 missing-inputs").inputs_conflicted());
+        assert!(!BroadcastError::Upstream("txn-mempool-conflict".to_string()).inputs_conflicted());
+        assert!(
+            !BroadcastError::Indeterminate("txn-mempool-conflict".to_string()).inputs_conflicted()
+        );
         assert!(!BroadcastError::Upstream("missing-inputs".to_string()).inputs_missing());
         assert!(!BroadcastError::Indeterminate("missing-inputs".to_string()).inputs_missing());
     }

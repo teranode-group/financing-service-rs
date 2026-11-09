@@ -1674,11 +1674,18 @@ impl Service {
             Err(FundingBroadcastError {
                 error,
                 inputs_missing,
+                inputs_conflicted,
             }) => {
                 if error.code == ErrorCode::BroadcastOutcomeUnknown {
                     Self::reserve_uncertain_funding(service, &prepared).await;
                 } else {
-                    Self::release_prepared_funding(service, &prepared, inputs_missing).await;
+                    Self::release_prepared_funding(
+                        service,
+                        &prepared,
+                        inputs_missing,
+                        inputs_conflicted,
+                    )
+                    .await;
                 }
                 // Marked stale rather than refetched. The cache is already
                 // right -- nothing was spent on a refusal, and an uncertain
@@ -1708,23 +1715,30 @@ impl Service {
     /// Except, when the node said inputs are missing, the service's own
     /// pending change among them, which it will never list and so could
     /// never take back (CS-506): that is forgotten, with anything built on
-    /// it, and the in-flight state saved without it.
+    /// it, and the in-flight state saved without it. And when it said an
+    /// input is spent by another transaction, own change is not made pending
+    /// again, so the next refresh can drop it (CS-691).
+    ///
+    /// The in-flight state is saved whenever this changed the pending change,
+    /// so a restart does not lose it (CS-465).
     async fn release_prepared_funding(
         service: &Arc<Service>,
         prepared: &PreparedFunding,
         inputs_missing: bool,
+        inputs_conflicted: bool,
     ) {
         if let Some(client) = service.client_handle(&prepared.client_id).await {
-            let forgotten = {
+            let changed = {
                 let mut client = client.write().await;
-                client.release_claim(&prepared.spend_plan);
-                if inputs_missing {
+                let repended = client.release_claim(&prepared.spend_plan, inputs_conflicted);
+                let forgotten = if inputs_missing {
                     client.forget_refused_own_change(&prepared.spend_plan)
                 } else {
                     0
-                }
+                };
+                repended + forgotten
             };
-            if forgotten > 0 {
+            if changed > 0 {
                 service.save_inflight_state().await;
             }
         }
@@ -1808,12 +1822,18 @@ impl Service {
                         Err(FundingBroadcastError {
                             error: cause,
                             inputs_missing,
+                            inputs_conflicted,
                         }) => {
                             if cause.code == ErrorCode::BroadcastOutcomeUnknown {
                                 Self::reserve_uncertain_funding(service, &prepared).await;
                             } else {
-                                Self::release_prepared_funding(service, &prepared, inputs_missing)
-                                    .await;
+                                Self::release_prepared_funding(
+                                    service,
+                                    &prepared,
+                                    inputs_missing,
+                                    inputs_conflicted,
+                                )
+                                .await;
                             }
                             if tx_index == 0 {
                                 resync_after_multiple_tx_failure(service, fund_request).await;
@@ -1894,6 +1914,7 @@ impl Service {
             return Err(FundingBroadcastError {
                 error,
                 inputs_missing: e.inputs_missing(),
+                inputs_conflicted: e.inputs_conflicted(),
             });
         }
         log::info!(
@@ -1981,6 +2002,9 @@ pub struct FundingBroadcastError {
     pub error: CodedError,
     /// The node refused it because an input does not exist (CS-506).
     pub inputs_missing: bool,
+    /// The node refused it because an input is spent by another transaction
+    /// (CS-691).
+    pub inputs_conflicted: bool,
 }
 
 impl From<CodedError> for FundingBroadcastError {
@@ -1988,6 +2012,7 @@ impl From<CodedError> for FundingBroadcastError {
         Self {
             error,
             inputs_missing: false,
+            inputs_conflicted: false,
         }
     }
 }
