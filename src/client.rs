@@ -3070,6 +3070,35 @@ mod tests {
         );
     }
 
+    /// The same, with the flag the service computes for a conflict refused
+    /// through the blockchain interface (no `[mapi_lite]`), which reports it
+    /// as `Upstream` (#160 review).
+    #[test]
+    fn cs_691_a_conflict_reported_as_upstream_is_dropped_by_the_next_refresh() {
+        let input = cs_426_utxo(1, 5_000);
+        let mut client = client_holding(vec![input.clone()]);
+        let change = spend_own_change(&mut client, 1).remove(0);
+        let conflicted = claim_one(&mut client, 1_000);
+        client.apply_chain_state(vec![input.clone()]);
+
+        let spent_elsewhere = crate::broadcaster::BroadcastError::Upstream(
+            "A provided argument is not valid `258: txn-mempool-conflict`".to_string(),
+        )
+        .inputs_conflicted();
+        assert!(spent_elsewhere);
+        assert_eq!(client.release_claim(&conflicted, spent_elsewhere), 0);
+        client.invalidate_chain_state();
+        client.apply_chain_state(vec![]);
+
+        assert!(
+            !client
+                .unspent
+                .iter()
+                .any(|utxo| outpoint_key(utxo) == outpoint_key(&change)),
+            "change spent by a conflicting transaction is offered again"
+        );
+    }
+
     /// A claim the upstream definitely refused spent nothing: its own change
     /// is spendable again at once, and stays so across a refresh from an
     /// index that has not listed it yet -- the claim's hold is gone, and the

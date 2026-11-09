@@ -60,15 +60,31 @@ pub enum BroadcastError {
 }
 
 impl BroadcastError {
-    /// Whether the upstream refused the transaction because an input is
-    /// already spent by another transaction (CS-691), as SV Node's
-    /// `258 txn-mempool-conflict` or a double-spend reason says. Only a
-    /// definite refusal says this.
+    /// The text a node's reject reason can be read from, lowercased: a
+    /// refusal's description, or an upstream error's detail.
+    ///
+    /// [`woc::WocBroadcaster`] reports a node's refusal as
+    /// [`BroadcastError::Upstream`], because chain-gang's interfaces do not
+    /// tell a refusal from a transport failure, so the reason is only in the
+    /// text. That is safe to read: a transport failure never carries a node's
+    /// reject reason. An indeterminate or untrusted outcome is never read,
+    /// since it says nothing definite about the inputs.
+    fn node_reason(&self) -> Option<String> {
+        match self {
+            BroadcastError::Rejected { description, .. } => Some(description.to_ascii_lowercase()),
+            BroadcastError::Upstream(detail) => Some(detail.to_ascii_lowercase()),
+            BroadcastError::Indeterminate(_) | BroadcastError::Untrusted(_) => None,
+        }
+    }
+
+    /// Whether the node refused the transaction because an input is already
+    /// spent by another transaction (CS-691), as SV Node's
+    /// `258 txn-mempool-conflict` or a double-spend reason says, through
+    /// mapi-lite or through the blockchain interface ([`Self::node_reason`]).
     pub fn inputs_conflicted(&self) -> bool {
-        let BroadcastError::Rejected { description, .. } = self else {
+        let Some(description) = self.node_reason() else {
             return false;
         };
-        let description = description.to_ascii_lowercase();
         description.contains("txn-mempool-conflict")
             || description.contains("double-spend")
             || description.contains("conflicted with")
@@ -80,13 +96,13 @@ impl BroadcastError {
     /// Matched on the node's reject reason as mapi-lite passes it through --
     /// `16 missing-inputs` from SV Node, `bad-txns-inputs-missingorspent` from
     /// its consensus check -- since neither the node nor mapi-lite gives it a
-    /// code of its own. Only a definite refusal says this: an error that never
-    /// reached the node says nothing about the inputs.
+    /// code of its own. Read through the blockchain interface too
+    /// ([`Self::node_reason`]). An outcome that may never have reached the
+    /// node says nothing about the inputs.
     pub fn inputs_missing(&self) -> bool {
-        let BroadcastError::Rejected { description, .. } = self else {
+        let Some(description) = self.node_reason() else {
             return false;
         };
-        let description = description.to_ascii_lowercase();
         description.contains("missing-inputs")
             || description.contains("missing inputs")
             || description.contains("missingorspent")
@@ -197,12 +213,22 @@ mod tests {
                 .inputs_conflicted()
         );
         assert!(!rejected("16 missing-inputs").inputs_conflicted());
-        assert!(!BroadcastError::Upstream("txn-mempool-conflict".to_string()).inputs_conflicted());
+        // Through the blockchain interface a node's refusal is `Upstream`, as
+        // `WocBroadcaster` reports chain-gang's error (#160 review).
+        let upstream = |detail: &str| BroadcastError::Upstream(detail.to_string());
+        assert!(
+            upstream("A provided argument is not valid `258: txn-mempool-conflict`")
+                .inputs_conflicted()
+        );
+        assert!(upstream("16: missing-inputs").inputs_missing());
+        assert!(!upstream("http status 503").inputs_conflicted());
+        assert!(!upstream("http status 503").inputs_missing());
+        // An outcome that may never have reached the node says nothing.
         assert!(
             !BroadcastError::Indeterminate("txn-mempool-conflict".to_string()).inputs_conflicted()
         );
-        assert!(!BroadcastError::Upstream("missing-inputs".to_string()).inputs_missing());
         assert!(!BroadcastError::Indeterminate("missing-inputs".to_string()).inputs_missing());
+        assert!(!BroadcastError::Untrusted("txn-mempool-conflict".to_string()).inputs_conflicted());
     }
 
     #[test]

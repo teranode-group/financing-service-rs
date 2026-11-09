@@ -135,4 +135,67 @@ mod tests {
         let broadcaster = WocBroadcaster::new(blockchain, "test");
         assert!(broadcaster.health_check().await.is_ok());
     }
+
+    /// A node behind the blockchain interface that refuses every broadcast
+    /// as a mempool conflict, in SV Node's words.
+    struct ConflictingBlockchain {
+        inner: tokio::sync::Mutex<chain_gang::interface::TestInterface>,
+    }
+
+    #[async_trait]
+    impl BlockchainInterface for ConflictingBlockchain {
+        fn set_network(&mut self, network: &chain_gang::network::Network) {
+            if let Ok(mut inner) = self.inner.try_lock() {
+                inner.set_network(network);
+            }
+        }
+        async fn status(&self) -> Result<(), chain_gang::util::ChainGangError> {
+            self.inner.lock().await.status().await
+        }
+        async fn get_balance(
+            &self,
+            address: &str,
+        ) -> Result<chain_gang::interface::Balance, chain_gang::util::ChainGangError> {
+            self.inner.lock().await.get_balance(address).await
+        }
+        async fn get_utxo(
+            &self,
+            address: &str,
+        ) -> Result<chain_gang::interface::Utxo, chain_gang::util::ChainGangError> {
+            self.inner.lock().await.get_utxo(address).await
+        }
+        async fn broadcast_tx(&self, _tx: &Tx) -> Result<String, chain_gang::util::ChainGangError> {
+            Err(chain_gang::util::ChainGangError::BadArgument(
+                "258: txn-mempool-conflict".to_string(),
+            ))
+        }
+        async fn get_tx(&self, txid: &str) -> Result<Tx, chain_gang::util::ChainGangError> {
+            self.inner.lock().await.get_tx(txid).await
+        }
+        async fn get_latest_block_header(
+            &self,
+        ) -> Result<chain_gang::messages::BlockHeader, chain_gang::util::ChainGangError> {
+            self.inner.lock().await.get_latest_block_header().await
+        }
+        async fn get_block_headers(&self) -> Result<String, chain_gang::util::ChainGangError> {
+            self.inner.lock().await.get_block_headers().await
+        }
+    }
+
+    /// CS-691, from the #160 review: without `[mapi_lite]`, a node's conflict
+    /// refusal reaches the service through this broadcaster, and is read as a
+    /// conflict, so the own change it spent is not offered again.
+    #[tokio::test]
+    async fn cs_691_a_conflict_through_the_blockchain_interface_is_a_conflict() {
+        let blockchain = Arc::new(ConflictingBlockchain {
+            inner: tokio::sync::Mutex::new(chain_gang::interface::TestInterface::new()),
+        });
+        let broadcaster = WocBroadcaster::new(blockchain, "woc");
+        let error = broadcaster
+            .broadcast_tx(&sample_tx())
+            .await
+            .expect_err("refused");
+        assert!(error.inputs_conflicted(), "classified as: {error}");
+        assert!(!error.inputs_missing(), "classified as: {error}");
+    }
 }
