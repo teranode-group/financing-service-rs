@@ -13,7 +13,9 @@ data/dynamic*
 data/*.inflight.json
 data/*.tmp*
 
-# Key material and local configuration.
+# Key material and local configuration. local*.toml holds a developer's WIFs
+# in plaintext.
+data/local*.toml
 certs
 *.pem
 *.key
