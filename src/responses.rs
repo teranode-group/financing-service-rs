@@ -399,6 +399,11 @@ pub struct BalanceResponse {
     /// has to guess a fee and the number of inputs, which is what the balance
     /// endpoint should be telling it.
     pub max_fundable: i64,
+    /// Satoshis below which change is not worth an output (SR-FUND-025): the
+    /// figure `POST /fund` decides by, at the fee rate this client pays now
+    /// (CS-684). Published so a caller that has to agree with it, such as
+    /// Event's UTXO cache, reads it rather than derives it.
+    pub dust_threshold: i64,
 }
 
 #[derive(Serialize, Clone, Debug, PartialEq)]

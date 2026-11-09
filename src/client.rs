@@ -825,7 +825,11 @@ impl Client {
     /// 546, which is where Bitcoin Core's number comes from. That figure is
     /// not wrong, it is pinned to a fee rate three orders of magnitude above
     /// what BSV charges.
-    fn dust_threshold(&self) -> i64 {
+    ///
+    /// Published on `GET /client/{client_id}/balance` as `dust_threshold`
+    /// (CS-684), so a caller that must agree with it -- Event's UTXO cache,
+    /// deciding what is worth keeping -- reads it rather than derives it.
+    pub fn dust_threshold(&self) -> i64 {
         let round_trip_bytes = Self::CHANGE_OUTPUT_BYTES + Self::INPUT_BYTES;
         let break_even = round_trip_bytes
             .saturating_mul(self.fee_satoshis_per_kb)

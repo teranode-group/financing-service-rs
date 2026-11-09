@@ -418,7 +418,8 @@ curl -H "Authorization: Bearer your-client-api-key" \
 {
     "confirmed": 99904,
     "unconfirmed": 95162,
-    "max_fundable": 98904
+    "max_fundable": 98904,
+    "dust_threshold": 38
 }
 ```
 
@@ -429,5 +430,7 @@ If such a parent never makes it — a conflict, an eviction or a reorg drops it 
 Both figures are **derived from the unspent set**, not asked for separately. A separate balance query can disagree with the UTXOs it is meant to describe — WhatsOnChain's `/address/{address}/balance` is deprecated and was reporting `unconfirmed: 0` for addresses whose unspent set plainly held unconfirmed outputs — and when they disagree, the unspent set is the one that decides what can be funded. Deriving means `confirmed`, `unconfirmed` and `max_fundable` always describe the same set of coins, and that the balance reflects a funding transaction the moment it spends from them rather than at the next refresh.
 
 `max_fundable` is **the most a single `POST /fund` can ask for right now**, assuming one standard P2PKH outpoint. Use it rather than deriving a figure from the balance.
+
+`dust_threshold` is **the value, in satoshis, below which change is not worth an output** (SR-FUND-025): what `POST /fund` decides by when it folds change into the fee rather than paying it back. It is `max(1, 2 × ceil((34 + 148) × fee rate ÷ 1000))` at the rate this client pays now (sat/KB, from [`[fees]`](Configuration.md#fees) or mapi-lite's quote), so it moves with the rate: 38 at the default 100 sat/KB. It is published so a caller that has to agree with it -- Event's UTXO cache, deciding whether an outpoint fits a write or a recovery is worth broadcasting -- reads it rather than derives its own (CS-684). It is read under the same lock as the other figures, so all of them describe the same moment.
 
 It is not `confirmed + unconfirmed` minus a fee you can guess. Fees come out of the same UTXOs, and every input the transaction has to spend adds bytes and so adds fee — so a wallet holding its balance in many small pieces can fund far less than one holding the same total in a single piece. Where the difference is large, the UTXOs are fragmented: a request between `max_fundable` and what the balance suggests is refused with `no_suitable_utxo`, whose description says what consolidating would raise the limit to.

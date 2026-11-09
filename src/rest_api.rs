@@ -785,10 +785,11 @@ pub async fn balance(
     }
 
     match data.service.get_balance_and_max_fundable(&client_id).await {
-        Some((balance, max_fundable)) => json_ok(&BalanceResponse {
+        Some((balance, max_fundable, dust_threshold)) => json_ok(&BalanceResponse {
             confirmed: balance.confirmed,
             unconfirmed: balance.unconfirmed,
             max_fundable,
+            dust_threshold,
         }),
         None => error_response(
             ErrorCode::UnknownClient,
@@ -1229,6 +1230,10 @@ mod tests {
             .contains("Unknown client_id"));
     }
 
+    /// SR-FUND-025's threshold at the test config's [fees] rate, the default
+    /// 100 sat/KB: 2 * ceil((34 + 148) * 100 / 1000).
+    const DUST_AT_DEFAULT_RATE: i64 = 38;
+
     #[actix_web::test]
     async fn test_balance_success() {
         let app = build_app().await;
@@ -1242,6 +1247,9 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
         let body: Value = test::read_body_json(resp).await;
         assert!(body["confirmed"].as_i64().unwrap() > 0);
+        // CS-684: the dust threshold POST /fund decides by, at the test
+        // config's [fees] rate.
+        assert_eq!(body["dust_threshold"], DUST_AT_DEFAULT_RATE, "{body}");
     }
 
     #[actix_web::test]
