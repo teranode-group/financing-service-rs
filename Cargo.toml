@@ -6,7 +6,7 @@ edition = "2021"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-actix-web = { version = "4.15.0", default-features = false, features = ["macros", "compress-brotli", "compress-gzip", "compress-zstd", "cookies", "unicode", "compat", "ws"] }
+actix-web = { version = "4.18.2", default-features = false, features = ["macros", "compress-brotli", "compress-gzip", "compress-zstd", "cookies", "unicode", "compat", "ws"] }
 serde = { version = "1.0.229", features =["derive"] }
 toml = "1.1.6"
 # The configuration loader: the TOML file, then FS__ environment overrides
@@ -56,7 +56,7 @@ uls-core = { git = "ssh://git@github.com/teranode-group/mapi-rs.git", rev = "593
 reqwest = { version = "0.13", default-features = false }
 
 [dev-dependencies]
-actix-http = "3"
+actix-http = "3.20.3"
 # MapiBroadcaster tests: a mock mapi-lite serving the real wire shapes, with
 # uls-core signing the envelopes the way the server does.
 wiremock = "0.6"
