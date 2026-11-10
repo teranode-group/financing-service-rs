@@ -382,7 +382,7 @@ ttl_seconds = 600
 max_entries = 10000
 ```
 
-* `ttl_seconds` — how long a completed record stays replayable. Should comfortably exceed your clients' retry window; too short and a legitimate retry funds a second time. Default `600`.
+* `ttl_seconds` — how long a completed record stays replayable. Should comfortably exceed your clients' retry window; too short and a legitimate retry funds a second time. Default `600`. For a client whose Event runs its UTXO cache, keep it above Event's `intent_resend_after_seconds`: see [below](#a-client-whose-event-runs-the-utxo-cache).
 * `max_entries` — upper bound on retained records, so a client sending a fresh `idempotency_key` on every request cannot grow the store without limit. When full, the oldest record of **whichever client holds the most** is dropped, so a client filling the store evicts its own records rather than other clients' (whose retries would then fund twice). Default `10000`.
 
 Each record holds a hash of the request rather than the request, and an `idempotency_key` may be at most 256 bytes, so a record's size does not depend on what the client sends.
@@ -406,7 +406,24 @@ period_seconds = 3600                 # default
 
 Whatever these say, no request may pay out more than the 21 million BSV that exist; one asking for more, or whose `satoshi` × `no_of_outpoints` overflows, is a `400`.
 
-The right values depend on what your clients fund. Event, for example, asks for one transaction's fee and outputs at a time — a few hundred satoshis.
+The right values depend on what your clients fund. Event, for example, asks for one transaction's fee and outputs at a time — a few hundred satoshis. With its UTXO cache on, it also asks for batches of up to 1000 outpoints in one request, which needs more room: see [below](#a-client-whose-event-runs-the-utxo-cache).
+
+## A client whose Event runs the UTXO cache
+
+Event's UTXO cache (teranode-event-rs, CS-493) can hold funding outpoints for its client ahead of need, so that a write needs no `POST /fund` of its own. It is off unless the Event operator sets `[utxo_cache] enabled`. Nothing in FS's configuration turns it on or off, but three settings here have to be sized for it. Event's side is in its own `docs/RUNNING.md`, under "The UTXO cache".
+
+**What Event reads, and what it refuses without.** The cache reads `dust_threshold` and `fee_satoshis_per_kb` from [`GET /client/{client_id}/balance`](SupportedEndpoints.md#client-balance) (CS-684) every `dust_refresh_seconds`, 60 by default: one balance read a minute per Event instance. It decides with them which outpoint fits a write and whether a consolidation is worth broadcasting. **With the cache on, Event will not start against an FS whose balance answer lacks either field**, which is any FS before 6.1.0.
+
+**How it asks.** A preallocation is **one `POST /fund` of up to Event's `max_batch` outpoints** (default 200, at most FS's 1000). Each outpoint has its own script in `locking_scripts`, all in one transaction, with a random `idempotency_key`. Each outpoint is worth the top of a band one `dust_threshold` wide: `(⌊R ÷ D⌋ + 1) × D − 1`, where R is what one write needs and D is `dust_threshold`. That is at most R + D − 1, so with writes of a few hundred satoshis at the default 100 sat/KB, about 300 each. A write the cache cannot fund is funded by its own one-outpoint `POST /fund`, as without the cache.
+
+**The balance shows less.** The cache holds what it was paid outside the client's wallet until Event spends it on a write or **consolidates** it back. A consolidation is one transaction paying unused outpoints to the client's address, from [`GET /client/{client_id}/address`](SupportedEndpoints.md#get-address). It returns outpoints left unused for a day by default, or sooner when a fee change leaves them fitting no write, and everything when the cache is turned off. `confirmed`, `unconfirmed` and `max_fundable` therefore fall by up to Event's `max_cached_value` (1,000,000 satoshis by default) while the cache is full. Event never takes `max_fundable` below its own `fs_reserve` (100,000 by default), so a write the cache misses can still be funded. From event-rs CS-693, the coin of a write that fails after funding is consolidated back too, rather than stranded.
+
+Size the rest like this:
+
+* **[`[funding_limits]`](#funding_limits) `max_satoshis_per_request`** has to allow `max_batch` × the outpoint value: about 60,000 satoshis for 200 outpoints of 300. A batch over it is refused with `invalid_request`. Event keeps that batch's record and asks again every `intent_resend_after_seconds`, refused each time, while its writes are funded one at a time. Set Event's `max_batch_value` to the same figure, so Event asks for smaller batches rather than being refused.
+* **`max_satoshis_per_period`** has to allow what the client's writes spend in `period_seconds`, plus what the cache takes ahead of them. In the first period after a start that can be all of `max_cached_value`. A batch over it is refused with `rate_limited`, which makes Event back off: it waits `Retry-After` and funds writes on demand meanwhile. Set Event's `max_value_per_period` and `period_seconds` to the same figures.
+* **[`[idempotency]`](#idempotency) `ttl_seconds`** has to stay above Event's `intent_resend_after_seconds` (300 by default, at least 60). Event records each batch before it sends it. If FS's answer is lost, Event sends the same request again, with the same key, once the batch is that old. Within the TTL, FS replays what it paid. After it, or after an FS restart, FS funds the batch a second time. Nothing is lost, since any outpoints the first request paid are at keys Event can enumerate, but they sit outside Event's cache until its operator sweeps those keys. The default 600 is enough. A key FS is still holding because its broadcast's outcome is unknown answers `key_in_progress`, and Event keeps asking at the same interval until FS settles it or the TTL runs out.
+* **The refusals that need an operator.** `insufficient_balance`, `no_suitable_utxo`, `broadcast_rejected`, `broadcaster_untrusted` and a refused client (`unauthorized`, `unknown_client`) stop Event's preallocation until Event restarts, and Event's `/status` says why. `funds_in_flight`, `rate_limited`, `chain_unavailable` and `broadcast_failed` only make it back off. In both cases Event's writes are funded one at a time, as without the cache.
 
 ## [fees]
 

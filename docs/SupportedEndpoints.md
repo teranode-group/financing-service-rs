@@ -196,6 +196,8 @@ This matters when each funded output is spent by a different transaction. Output
 
 With `multiple_tx: true` the scripts are paid one per transaction rather than one per output of a single transaction.
 
+Event's UTXO cache preallocates this way: one request of up to 1000 scripts, at keys it can enumerate, with a random `idempotency_key`. [`[funding_limits]`](Configuration.md#funding_limits) has to leave room for that; see [A client whose Event runs the UTXO cache](Configuration.md#a-client-whose-event-runs-the-utxo-cache).
+
 Rejected as `invalid_request`: supplying both fields, supplying neither, an empty `locking_scripts` list, a `no_of_outpoints` that disagrees with the list length, more than 1000 outpoints, and locking scripts totalling more than 1 MiB (a single `locking_script` counts once per outpoint). The client and its API key are checked first, so an unknown or unauthenticated caller is refused before any of this is looked at (CS-519).
 
 ### Idempotency
@@ -433,6 +435,8 @@ Both figures are **derived from the unspent set**, not asked for separately. A s
 `max_fundable` is **the most a single `POST /fund` can ask for right now**, assuming one standard P2PKH outpoint. Use it rather than deriving a figure from the balance.
 
 `dust_threshold` is **the value, in satoshis, below which change is not worth an output** (SR-FUND-025): what `POST /fund` decides by when it folds change into the fee rather than paying it back. It is `max(1, 2 × ceil((34 + 148) × fee rate ÷ 1000))` at the rate this client pays now (sat/KB, from [`[fees]`](Configuration.md#fees) or mapi-lite's quote), so it moves with the rate: 38 at the default 100 sat/KB. It is published so a caller that has to agree with it -- Event's UTXO cache, deciding whether an outpoint fits a write or a recovery is worth broadcasting -- reads it rather than derives its own (CS-684). It is read under the same lock as the other figures, so all of them describe the same moment.
+
+**A client whose Event runs its UTXO cache shows less here.** Outpoints the cache was paid ahead of need have left the wallet until Event spends them or consolidates them back to the client's address, so all three figures fall by what the cache holds. Event reads `dust_threshold` and `fee_satoshis_per_kb` every minute, and with the cache on it will not start without them. See [A client whose Event runs the UTXO cache](Configuration.md#a-client-whose-event-runs-the-utxo-cache).
 
 `fee_satoshis_per_kb` is **the rate `dust_threshold` was computed at**, in satoshis per KB, published beside it so a caller can tell which rate the threshold belongs to. That rate is FS's, and it can differ from the quote the caller pays, so a caller combining the two should compare them. It moves only in these ways:
 
