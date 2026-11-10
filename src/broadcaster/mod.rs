@@ -39,6 +39,11 @@ pub enum BroadcastError {
         description: String,
         /// The upstream's own view of whether resubmitting could succeed.
         retryable: bool,
+        /// The transactions mapi-lite says already spend an input of this
+        /// one, by txid (uls-client's `conflicted_with`, CS-692). Empty when
+        /// there are none, and always through the blockchain interface, which
+        /// has no such field. Also appended to `description`, for the log.
+        conflicted_with: Vec<String>,
     },
     /// The upstream could not be reached or did not answer usably: transport
     /// failure, HTTP error status, undecodable body, bad response signature.
@@ -78,16 +83,27 @@ impl BroadcastError {
     }
 
     /// Whether the node refused the transaction because an input is already
-    /// spent by another transaction (CS-691), as SV Node's
-    /// `258 txn-mempool-conflict` or a double-spend reason says, through
-    /// mapi-lite or through the blockchain interface ([`Self::node_reason`]).
+    /// spent by another transaction (CS-691).
+    ///
+    /// mapi-lite says so in structure: a refusal naming the transactions it
+    /// conflicted with is a conflict whatever its description says (CS-692).
+    /// Without that -- through the blockchain interface, or a mapi-lite
+    /// refusal naming none -- it is read off the node's reason
+    /// ([`Self::node_reason`]): SV Node's `258 txn-mempool-conflict`, or a
+    /// double-spend.
     pub fn inputs_conflicted(&self) -> bool {
+        if let BroadcastError::Rejected {
+            conflicted_with, ..
+        } = self
+        {
+            if !conflicted_with.is_empty() {
+                return true;
+            }
+        }
         let Some(description) = self.node_reason() else {
             return false;
         };
-        description.contains("txn-mempool-conflict")
-            || description.contains("double-spend")
-            || description.contains("conflicted with")
+        description.contains("txn-mempool-conflict") || description.contains("double-spend")
     }
 
     /// Whether the upstream refused the transaction because an input does not
@@ -115,6 +131,7 @@ impl std::fmt::Display for BroadcastError {
             BroadcastError::Rejected {
                 description,
                 retryable,
+                ..
             } => write!(f, "rejected: {description} (retryable: {retryable})"),
             BroadcastError::Upstream(detail) => write!(f, "upstream error: {detail}"),
             BroadcastError::Indeterminate(detail) => {
@@ -197,6 +214,7 @@ mod tests {
         let rejected = |description: &str| BroadcastError::Rejected {
             description: description.to_string(),
             retryable: false,
+            conflicted_with: Vec::new(),
         };
         // Verbatim from mapi-lite v0.3.0 over an SV Node regtest, 2026-10-09.
         assert!(
@@ -208,10 +226,6 @@ mod tests {
         assert!(rejected("bad-txns-inputs-missingorspent").inputs_missing());
         assert!(!rejected("258 txn-mempool-conflict").inputs_missing());
         assert!(rejected("258 txn-mempool-conflict").inputs_conflicted());
-        assert!(
-            rejected("Mempool error (details: 258 txn-mempool-conflict) (conflicted with ab)")
-                .inputs_conflicted()
-        );
         assert!(!rejected("16 missing-inputs").inputs_conflicted());
         // Through the blockchain interface a node's refusal is `Upstream`, as
         // `WocBroadcaster` reports chain-gang's error (#160 review).
@@ -231,11 +245,34 @@ mod tests {
         assert!(!BroadcastError::Untrusted("txn-mempool-conflict".to_string()).inputs_conflicted());
     }
 
+    /// CS-692: a mapi-lite refusal naming the transactions it conflicted
+    /// with is a conflict whatever its description says, and only the node's
+    /// own reason is read when it names none. Our own "(conflicted with ...)"
+    /// note in the description is never read back.
+    #[test]
+    fn a_refusal_naming_its_conflicts_is_a_conflict_whatever_it_says() {
+        let named = |description: &str| BroadcastError::Rejected {
+            description: description.to_string(),
+            retryable: false,
+            conflicted_with: vec!["ab".repeat(32)],
+        };
+        assert!(named("").inputs_conflicted());
+        assert!(named("Mempool error, worded some new way").inputs_conflicted());
+        assert!(!named("Mempool error, worded some new way").inputs_missing());
+        let unnamed = BroadcastError::Rejected {
+            description: "some reason (conflicted with ab)".to_string(),
+            retryable: false,
+            conflicted_with: Vec::new(),
+        };
+        assert!(!unnamed.inputs_conflicted());
+    }
+
     #[test]
     fn broadcast_error_display_names_the_kind_of_failure() {
         let rejected = BroadcastError::Rejected {
             description: "txn-mempool-conflict".to_string(),
             retryable: false,
+            conflicted_with: Vec::new(),
         };
         assert_eq!(
             rejected.to_string(),
@@ -244,6 +281,7 @@ mod tests {
         let retryable = BroadcastError::Rejected {
             description: "mempool full".to_string(),
             retryable: true,
+            conflicted_with: Vec::new(),
         };
         assert_eq!(
             retryable.to_string(),

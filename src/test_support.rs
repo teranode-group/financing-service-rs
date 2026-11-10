@@ -642,6 +642,7 @@ impl TxBroadcaster for RejectingBroadcaster {
         Err(BroadcastError::Rejected {
             description: "txn-mempool-conflict".to_string(),
             retryable: self.retryable,
+            conflicted_with: Vec::new(),
         })
     }
 
