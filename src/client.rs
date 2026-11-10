@@ -748,8 +748,9 @@ impl Client {
             .div_ceil(1000)
     }
 
-    /// The rate this client costs its transactions at, in satoshis per KB.
-    #[cfg(test)]
+    /// The rate this client costs its transactions at, in satoshis per KB:
+    /// the rate [`Self::dust_threshold`] is computed at, published beside it
+    /// on `GET /client/{client_id}/balance` (CS-684).
     pub fn fee_satoshis_per_kb(&self) -> u64 {
         self.fee_satoshis_per_kb
     }

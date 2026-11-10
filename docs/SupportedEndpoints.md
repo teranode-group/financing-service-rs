@@ -419,7 +419,8 @@ curl -H "Authorization: Bearer your-client-api-key" \
     "confirmed": 99904,
     "unconfirmed": 95162,
     "max_fundable": 98904,
-    "dust_threshold": 38
+    "dust_threshold": 38,
+    "fee_satoshis_per_kb": 100
 }
 ```
 
@@ -432,5 +433,13 @@ Both figures are **derived from the unspent set**, not asked for separately. A s
 `max_fundable` is **the most a single `POST /fund` can ask for right now**, assuming one standard P2PKH outpoint. Use it rather than deriving a figure from the balance.
 
 `dust_threshold` is **the value, in satoshis, below which change is not worth an output** (SR-FUND-025): what `POST /fund` decides by when it folds change into the fee rather than paying it back. It is `max(1, 2 × ceil((34 + 148) × fee rate ÷ 1000))` at the rate this client pays now (sat/KB, from [`[fees]`](Configuration.md#fees) or mapi-lite's quote), so it moves with the rate: 38 at the default 100 sat/KB. It is published so a caller that has to agree with it -- Event's UTXO cache, deciding whether an outpoint fits a write or a recovery is worth broadcasting -- reads it rather than derives its own (CS-684). It is read under the same lock as the other figures, so all of them describe the same moment.
+
+`fee_satoshis_per_kb` is **the rate `dust_threshold` was computed at**, in satoshis per KB, published beside it so a caller can tell which rate the threshold belongs to. That rate is FS's, and it can differ from the quote the caller pays, so a caller combining the two should compare them. It moves only in these ways:
+
+- **With `[mapi_lite]`**, it is taken from mapi-lite's fee quote once per balance refresh (`service.utxo_refresh_period`), never on the funding path. It can therefore be up to one refresh behind the quote, and a mapi-lite that is down leaves it where it was.
+- **A quote above [`fees.max_satoshis_per_kb`](Configuration.md#fees)** is ignored, not clamped, and the rate stays where it was, while a caller pricing at the quote follows it.
+- **Without `[mapi_lite]`** there is no quote, so it is the fixed `fees.satoshis_per_kb` and never moves until the configuration changes.
+
+`dust_threshold` follows it exactly.
 
 It is not `confirmed + unconfirmed` minus a fee you can guess. Fees come out of the same UTXOs, and every input the transaction has to spend adds bytes and so adds fee — so a wallet holding its balance in many small pieces can fund far less than one holding the same total in a single piece. Where the difference is large, the UTXOs are fragmented: a request between `max_fundable` and what the balance suggests is refused with `no_suitable_utxo`, whose description says what consolidating would raise the limit to.

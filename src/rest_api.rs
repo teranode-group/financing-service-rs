@@ -785,11 +785,12 @@ pub async fn balance(
     }
 
     match data.service.get_balance_and_max_fundable(&client_id).await {
-        Some((balance, max_fundable, dust_threshold)) => json_ok(&BalanceResponse {
-            confirmed: balance.confirmed,
-            unconfirmed: balance.unconfirmed,
-            max_fundable,
-            dust_threshold,
+        Some(figures) => json_ok(&BalanceResponse {
+            confirmed: figures.balance.confirmed,
+            unconfirmed: figures.balance.unconfirmed,
+            max_fundable: figures.max_fundable,
+            dust_threshold: figures.dust_threshold,
+            fee_satoshis_per_kb: figures.fee_satoshis_per_kb,
         }),
         None => error_response(
             ErrorCode::UnknownClient,
@@ -1250,6 +1251,9 @@ mod tests {
         // CS-684: the dust threshold POST /fund decides by, at the test
         // config's [fees] rate.
         assert_eq!(body["dust_threshold"], DUST_AT_DEFAULT_RATE, "{body}");
+        // And the rate it was computed at, so a caller can tell which rate it
+        // belongs to.
+        assert_eq!(body["fee_satoshis_per_kb"], 100, "{body}");
     }
 
     #[actix_web::test]

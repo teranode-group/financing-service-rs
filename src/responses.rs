@@ -404,6 +404,10 @@ pub struct BalanceResponse {
     /// (CS-684). Published so a caller that has to agree with it, such as
     /// Event's UTXO cache, reads it rather than derives it.
     pub dust_threshold: i64,
+    /// The fee rate `dust_threshold` is computed at, in satoshis per KB, so a
+    /// caller can tell which rate it belongs to and notice when that differs
+    /// from the rate it pays itself.
+    pub fee_satoshis_per_kb: u64,
 }
 
 #[derive(Serialize, Clone, Debug, PartialEq)]
