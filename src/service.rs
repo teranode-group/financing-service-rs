@@ -111,6 +111,16 @@ pub struct PreparedFunding {
     pub spend_plan: FundingSpendPlan,
 }
 
+/// What `GET /client/{client_id}/balance` answers, read under one lock (see
+/// [`Service::get_balance_and_max_fundable`]).
+#[derive(Debug, Clone)]
+pub struct BalanceFigures {
+    pub balance: Balance,
+    pub max_fundable: i64,
+    pub dust_threshold: i64,
+    pub fee_satoshis_per_kb: u64,
+}
+
 /// Service data
 pub struct Service {
     blockchain_status: RwLock<BlockchainConnectionStatus>,
@@ -1532,15 +1542,24 @@ impl Service {
         )
     }
 
-    /// Balance together with the most a single `POST /fund` could ask for.
+    /// Balance together with the most a single `POST /fund` could ask for,
+    /// the dust threshold in force, and the fee rate it is computed at
+    /// (CS-684).
     ///
-    /// Read under one lock so the two cannot disagree: a refresh between two
+    /// Read under one lock so they cannot disagree: a refresh between two
     /// reads would let the endpoint report a maximum that does not belong to
-    /// the balance beside it.
-    pub async fn get_balance_and_max_fundable(&self, client_id: &str) -> Option<(Balance, i64)> {
+    /// the balance beside it, and a fee-rate refresh a threshold that does not
+    /// belong to that maximum, or a rate that does not belong to that
+    /// threshold.
+    pub async fn get_balance_and_max_fundable(&self, client_id: &str) -> Option<BalanceFigures> {
         let client = self.client_handle(client_id).await?;
         let client = client.read().await;
-        Some((client.get_balance(), client.max_fundable_p2pkh()))
+        Some(BalanceFigures {
+            balance: client.get_balance(),
+            max_fundable: client.max_fundable_p2pkh(),
+            dust_threshold: client.dust_threshold(),
+            fee_satoshis_per_kb: client.fee_satoshis_per_kb(),
+        })
     }
 
     pub async fn get_address(&self, client_id: &str) -> Option<String> {
@@ -2816,6 +2835,50 @@ mod tests {
         broadcaster: Arc<dyn TxBroadcaster>,
     ) -> Arc<Service> {
         Arc::new(Service::new_for_test_with_broadcaster(config, blockchain, broadcaster).await)
+    }
+
+    /// CS-684: the balance answer's dust threshold is SR-FUND-025's formula
+    /// at the rate this client pays, read under the same lock as the
+    /// balance, and follows the rate when it changes (from `[fees]` or
+    /// mapi-lite's quote, CS-451).
+    #[tokio::test]
+    async fn cs_684_the_balance_carries_the_dust_threshold_at_the_rate_in_force() {
+        use crate::test_support::{CountingBlockchain, CountingBroadcaster};
+
+        let formula =
+            |sat_per_kb: u64| -> i64 { (2 * (182 * sat_per_kb).div_ceil(1000)).max(1) as i64 };
+        let config = test_config(&unique_dynamic_config_path());
+        let blockchain = CountingBlockchain::new(&config).await;
+        let service = service_with(&config, blockchain, CountingBroadcaster::new()).await;
+        let figures = || async {
+            service
+                .get_balance_and_max_fundable(TEST_CLIENT_ID)
+                .await
+                .expect("a known client")
+        };
+        let dust = || async { figures().await.dust_threshold };
+
+        assert_eq!(dust().await, formula(config.fees.satoshis_per_kb));
+        assert_eq!(dust().await, 38, "100 sat/KB");
+        // The rate it was computed at goes with it.
+        assert_eq!(
+            figures().await.fee_satoshis_per_kb,
+            config.fees.satoshis_per_kb
+        );
+
+        for rate in [500, 1_000] {
+            service
+                .client_handle(TEST_CLIENT_ID)
+                .await
+                .unwrap()
+                .write()
+                .await
+                .set_fee_satoshis_per_kb(rate);
+            let at_rate = figures().await;
+            assert_eq!(at_rate.dust_threshold, formula(rate), "{rate} sat/KB");
+            assert_eq!(at_rate.fee_satoshis_per_kb, rate);
+        }
+        assert_eq!(dust().await, 364, "1000 sat/KB, as CS-452 pins it");
     }
 
     /// With a broadcaster injected, the blockchain interface serves reads
