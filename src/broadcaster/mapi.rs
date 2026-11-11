@@ -455,6 +455,12 @@ impl TxBroadcaster for MapiBroadcaster {
     ///
     /// A `503` carries the names of mapi-lite's failing checks into the error,
     /// for the log line; the `/ready` body this service returns stays generic.
+    /// mapi-lite passes the node's reject reason through, and names the
+    /// transactions a refusal conflicted with (CS-691).
+    fn reads_node_reasons(&self) -> bool {
+        true
+    }
+
     async fn health_check(&self) -> Result<(), BroadcastError> {
         // Both at once, not one after the other: each is bounded by
         // MAPI_LITE_PROBE_TIMEOUT, and the whole probe has to fit inside one,
