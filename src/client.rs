@@ -3071,8 +3071,8 @@ mod tests {
     }
 
     /// The same, with the flag the service computes for a conflict refused
-    /// through the blockchain interface (no `[mapi_lite]`), which reports it
-    /// as `Upstream` (#160 review).
+    /// through the `rpc` blockchain interface (no `[mapi_lite]`), which
+    /// reports it as `Upstream`, in chain-gang's own words (#160 review).
     #[test]
     fn cs_691_a_conflict_reported_as_upstream_is_dropped_by_the_next_refresh() {
         let input = cs_426_utxo(1, 5_000);
@@ -3082,7 +3082,8 @@ mod tests {
         client.apply_chain_state(vec![input.clone()]);
 
         let spent_elsewhere = crate::broadcaster::BroadcastError::Upstream(
-            "A provided argument is not valid `258: txn-mempool-conflict`".to_string(),
+            "Invalid response: sendrawtransaction failed with code -26: 258: txn-mempool-conflict"
+                .to_string(),
         )
         .inputs_conflicted();
         assert!(spent_elsewhere);

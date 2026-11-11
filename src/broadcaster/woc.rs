@@ -58,6 +58,12 @@ impl TxBroadcaster for WocBroadcaster {
             .await
             .map_err(|e| BroadcastError::Upstream(e.to_string()))
     }
+
+    /// Only `rpc` keeps the node's reject reason in its error; chain-gang
+    /// 0.13.1's `woc` and `uaas` keep only the HTTP status (CS-691).
+    fn reads_node_reasons(&self) -> bool {
+        self.name == "rpc"
+    }
 }
 
 #[cfg(test)]
@@ -137,9 +143,12 @@ mod tests {
     }
 
     /// A node behind the blockchain interface that refuses every broadcast
-    /// as a mempool conflict, in SV Node's words.
+    /// as a mempool conflict, with the error the interface really returns:
+    /// `rpc` keeps the node's message, and `woc` (and `uaas`) only the HTTP
+    /// status, the body dropped (chain-gang 0.13.1, `woc_interface.rs`).
     struct ConflictingBlockchain {
         inner: tokio::sync::Mutex<chain_gang::interface::TestInterface>,
+        error: fn() -> chain_gang::util::ChainGangError,
     }
 
     #[async_trait]
@@ -165,9 +174,7 @@ mod tests {
             self.inner.lock().await.get_utxo(address).await
         }
         async fn broadcast_tx(&self, _tx: &Tx) -> Result<String, chain_gang::util::ChainGangError> {
-            Err(chain_gang::util::ChainGangError::BadArgument(
-                "258: txn-mempool-conflict".to_string(),
-            ))
+            Err((self.error)())
         }
         async fn get_tx(&self, txid: &str) -> Result<Tx, chain_gang::util::ChainGangError> {
             self.inner.lock().await.get_tx(txid).await
@@ -182,20 +189,55 @@ mod tests {
         }
     }
 
-    /// CS-691, from the #160 review: without `[mapi_lite]`, a node's conflict
-    /// refusal reaches the service through this broadcaster, and is read as a
-    /// conflict, so the own change it spent is not offered again.
+    /// CS-691, from the #160 review: without `[mapi_lite]`, a node's
+    /// conflict refusal reaches the service through this broadcaster. Through
+    /// `rpc` it is read as a conflict, so the own change it spent is not
+    /// offered again.
     #[tokio::test]
-    async fn cs_691_a_conflict_through_the_blockchain_interface_is_a_conflict() {
+    async fn cs_691_a_conflict_through_rpc_is_a_conflict() {
         let blockchain = Arc::new(ConflictingBlockchain {
             inner: tokio::sync::Mutex::new(chain_gang::interface::TestInterface::new()),
+            // What chain-gang's RPC interface returns for SV Node's refusal.
+            error: || {
+                chain_gang::util::ChainGangError::ResponseError(
+                    "sendrawtransaction failed with code -26: 258: txn-mempool-conflict"
+                        .to_string(),
+                )
+            },
         });
-        let broadcaster = WocBroadcaster::new(blockchain, "woc");
+        let broadcaster = WocBroadcaster::new(blockchain, "rpc");
+        assert!(broadcaster.reads_node_reasons());
         let error = broadcaster
             .broadcast_tx(&sample_tx())
             .await
             .expect_err("refused");
         assert!(error.inputs_conflicted(), "classified as: {error}");
         assert!(!error.inputs_missing(), "classified as: {error}");
+    }
+
+    /// Through `woc` (and `uaas`) the same refusal arrives as the HTTP status
+    /// alone: nothing says it was a conflict, and the broadcaster says it
+    /// cannot read node reasons, so the service treats it as one that may
+    /// have been (#160 review).
+    #[tokio::test]
+    async fn cs_691_a_conflict_through_woc_cannot_be_read() {
+        let blockchain = Arc::new(ConflictingBlockchain {
+            inner: tokio::sync::Mutex::new(chain_gang::interface::TestInterface::new()),
+            // chain-gang 0.13.1's `woc_interface.rs` on a non-200 answer.
+            error: || {
+                chain_gang::util::ChainGangError::ResponseError(
+                    "response.status() = 400 Bad Request".to_string(),
+                )
+            },
+        });
+        for name in ["woc", "uaas"] {
+            let broadcaster = WocBroadcaster::new(blockchain.clone(), name);
+            assert!(!broadcaster.reads_node_reasons(), "{name}");
+            let error = broadcaster
+                .broadcast_tx(&sample_tx())
+                .await
+                .expect_err("refused");
+            assert!(!error.inputs_conflicted(), "classified as: {error}");
+        }
     }
 }
