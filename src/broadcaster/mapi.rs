@@ -425,6 +425,8 @@ impl TxBroadcaster for MapiBroadcaster {
                 // mapi-lite says: `txn-mempool-conflict` means another
                 // transaction already holds an input of this one, and
                 // offering it again cannot succeed (CS-427).
+                // The txids stay in structure for `inputs_conflicted` (CS-692);
+                // the description names them too, for the log.
                 let description = if conflicted_with.is_empty() {
                     description
                 } else {
@@ -436,6 +438,7 @@ impl TxBroadcaster for MapiBroadcaster {
                 Err(BroadcastError::Rejected {
                     description,
                     retryable,
+                    conflicted_with,
                 })
             }
         }
@@ -452,6 +455,12 @@ impl TxBroadcaster for MapiBroadcaster {
     ///
     /// A `503` carries the names of mapi-lite's failing checks into the error,
     /// for the log line; the `/ready` body this service returns stays generic.
+    /// mapi-lite passes the node's reject reason through, and names the
+    /// transactions a refusal conflicted with (CS-691).
+    fn reads_node_reasons(&self) -> bool {
+        true
+    }
+
     async fn health_check(&self) -> Result<(), BroadcastError> {
         // Both at once, not one after the other: each is bounded by
         // MAPI_LITE_PROBE_TIMEOUT, and the whole probe has to fit inside one,
@@ -1032,12 +1041,17 @@ mod tests {
             BroadcastError::Rejected {
                 description,
                 retryable,
+                conflicted_with,
             } => {
                 assert!(
                     description.contains("txn-mempool-conflict"),
                     "{description}"
                 );
                 assert!(description.contains("1263e7f9"), "{description}");
+                assert_eq!(
+                    conflicted_with,
+                    ["1263e7f90ab93a140e5a4102c00dd12227bbbb4f98a53a62469f69521f863a17"]
+                );
                 assert!(
                     !retryable,
                     "a conflict cannot be resolved by resubmitting the same transaction"
@@ -1077,6 +1091,35 @@ mod tests {
         }
     }
 
+    /// CS-692: mapi-lite naming a conflicting transaction is enough. The
+    /// service treats the refusal as a conflict (CS-691) even when the
+    /// description carries none of the node's wording for one.
+    #[tokio::test]
+    async fn cs_692_a_named_conflict_is_a_conflict_whatever_the_description_says() {
+        let server = MockServer::start().await;
+        let tx = sample_tx();
+        let rejection = txs_payload(json!({
+            "returnResult": "failure",
+            "resultDescription": "Mempool error",
+            "txid": tx.hash().encode(),
+            "failureRetryable": false,
+            "conflictedWith": [{ "txid": "c0ffee", "size": 100, "hex": "00" }],
+        }));
+        Mock::given(method("POST"))
+            .and(path("/mapi/txs"))
+            .respond_with(ok(rejection))
+            .mount(&server)
+            .await;
+
+        let error = broadcaster(&server)
+            .broadcast_tx(&tx)
+            .await
+            .expect_err("rejected");
+
+        assert!(error.inputs_conflicted(), "{error}");
+        assert!(!error.inputs_missing(), "{error}");
+    }
+
     #[tokio::test]
     async fn mapi_broadcaster_rejection_carries_description_conflicts_and_retryability() {
         let server = MockServer::start().await;
@@ -1103,12 +1146,14 @@ mod tests {
             BroadcastError::Rejected {
                 description,
                 retryable,
+                conflicted_with,
             } => {
                 assert!(
                     description.contains("txn-mempool-conflict"),
                     "{description}"
                 );
                 assert!(description.contains("deadbeef"), "{description}");
+                assert_eq!(conflicted_with, ["deadbeef"]);
                 assert!(!retryable);
             }
             other => panic!("expected a rejection, got {other:?}"),
