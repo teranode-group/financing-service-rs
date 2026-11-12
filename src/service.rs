@@ -3055,6 +3055,7 @@ mod tests {
                 description: "Mempool error, retry again later. (details: 16 missing-inputs)"
                     .to_string(),
                 retryable: true,
+                conflicted_with: Vec::new(),
             }),
         ]);
         let service = service_with(&config, blockchain, broadcaster.clone()).await;
@@ -3113,6 +3114,7 @@ mod tests {
             let refusal = vec![Some(BroadcastError::Rejected {
                 description: "Mempool full".to_string(),
                 retryable: false,
+                conflicted_with: Vec::new(),
             })];
             let broadcaster = if reads_reasons {
                 ScriptedBroadcaster::reading_reasons(refusal)
@@ -3156,6 +3158,7 @@ mod tests {
             Some(BroadcastError::Rejected {
                 description: "16 missing-inputs".to_string(),
                 retryable: false,
+                conflicted_with: Vec::new(),
             }),
         ]);
         let service = service_with(&config, blockchain, broadcaster.clone()).await;
