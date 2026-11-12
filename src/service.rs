@@ -1693,11 +1693,19 @@ impl Service {
             Err(FundingBroadcastError {
                 error,
                 inputs_missing,
+                inputs_conflicted,
+                reason_unread,
             }) => {
                 if error.code == ErrorCode::BroadcastOutcomeUnknown {
                     Self::reserve_uncertain_funding(service, &prepared).await;
                 } else {
-                    Self::release_prepared_funding(service, &prepared, inputs_missing).await;
+                    Self::release_prepared_funding(
+                        service,
+                        &prepared,
+                        inputs_missing,
+                        inputs_conflicted || reason_unread,
+                    )
+                    .await;
                 }
                 // Marked stale rather than refetched. The cache is already
                 // right -- nothing was spent on a refusal, and an uncertain
@@ -1727,23 +1735,33 @@ impl Service {
     /// Except, when the node said inputs are missing, the service's own
     /// pending change among them, which it will never list and so could
     /// never take back (CS-506): that is forgotten, with anything built on
-    /// it, and the in-flight state saved without it.
+    /// it, and the in-flight state saved without it. And when it said an
+    /// input is spent by another transaction, own change is not made pending
+    /// again, so the next refresh can drop it (CS-691). Nor when the
+    /// broadcaster could not read why the node refused (`woc`, `uaas`): it
+    /// may have been a conflict, so the change waits for the chain to list
+    /// it, as before CS-691.
+    ///
+    /// The in-flight state is saved whenever this changed the pending change,
+    /// so a restart does not lose it (CS-465).
     async fn release_prepared_funding(
         service: &Arc<Service>,
         prepared: &PreparedFunding,
         inputs_missing: bool,
+        inputs_conflicted: bool,
     ) {
         if let Some(client) = service.client_handle(&prepared.client_id).await {
-            let forgotten = {
+            let changed = {
                 let mut client = client.write().await;
-                client.release_claim(&prepared.spend_plan);
-                if inputs_missing {
+                let repended = client.release_claim(&prepared.spend_plan, inputs_conflicted);
+                let forgotten = if inputs_missing {
                     client.forget_refused_own_change(&prepared.spend_plan)
                 } else {
                     0
-                }
+                };
+                repended + forgotten
             };
-            if forgotten > 0 {
+            if changed > 0 {
                 service.save_inflight_state().await;
             }
         }
@@ -1827,12 +1845,19 @@ impl Service {
                         Err(FundingBroadcastError {
                             error: cause,
                             inputs_missing,
+                            inputs_conflicted,
+                            reason_unread,
                         }) => {
                             if cause.code == ErrorCode::BroadcastOutcomeUnknown {
                                 Self::reserve_uncertain_funding(service, &prepared).await;
                             } else {
-                                Self::release_prepared_funding(service, &prepared, inputs_missing)
-                                    .await;
+                                Self::release_prepared_funding(
+                                    service,
+                                    &prepared,
+                                    inputs_missing,
+                                    inputs_conflicted || reason_unread,
+                                )
+                                .await;
                             }
                             if tx_index == 0 {
                                 resync_after_multiple_tx_failure(service, fund_request).await;
@@ -1913,6 +1938,8 @@ impl Service {
             return Err(FundingBroadcastError {
                 error,
                 inputs_missing: e.inputs_missing(),
+                inputs_conflicted: e.inputs_conflicted(),
+                reason_unread: !broadcaster.reads_node_reasons(),
             });
         }
         log::info!(
@@ -2000,6 +2027,13 @@ pub struct FundingBroadcastError {
     pub error: CodedError,
     /// The node refused it because an input does not exist (CS-506).
     pub inputs_missing: bool,
+    /// The node refused it because an input is spent by another transaction
+    /// (CS-691).
+    pub inputs_conflicted: bool,
+    /// The broadcaster cannot read the node's reason for a refusal
+    /// ([`TxBroadcaster::reads_node_reasons`]), so it may have been a
+    /// conflict that nothing here can see.
+    pub reason_unread: bool,
 }
 
 impl From<CodedError> for FundingBroadcastError {
@@ -2007,6 +2041,8 @@ impl From<CodedError> for FundingBroadcastError {
         Self {
             error,
             inputs_missing: false,
+            inputs_conflicted: false,
+            reason_unread: false,
         }
     }
 }
@@ -3053,6 +3089,52 @@ mod tests {
             !spends_first(&sent[2]),
             "the next request did not select the refused change again"
         );
+    }
+
+    /// CS-691, #160 review: a refusal from a broadcaster that cannot read
+    /// the node's reason (`woc`, `uaas`) is marked so, and the claim is then
+    /// released as one that may have been a conflict: its own change is not
+    /// made pending again (`release_claim(.., true)`, whose effect
+    /// `client::tests::cs_691_own_change_refused_as_a_conflict_is_dropped_by_the_next_refresh`
+    /// shows). One from mapi-lite, which reads it, is not.
+    #[tokio::test]
+    async fn cs_691_a_refusal_the_broadcaster_cannot_read_is_marked_unread() {
+        use crate::test_support::{blockchain_listing, ScriptedBroadcaster};
+
+        for reads_reasons in [true, false] {
+            let config = test_config(&unique_dynamic_config_path());
+            let utxo = chain_gang::interface::UtxoEntry {
+                height: 1517000,
+                tx_pos: 0,
+                tx_hash: "e".repeat(64),
+                value: 50_000,
+            };
+            let blockchain = blockchain_listing(&config, &[utxo]).await;
+            let refusal = vec![Some(BroadcastError::Rejected {
+                description: "Mempool full".to_string(),
+                retryable: false,
+            })];
+            let broadcaster = if reads_reasons {
+                ScriptedBroadcaster::reading_reasons(refusal)
+            } else {
+                ScriptedBroadcaster::new(refusal)
+            };
+            let service = service_with(&config, blockchain, broadcaster).await;
+            let request = FundRequest {
+                satoshi: 1_000,
+                ..sample_fund_request(TEST_CLIENT_ID)
+            };
+
+            let (broadcaster, prepared) = Service::prepare_funding_outpoints(&service, &request)
+                .await
+                .expect("prepared");
+            let refused = Service::broadcast_prepared_funding(broadcaster, &prepared)
+                .await
+                .expect_err("refused");
+
+            assert!(!refused.inputs_conflicted);
+            assert_eq!(refused.reason_unread, !reads_reasons);
+        }
     }
 
     /// The forgotten change is forgotten on disk too, or a restart would bring

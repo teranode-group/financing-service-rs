@@ -568,6 +568,8 @@ impl TxBroadcaster for FailingBroadcaster {
 pub struct ScriptedBroadcaster {
     answers: std::sync::Mutex<std::collections::VecDeque<Option<BroadcastError>>>,
     sent: std::sync::Mutex<Vec<Tx>>,
+    /// [`TxBroadcaster::reads_node_reasons`]: as mapi-lite, or as `woc`.
+    reads_reasons: bool,
 }
 
 impl ScriptedBroadcaster {
@@ -576,6 +578,16 @@ impl ScriptedBroadcaster {
         Arc::new(Self {
             answers: std::sync::Mutex::new(answers.into()),
             sent: std::sync::Mutex::new(Vec::new()),
+            reads_reasons: false,
+        })
+    }
+
+    /// [`Self::new`], reading the node's reasons as mapi-lite does (CS-691).
+    pub fn reading_reasons(answers: Vec<Option<BroadcastError>>) -> Arc<Self> {
+        Arc::new(Self {
+            answers: std::sync::Mutex::new(answers.into()),
+            sent: std::sync::Mutex::new(Vec::new()),
+            reads_reasons: true,
         })
     }
 
@@ -588,6 +600,10 @@ impl ScriptedBroadcaster {
 impl TxBroadcaster for ScriptedBroadcaster {
     fn name(&self) -> &str {
         "scripted"
+    }
+
+    fn reads_node_reasons(&self) -> bool {
+        self.reads_reasons
     }
 
     async fn broadcast_tx(&self, tx: &Tx) -> Result<String, BroadcastError> {

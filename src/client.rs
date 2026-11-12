@@ -475,11 +475,16 @@ impl Client {
     /// their reservations outlast a chain that has not listed them yet.
     ///
     /// Own change is recognised by its txid: a transaction this service handed
-    /// out within the reservation window.
+    /// out within the reservation window, or one still broadcasting -- a claim
+    /// can take the change of a transaction the node has accepted before the
+    /// service has heard so (CS-691).
     fn record_spent_change(&mut self, txid: &str, spent: &[UtxoEntry], now: Instant) {
         let outpoints: Vec<OutPointKey> = spent
             .iter()
-            .filter(|entry| self.handed_out.contains_key(&entry.tx_hash))
+            .filter(|entry| {
+                self.handed_out.contains_key(&entry.tx_hash)
+                    || self.in_flight_change.contains_key(&entry.tx_hash)
+            })
             .map(outpoint_key)
             .collect();
         if !outpoints.is_empty() {
@@ -1395,8 +1400,15 @@ impl Client {
                 plan.txid
             ));
         }
-        let change_entry = plan.change_entry.clone();
-        self.remove_spent(&plan.spent_outpoints, plan.change_entry);
+        // Change a request has already claimed stays out (CS-691). The node can
+        // accept this transaction before the service hears that it did, so a
+        // refresh in between can list the change and a request claim it; put
+        // back now, it would be offered again while that claim's broadcast is
+        // still running. Its claim, commit or reservation settles it from here.
+        let change_entry = plan
+            .change_entry
+            .filter(|change| !self.reserved.contains_key(&outpoint_key(change)));
+        self.remove_spent(&plan.spent_outpoints, change_entry.clone());
         let now = Instant::now();
         self.record_spent_change(&plan.txid, &plan.spent_outpoints, now);
         self.handed_out.insert(plan.txid, now);
@@ -1448,6 +1460,13 @@ impl Client {
         for entry in &plan.spent_outpoints {
             self.reserved.insert(outpoint_key(entry), now);
         }
+        // Own change among the inputs is held until the chain is seen to know
+        // of this transaction, as a committed spend of it is (SR-FUND-033),
+        // and from the claim on, not only once the broadcast has settled: a
+        // broadcast can take seconds, and a refresh in that time cannot tell
+        // "not listed yet" from "spent", so it released the claim's hold and a
+        // later one listed the change as unspent again (CS-691).
+        self.record_spent_change(&plan.txid, &plan.spent_outpoints, now);
         // A claim is normally settled within a broadcast. One never settled --
         // its request dropped mid-flight -- is forgotten at the same age its
         // reservation is.
@@ -1468,19 +1487,53 @@ impl Client {
     /// not take: nothing was spent, so they are spendable again at once.
     ///
     /// Put back in the cache now rather than left for the next refresh, which
-    /// may be a whole freshness window away. If the refusal was a conflict --
-    /// the input spent by something outside this service -- the caller marks
-    /// the chain state stale, and the next refresh drops it again.
-    pub fn release_claim(&mut self, plan: &FundingSpendPlan) {
+    /// may be a whole freshness window away. The service's own change among
+    /// them is pending again too, so a refresh from an interface that has not
+    /// listed it yet does not lose it (CS-691).
+    ///
+    /// Except when `spent_elsewhere`: the refusal was a conflict, the input
+    /// spent by another transaction. The caller then marks the chain state
+    /// stale, and the next refresh drops what the chain no longer lists. Own
+    /// change is not made pending for that reason: pending change is put back
+    /// after every refresh whether listed or not, so change the conflicting
+    /// transaction spent would be offered, and refused, until the reservation
+    /// window ran out.
+    ///
+    /// Returns how many own-change outputs were made pending again, so the
+    /// caller knows the in-flight state needs saving (CS-465).
+    pub fn release_claim(&mut self, plan: &FundingSpendPlan, spent_elsewhere: bool) -> usize {
         self.in_flight_change.remove(&plan.txid);
+        // Nothing was spent, so there is no spend for the chain to catch up
+        // with (CS-691).
+        self.spent_change.remove(&plan.txid);
+        let now = Instant::now();
+        let mut repended = 0;
         for entry in &plan.spent_outpoints {
             let key = outpoint_key(entry);
             self.reserved.remove(&key);
             if !self.unspent.iter().any(|utxo| outpoint_key(utxo) == key) {
                 self.unspent.push(entry.clone());
             }
+            // Own change is pending again: a refresh while the claim held it
+            // dropped it from the pending change, and the chain may not list
+            // it yet, so without this the next refresh would lose it until
+            // the chain caught up (CS-691).
+            if !spent_elsewhere
+                && self.handed_out.contains_key(&entry.tx_hash)
+                && !self.pending_change.contains_key(&key)
+            {
+                self.pending_change.insert(
+                    key,
+                    PendingChange {
+                        entry: entry.clone(),
+                        since: now,
+                    },
+                );
+                repended += 1;
+            }
         }
         self.unspent.sort_by_key(|utxo| utxo.value);
+        repended
     }
 
     /// Forget the service's own pending change that a refused plan spent, after
@@ -2634,7 +2687,7 @@ mod tests {
     fn cs_475_a_released_claim_is_no_longer_in_flight() {
         let mut client = client_holding_at_rate(vec![cs_422_utxo(1, 0, 5_000)], 100);
         let first = claim_one(&mut client, 10);
-        client.release_claim(&first);
+        client.release_claim(&first, false);
         assert!(client.in_flight_change.is_empty());
         assert!(client.funding_balance_error(&cs_422_request(10)).is_none());
     }
@@ -2861,6 +2914,229 @@ mod tests {
         // change[0..4] released; change[4..9] still held, spent by
         // transactions the index has not seen
         assert_eq!(client.reserved_outpoint_count(), 5);
+    }
+
+    // ---- CS-691: own change claimed by a broadcast still in flight ----
+
+    /// The CS-691 bench's case, 60 of 60 conflicts traced. A node can accept
+    /// a funding transaction before the service hears it did, so a refresh in
+    /// between lists its change as unspent and the next request claims it.
+    /// The transaction's commit then arrived and put that change back in the
+    /// cache, claimed or not, and the request after that spent it a second
+    /// time: refused as `txn-mempool-conflict`, against the claim still
+    /// broadcasting.
+    #[test]
+    fn cs_691_a_late_commit_does_not_hand_back_change_already_claimed() {
+        let input = cs_426_utxo(1, 5_000);
+        let mut client = client_holding(vec![input]);
+        let parent = claim_one(&mut client, 1_000);
+        let change = parent.change_entry.clone().expect("the parent has change");
+
+        // the node has the parent before the service hears that it does
+        client.apply_chain_state(vec![UtxoEntry {
+            height: -1,
+            ..change.clone()
+        }]);
+        let child = claim_one(&mut client, 1_000);
+        assert_eq!(child.spent_outpoints, vec![change.clone()]);
+
+        client.commit_funding_spend(parent).expect("commits");
+
+        assert!(
+            !client
+                .unspent
+                .iter()
+                .any(|utxo| outpoint_key(utxo) == outpoint_key(&change)),
+            "the parent's commit put its claimed change back"
+        );
+        assert!(
+            client.plan_funding_tx(&cs_426_request(1_000)).is_err(),
+            "the next request planned a second spend of the claimed change"
+        );
+        client.commit_funding_spend(child).expect("commits");
+        assert!(client.plan_funding_tx(&cs_426_request(1_000)).is_ok());
+    }
+
+    /// Own change [`Client::claim_inputs`] has handed to a broadcast that is
+    /// still running, read by an index that lags: it must stay held, as a
+    /// committed spend of it is (SR-FUND-033). The first refresh after the
+    /// claim dropped it from the pending change, because it was reserved; one
+    /// from an index that had not yet seen the parent then released the
+    /// reservation as "no longer listed, so spent"; and one that had caught up
+    /// with the parent but not the child listed it as unspent, with nothing
+    /// holding it. The next request spent it again, and the node refused that
+    /// as a conflict with the broadcast still in flight -- 177 times in 30s on
+    /// the CS-691 bench.
+    #[test]
+    fn cs_691_claimed_own_change_is_not_offered_while_the_index_lags() {
+        let input = cs_426_utxo(1, 5_000);
+        let mut client = client_holding(vec![input.clone()]);
+        let change = spend_own_change(&mut client, 1).remove(0);
+        let in_flight = claim_one(&mut client, 1_000);
+        assert_eq!(
+            in_flight.spent_outpoints,
+            vec![change.clone()],
+            "the claim spends the service's own change"
+        );
+        let offered = |client: &Client| {
+            client
+                .unspent
+                .iter()
+                .any(|utxo| outpoint_key(utxo) == outpoint_key(&change))
+        };
+
+        // two refreshes from an index that has seen neither transaction
+        client.apply_chain_state(vec![input.clone()]);
+        client.apply_chain_state(vec![input.clone()]);
+        assert!(!offered(&client));
+
+        // the index has the parent, not yet the in-flight child
+        let parent_seen = vec![UtxoEntry {
+            height: -1,
+            ..change.clone()
+        }];
+        client.apply_chain_state(parent_seen.clone());
+        assert!(!offered(&client), "claimed change offered again");
+        client.apply_chain_state(parent_seen);
+        assert!(!offered(&client), "claimed change offered again");
+        assert!(
+            client.plan_funding_tx(&cs_426_request(1_000)).is_err(),
+            "the next request planned a spend of the claimed change"
+        );
+
+        // committed, it goes on being held as any spent change is
+        client.commit_funding_spend(in_flight).expect("commits");
+        client.apply_chain_state(vec![UtxoEntry {
+            height: -1,
+            ..change.clone()
+        }]);
+        assert!(!offered(&client));
+    }
+
+    /// The bench case followed by the lagging index the next test assumes
+    /// (from the review of #160). The child claimed the parent's change
+    /// while the parent was still broadcasting, so the parent was not handed
+    /// out yet; the claim must still hold the change as own change, through a
+    /// refresh from an index that has not seen the parent and one that has
+    /// the parent but not the child.
+    #[test]
+    fn cs_691_change_claimed_before_its_parent_commits_survives_a_lagging_index() {
+        let input = cs_426_utxo(1, 5_000);
+        let mut client = client_holding(vec![input.clone()]);
+        let parent = claim_one(&mut client, 1_000);
+        let change = parent.change_entry.clone().expect("the parent has change");
+        client.apply_chain_state(vec![UtxoEntry {
+            height: -1,
+            ..change.clone()
+        }]);
+        let child = claim_one(&mut client, 1_000);
+        assert_eq!(child.spent_outpoints, vec![change.clone()]);
+        client.commit_funding_spend(parent).expect("commits");
+
+        // an index that has not seen the parent yet
+        client.apply_chain_state(vec![input.clone()]);
+        client.apply_chain_state(vec![input.clone()]);
+        // one that has the parent, not the child still broadcasting
+        client.apply_chain_state(vec![UtxoEntry {
+            height: -1,
+            ..change.clone()
+        }]);
+        assert!(
+            client.plan_funding_tx(&cs_426_request(1_000)).is_err(),
+            "the child's claimed change was offered again"
+        );
+    }
+
+    /// A claim on own change refused as a conflict: another transaction spent
+    /// the change. The claim gives it back, but not as pending change, so
+    /// the next refresh, from an index that has seen the conflicting spend,
+    /// drops it rather than offering it again until the reservation window
+    /// runs out (from the review of #160).
+    #[test]
+    fn cs_691_own_change_refused_as_a_conflict_is_dropped_by_the_next_refresh() {
+        let input = cs_426_utxo(1, 5_000);
+        let mut client = client_holding(vec![input.clone()]);
+        let change = spend_own_change(&mut client, 1).remove(0);
+        let conflicted = claim_one(&mut client, 1_000);
+        // a refresh while the broadcast runs, from an index behind the parent
+        client.apply_chain_state(vec![input.clone()]);
+
+        assert_eq!(client.release_claim(&conflicted, true), 0);
+        client.invalidate_chain_state();
+        // the index has the parent and the conflicting spend of its change
+        client.apply_chain_state(vec![]);
+
+        assert!(
+            !client
+                .unspent
+                .iter()
+                .any(|utxo| outpoint_key(utxo) == outpoint_key(&change)),
+            "change spent by a conflicting transaction is offered again"
+        );
+    }
+
+    /// The same, with the flag the service computes for a conflict refused
+    /// through the `rpc` blockchain interface (no `[mapi_lite]`), which
+    /// reports it as `Upstream`, in chain-gang's own words (#160 review).
+    #[test]
+    fn cs_691_a_conflict_reported_as_upstream_is_dropped_by_the_next_refresh() {
+        let input = cs_426_utxo(1, 5_000);
+        let mut client = client_holding(vec![input.clone()]);
+        let change = spend_own_change(&mut client, 1).remove(0);
+        let conflicted = claim_one(&mut client, 1_000);
+        client.apply_chain_state(vec![input.clone()]);
+
+        let spent_elsewhere = crate::broadcaster::BroadcastError::Upstream(
+            "Invalid response: sendrawtransaction failed with code -26: 258: txn-mempool-conflict"
+                .to_string(),
+        )
+        .inputs_conflicted();
+        assert!(spent_elsewhere);
+        assert_eq!(client.release_claim(&conflicted, spent_elsewhere), 0);
+        client.invalidate_chain_state();
+        client.apply_chain_state(vec![]);
+
+        assert!(
+            !client
+                .unspent
+                .iter()
+                .any(|utxo| outpoint_key(utxo) == outpoint_key(&change)),
+            "change spent by a conflicting transaction is offered again"
+        );
+    }
+
+    /// A claim the upstream definitely refused spent nothing: its own change
+    /// is spendable again at once, and stays so across a refresh from an
+    /// index that has not listed it yet -- the claim's hold is gone, and the
+    /// change is pending again.
+    #[test]
+    fn cs_691_a_released_claim_gives_its_own_change_back() {
+        let input = cs_426_utxo(1, 5_000);
+        let mut client = client_holding(vec![input.clone()]);
+        let change = spend_own_change(&mut client, 1).remove(0);
+        let refused = claim_one(&mut client, 1_000);
+        // a refresh while the broadcast runs drops it from the pending change
+        client.apply_chain_state(vec![input.clone()]);
+
+        assert_eq!(
+            client.release_claim(&refused, false),
+            1,
+            "reports the own change it made pending, so the caller saves it (CS-465)"
+        );
+        assert!(!client.spent_change.contains_key(&refused.txid));
+        client.apply_chain_state(vec![input.clone()]);
+
+        assert!(
+            client
+                .unspent
+                .iter()
+                .any(|utxo| outpoint_key(utxo) == outpoint_key(&change)),
+            "released own change not offered"
+        );
+        let (_, next) = client
+            .plan_funding_tx(&cs_426_request(1_000))
+            .expect("funds from the released change");
+        assert_eq!(next.spent_outpoints, vec![change]);
     }
 
     /// The mechanism behind it. A refresh replaces the cache with what the
@@ -3327,7 +3603,7 @@ mod tests {
             spends(&second, &first_txid),
             "the change is the smallest suitable input, so it is selected"
         );
-        client.release_claim(&second);
+        client.release_claim(&second, false);
         assert_eq!(client.forget_refused_own_change(&second), 1);
 
         // A refresh: the chain still lists both originals (it has not seen the
@@ -3357,7 +3633,7 @@ mod tests {
         let first_txid = first.txid.clone();
         client.commit_funding_spend(first).expect("commits");
         let second = claim_one(&mut client, 1_000);
-        client.release_claim(&second);
+        client.release_claim(&second, false);
 
         assert!(client.unspent.iter().any(|u| u.tx_hash == first_txid));
     }
@@ -3399,7 +3675,7 @@ mod tests {
     fn cs_506_a_chain_listed_input_is_left_to_the_refresh() {
         let mut client = client_holding_at_rate(vec![cs_422_utxo(1, 0, 10_000)], 100);
         let plan = claim_one(&mut client, 1_000);
-        client.release_claim(&plan);
+        client.release_claim(&plan, false);
         assert_eq!(client.forget_refused_own_change(&plan), 0);
         assert_eq!(client.unspent.len(), 1);
     }
