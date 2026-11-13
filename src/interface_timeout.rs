@@ -23,11 +23,38 @@ use chain_gang::util::ChainGangError;
 pub struct Bounded {
     inner: Arc<dyn BlockchainInterface + Send + Sync>,
     timeout: Duration,
+    scope: Scope,
+}
+
+/// Which calls a [`Bounded`] puts its deadline on (CS-718).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Scope {
+    /// Every call.
+    All,
+    /// Every call but `broadcast_tx`, which is bounded further in, past the
+    /// wait for a pacing slot.
+    Reads,
+    /// `broadcast_tx` alone, inside the pacing, so its deadline starts once
+    /// its slot is granted.
+    Broadcasts,
 }
 
 impl Bounded {
+    #[cfg(test)]
     pub fn new(inner: Arc<dyn BlockchainInterface + Send + Sync>, timeout: Duration) -> Self {
-        Self { inner, timeout }
+        Self::covering(inner, timeout, Scope::All)
+    }
+
+    pub fn covering(
+        inner: Arc<dyn BlockchainInterface + Send + Sync>,
+        timeout: Duration,
+        scope: Scope,
+    ) -> Self {
+        Self {
+            inner,
+            timeout,
+            scope,
+        }
     }
 
     async fn bound<T>(
@@ -35,6 +62,15 @@ impl Bounded {
         call: &str,
         future: impl Future<Output = Result<T, ChainGangError>>,
     ) -> Result<T, ChainGangError> {
+        let broadcast = call == "broadcast_tx";
+        let covered = match self.scope {
+            Scope::All => true,
+            Scope::Reads => !broadcast,
+            Scope::Broadcasts => broadcast,
+        };
+        if !covered {
+            return future.await;
+        }
         match tokio::time::timeout(self.timeout, future).await {
             Ok(result) => result,
             Err(_) => Err(timed_out(call, self.timeout)),
