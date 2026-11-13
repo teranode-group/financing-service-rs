@@ -1785,6 +1785,27 @@ mod tests {
         client
     }
 
+    // ---- CS-721: a read that began before an invalidation ----
+
+    #[test]
+    fn cs_721_a_read_noted_before_an_invalidation_is_applied_but_stale() {
+        let mut client = test_client_with_utxos(&[10_000]);
+        let chain = client.unspent.clone();
+        let window = Duration::from_secs(60);
+
+        let since = client.invalidations();
+        client.invalidate_chain_state();
+        client.apply_chain_state_read_since(chain.clone(), since);
+        assert_eq!(client.unspent, chain, "applied: it is the newest answer");
+        assert!(!client.chain_state_is_fresh(window));
+        assert!(!client.chain_state_usable());
+
+        let since = client.invalidations();
+        client.apply_chain_state_read_since(chain, since);
+        assert!(client.chain_state_is_fresh(window));
+        assert!(client.chain_state_usable());
+    }
+
     fn sample_fund_request(satoshi: u64) -> FundRequest {
         FundRequest {
             client_id: TEST_CLIENT_ID.to_string(),
@@ -2236,27 +2257,6 @@ mod tests {
             pending_change: Vec::new(),
         });
         assert_eq!(client.reserved_outpoint_count(), 1);
-    }
-
-    // ---- CS-721: a read that began before an invalidation ----
-
-    #[test]
-    fn cs_721_a_read_noted_before_an_invalidation_is_applied_but_stale() {
-        let mut client = test_client_with_utxos(&[10_000]);
-        let chain = client.unspent.clone();
-        let window = Duration::from_secs(60);
-
-        let since = client.invalidations();
-        client.invalidate_chain_state();
-        client.apply_chain_state_read_since(chain.clone(), since);
-        assert_eq!(client.unspent, chain, "applied: it is the newest answer");
-        assert!(!client.chain_state_is_fresh(window));
-        assert!(!client.chain_state_usable());
-
-        let since = client.invalidations();
-        client.apply_chain_state_read_since(chain, since);
-        assert!(client.chain_state_is_fresh(window));
-        assert!(client.chain_state_usable());
     }
 
     // ---- CS-473: concurrent requests must not share an input ----
