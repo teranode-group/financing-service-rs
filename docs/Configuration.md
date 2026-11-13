@@ -438,6 +438,12 @@ satoshis_per_kb = 100
 * `satoshis_per_kb` — the rate, in satoshis per kilobyte. The fee for a transaction is `ceil(tx_bytes * satoshis_per_kb / 1000)`, rounded **up** so that rounding never underpays. `tx_bytes` is the transaction's serialised size, counted as an upper bound: every output is its 8-byte value, its script's length prefix and the script, and every input is costed at the longest a signature can be. So a transaction never pays less than the rate on the bytes it actually has — until CS-471 each funded output was counted as its script alone, nine bytes short, and an ordinary transaction paid about 97 sat/KB at a configured 100. Must be greater than zero; the service refuses to start otherwise, because a transaction paying no fee is not relayed. Default `100`.
 * `max_satoshis_per_kb` — the highest rate a fee quote may set (CS-523, SR-SEC-020). A quote above it is ignored, with a warning, and the current rate kept. It is not clamped: a rate that high is forged or a mistake. Default `1000`, which is ten times the default `satoshis_per_kb` and a thousand times mapi-lite's own default quote. Must be at least `satoshis_per_kb`.
 
+### An input the nodes refuse is held out for ten minutes
+
+The service reads the chain from one source and broadcasts through another, and they can disagree about a coin. Anyone can pay the public funding address with a transaction WhatsOnChain lists and mapi-lite's nodes never took. Sized as the smallest suitable UTXO, it used to be picked for every request, refused each time as spending a missing input, and listed again by the next refresh, so funding stopped until WhatsOnChain dropped it.
+
+Now an input the nodes refuse as missing, or as already spent by another transaction, is kept out of selection for ten minutes, though the read source goes on listing it, and requests fund from other inputs meanwhile (CS-720). After ten minutes it is offered again, so a coin that really is spendable is not lost. The refusal does not say which input it was, so every input of that transaction the chain listed is held. A funding usually spends one. A refusal whose reason the broadcaster cannot read (`woc`, `uaas`) holds nothing. The quarantine is in memory, so a restart lifts it.
+
 ### Dust change goes to the fee
 
 A change output of a satoshi or two cannot be spent for less than it holds, so paying it back only strands it. Funding the reported `max_fundable` used to do exactly that: it left one satoshi behind, and the client was then holding a balance of 1 with `max_fundable: 0`.
