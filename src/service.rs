@@ -4186,7 +4186,7 @@ mod tests {
             "the new wallet was given the old one's change"
         );
 
-        // A refusal: its inputs go back to nobody either.
+        // A refusal or an unknown outcome: its inputs go to nobody either.
         let service = Arc::new(
             Service::new_for_test(&config, test_blockchain_interface(&config).await).await,
         );
@@ -4209,7 +4209,9 @@ mod tests {
             .write()
             .await
             .insert(TEST_CLIENT_ID.to_string(), Arc::clone(&other));
-        Service::release_prepared_funding(&service, &prepared, false, false).await;
+        // Release (after a refusal) and the uncertain-outcome reservation both
+        // settle through `prepared_client`, which no longer finds it.
+        assert!(service.prepared_client(&prepared).await.is_none());
         Service::reserve_uncertain_funding(&service, &prepared).await;
         assert!(
             holds_nothing(&*other.read().await),
