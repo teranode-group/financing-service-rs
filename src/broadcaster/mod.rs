@@ -72,11 +72,13 @@ impl BroadcastError {
     /// [`BroadcastError::Upstream`], because chain-gang's interfaces do not
     /// tell a refusal from a transport failure, so the reason is only in the
     /// text. That is safe to read: a transport failure never carries a node's
-    /// reject reason. Only the `rpc` interface puts it there, though
-    /// (`sendrawtransaction failed with code -26: 258: txn-mempool-conflict`):
-    /// chain-gang 0.13.1's `woc` and `uaas` interfaces drop the response body
-    /// and report only the HTTP status, so there is nothing to read, and
-    /// [`TxBroadcaster::reads_node_reasons`] says so. An indeterminate or
+    /// reject reason. The `rpc` interface puts the node's message there
+    /// (`sendrawtransaction failed with code -26: 258: txn-mempool-conflict`),
+    /// and from chain-gang 0.13.2 the `woc` and `uaas` interfaces put the
+    /// refusal's body after its status (`response.status() = 400 Bad Request:
+    /// 258: txn-mempool-conflict`, CS-701). Only the `test` interface leaves
+    /// nothing to read, and [`TxBroadcaster::reads_node_reasons`] says so. An
+    /// indeterminate or
     /// untrusted outcome is never read, since it says nothing definite about
     /// the inputs.
     fn node_reason(&self) -> Option<String> {
@@ -92,13 +94,13 @@ impl BroadcastError {
     ///
     /// mapi-lite says so in structure: a refusal naming the transactions it
     /// conflicted with is a conflict whatever its description says (CS-692).
-    /// Without that -- through the `rpc` blockchain interface, or a mapi-lite
+    /// Without that -- through the blockchain interface, or a mapi-lite
     /// refusal naming none -- it is read off the node's reason
     /// ([`Self::node_reason`]): SV Node's `258 txn-mempool-conflict`, or a
-    /// double-spend. Through `woc` and `uaas` there is nothing to read, since
-    /// chain-gang drops the refusal's body, and the service treats any
-    /// refusal from them as one that may have been a conflict
-    /// ([`TxBroadcaster::reads_node_reasons`], CS-701).
+    /// double-spend. A broadcaster that cannot read the reason makes the
+    /// service treat any refusal as one that may have been a conflict
+    /// ([`TxBroadcaster::reads_node_reasons`]); `woc` and `uaas` can, from
+    /// chain-gang 0.13.2 (CS-701).
     pub fn inputs_conflicted(&self) -> bool {
         if let BroadcastError::Rejected {
             conflicted_with, ..
@@ -175,10 +177,10 @@ pub trait TxBroadcaster: Send + Sync {
     /// Whether a refusal from this broadcaster carries the node's own reason
     /// (CS-691), so [`BroadcastError::inputs_conflicted`] and
     /// [`BroadcastError::inputs_missing`] can be read off it. mapi-lite's
-    /// does, and chain-gang's `rpc` interface keeps the node's message; its
-    /// `woc` and `uaas` interfaces return only the HTTP status (chain-gang
-    /// 0.13.1). Without it, the service treats a refusal as one that may have
-    /// been a conflict. `false` unless a broadcaster says otherwise.
+    /// does. Of chain-gang's interfaces, `rpc` keeps the node's message, and
+    /// `woc` and `uaas` the refusal's body after its status (chain-gang
+    /// 0.13.2, CS-701). Without it, the service treats a refusal as one that
+    /// may have been a conflict. `false` unless a broadcaster says otherwise.
     fn reads_node_reasons(&self) -> bool {
         false
     }
@@ -248,8 +250,9 @@ mod tests {
         assert!(!rejected("16 missing-inputs").inputs_conflicted());
         // Through the blockchain interface a node's refusal is `Upstream`, as
         // `WocBroadcaster` reports chain-gang's error (#160 review): with the
-        // node's message through `rpc`, and the HTTP status alone through
-        // `woc` and `uaas`, which says nothing.
+        // node's message through `rpc`, and the refusal's body after its
+        // status through `woc` and `uaas` (CS-701). A status alone, as
+        // chain-gang wrote it before 0.13.2 or for an empty body, says nothing.
         let upstream = |detail: &str| BroadcastError::Upstream(detail.to_string());
         assert!(upstream(
             "Invalid response: sendrawtransaction failed with code -26: 258: txn-mempool-conflict"
@@ -261,6 +264,14 @@ mod tests {
         .inputs_missing());
         let woc = upstream("Invalid response: response.status() = 400 Bad Request");
         assert!(!woc.inputs_conflicted() && !woc.inputs_missing());
+        assert!(upstream(
+            "Invalid response: response.status() = 400 Bad Request: 258: txn-mempool-conflict"
+        )
+        .inputs_conflicted());
+        assert!(upstream(
+            "Invalid response: response.status() = 400 Bad Request: 16: missing-inputs"
+        )
+        .inputs_missing());
         assert!(!upstream("http status 503").inputs_conflicted());
         assert!(!upstream("http status 503").inputs_missing());
         // An outcome that may never have reached the node says nothing.

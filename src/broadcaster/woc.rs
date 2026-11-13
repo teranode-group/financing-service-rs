@@ -58,10 +58,11 @@ impl TxBroadcaster for WocBroadcaster {
             .map_err(|e| BroadcastError::Upstream(e.to_string()))
     }
 
-    /// Only `rpc` keeps the node's reject reason in its error; chain-gang
-    /// 0.13.1's `woc` and `uaas` keep only the HTTP status (CS-691).
+    /// `rpc` keeps the node's reject reason in its error, and from chain-gang
+    /// 0.13.2 `woc` and `uaas` keep the refusal's body, where the node's
+    /// reason is (CS-701). The `test` interface keeps none.
     fn reads_node_reasons(&self) -> bool {
-        self.name == "rpc"
+        matches!(self.name.as_str(), "rpc" | "woc" | "uaas")
     }
 }
 
@@ -74,9 +75,9 @@ impl TxBroadcaster for WocBroadcaster {
 ///   which for `woc` and `uaas` means a 200: they read the body only then.
 ///   For `rpc` it can be any status, and reading the node's verdict is what
 ///   failed.
-/// * **A 5xx other than 503.** chain-gang 0.13.1 turns every status but 200
-///   into `ResponseError("response.status() = 502 Bad Gateway")`, keeping
-///   only the status. A gateway's 502 or 504 can follow WhatsOnChain relaying
+/// * **A 5xx other than 503.** chain-gang turns every status but 200 into
+///   `ResponseError("response.status() = 502 Bad Gateway")`, followed from
+///   0.13.2 by the body (CS-701). A gateway's 502 or 504 can follow WhatsOnChain relaying
 ///   the transaction, and a 500 can be WhatsOnChain failing after it. A 503
 ///   is a server turning the request away, and a 4xx is it refusing it.
 /// * **An answer that is not one.** `rpc` reads the node's body for every
@@ -196,8 +197,8 @@ mod tests {
 
     /// A node behind the blockchain interface that refuses every broadcast
     /// as a mempool conflict, with the error the interface really returns:
-    /// `rpc` keeps the node's message, and `woc` (and `uaas`) only the HTTP
-    /// status, the body dropped (chain-gang 0.13.1, `woc_interface.rs`).
+    /// `rpc` keeps the node's message, and `woc` (and `uaas`) the HTTP status
+    /// followed by the body (chain-gang 0.13.2, `woc_interface.rs`).
     struct ConflictingBlockchain {
         inner: tokio::sync::Mutex<chain_gang::interface::TestInterface>,
         error: fn() -> chain_gang::util::ChainGangError,
@@ -267,30 +268,81 @@ mod tests {
         assert!(!error.inputs_missing(), "classified as: {error}");
     }
 
-    /// Through `woc` (and `uaas`) the same refusal arrives as the HTTP status
-    /// alone: nothing says it was a conflict, and the broadcaster says it
-    /// cannot read node reasons, so the service treats it as one that may
-    /// have been (#160 review).
+    /// Through `woc` (and `uaas`) the same refusal arrives with the node's
+    /// reason after the HTTP status (chain-gang 0.13.2), so it is read as a
+    /// conflict, as through `rpc` (CS-701). Before 0.13.2 the status came
+    /// alone, and the service had to treat any refusal as one that may have
+    /// been (#160 review).
     #[tokio::test]
-    async fn cs_691_a_conflict_through_woc_cannot_be_read() {
+    async fn cs_701_a_conflict_through_woc_is_a_conflict() {
         let blockchain = Arc::new(ConflictingBlockchain {
             inner: tokio::sync::Mutex::new(chain_gang::interface::TestInterface::new()),
-            // chain-gang 0.13.1's `woc_interface.rs` on a non-200 answer.
+            // chain-gang 0.13.2's `woc_interface.rs` on a non-200 answer.
             error: || {
                 chain_gang::util::ChainGangError::ResponseError(
-                    "response.status() = 400 Bad Request".to_string(),
+                    "response.status() = 400 Bad Request: 258: txn-mempool-conflict".to_string(),
                 )
             },
         });
         for name in ["woc", "uaas"] {
             let broadcaster = WocBroadcaster::new(blockchain.clone(), name);
-            assert!(!broadcaster.reads_node_reasons(), "{name}");
+            assert!(broadcaster.reads_node_reasons(), "{name}");
             let error = broadcaster
                 .broadcast_tx(&sample_tx())
                 .await
                 .expect_err("refused");
-            assert!(!error.inputs_conflicted(), "classified as: {error}");
+            assert!(error.inputs_conflicted(), "{name} classified as: {error}");
+            assert!(!error.inputs_missing(), "{name} classified as: {error}");
         }
+        // Only the `test` interface has no reason to read.
+        let test = WocBroadcaster::new(blockchain, "test");
+        assert!(!test.reads_node_reasons());
+    }
+
+    /// CS-701: a refusal from a real UaaS endpoint, through chain-gang, reaches
+    /// the service with the node's reason in its text: a conflict and a
+    /// missing input are each read as such. A 502 carrying the same words is
+    /// still an unknown outcome (CS-718), which is never read.
+    #[tokio::test]
+    async fn cs_701_a_refusal_reaches_the_service_with_the_nodes_reason() {
+        let (_s, broadcaster) = uaas_answering(
+            wiremock::ResponseTemplate::new(400).set_body_string("258: txn-mempool-conflict"),
+        )
+        .await;
+        let conflict = broadcaster.broadcast_tx(&sample_tx()).await.unwrap_err();
+        assert!(
+            matches!(conflict, BroadcastError::Upstream(_)),
+            "{conflict:?}"
+        );
+        assert!(
+            conflict.to_string().contains("txn-mempool-conflict"),
+            "{conflict}"
+        );
+        assert!(
+            conflict.inputs_conflicted() && !conflict.inputs_missing(),
+            "{conflict}"
+        );
+
+        let (_s, broadcaster) = uaas_answering(
+            wiremock::ResponseTemplate::new(400).set_body_string("16: missing-inputs"),
+        )
+        .await;
+        let missing = broadcaster.broadcast_tx(&sample_tx()).await.unwrap_err();
+        assert!(
+            missing.inputs_missing() && !missing.inputs_conflicted(),
+            "{missing}"
+        );
+
+        let (_s, broadcaster) = uaas_answering(
+            wiremock::ResponseTemplate::new(502).set_body_string("258: txn-mempool-conflict"),
+        )
+        .await;
+        let gateway = broadcaster.broadcast_tx(&sample_tx()).await.unwrap_err();
+        assert!(
+            matches!(gateway, BroadcastError::Indeterminate(_)),
+            "{gateway:?}"
+        );
+        assert!(!gateway.inputs_conflicted(), "{gateway}");
     }
 
     // --- CS-718: what a failed HTTP broadcast says about delivery ---------
