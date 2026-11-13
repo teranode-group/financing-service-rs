@@ -381,7 +381,10 @@ impl Client {
         let unspent = blockchain_interface
             .get_utxo(&self.address.to_string())
             .await?;
-        self.apply_chain_state(unspent);
+        // Nothing can invalidate the state while this holds `&mut self`, but
+        // through the same path as every other read (CS-721).
+        let since = self.invalidations;
+        self.apply_chain_state_read_since(unspent, since);
         Ok(())
     }
 
@@ -392,6 +395,10 @@ impl Client {
     /// it was made: a transaction that has reached the network but is not yet
     /// visible to the read interface still reads as unspent, and the service
     /// would offer the same input to the next funding request.
+    ///
+    /// For a read with no gap between it and this; every read in the service
+    /// goes through [`Self::apply_chain_state_read_since`] (CS-721).
+    #[cfg(test)]
     pub fn apply_chain_state(&mut self, unspent: Utxo) {
         self.apply_chain_state_read_since(unspent, self.invalidations);
     }
