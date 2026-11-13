@@ -197,11 +197,21 @@ impl IdempotencyStore {
     /// `max_entries` cheap fundings inside the TTL pushed out every other
     /// client's records, and their retries then funded twice. Taking from the
     /// biggest holder means a client flooding the store evicts its own.
+    ///
+    /// Only completed records are dropped, never one in flight (CS-723). A
+    /// request whose broadcast outcome was unknown leaves its record in
+    /// flight on purpose, so a retry is told it is in progress until the TTL
+    /// rather than funded again; evicted under load -- above about 16.7
+    /// fundings a second at the defaults -- that retry funded a second time.
+    /// With nothing completed left to drop the store goes over its bound, by
+    /// at most the requests in flight, which the funding limits bound.
     fn make_room_for_one(&mut self) {
         while self.entries.len() >= self.max_entries {
             let mut held: HashMap<&str, usize> = HashMap::new();
-            for key in self.entries.keys() {
-                *held.entry(key.client_id.as_str()).or_default() += 1;
+            for (key, entry) in &self.entries {
+                if matches!(entry, Entry::Completed { .. }) {
+                    *held.entry(key.client_id.as_str()).or_default() += 1;
+                }
             }
             // Ties go to the client id that sorts first, so eviction does not
             // depend on hash order.
@@ -215,7 +225,9 @@ impl IdempotencyStore {
             let oldest = self
                 .entries
                 .iter()
-                .filter(|(key, _)| key.client_id == biggest)
+                .filter(|(key, entry)| {
+                    key.client_id == biggest && matches!(entry, Entry::Completed { .. })
+                })
                 .min_by_key(|(_, entry)| entry.at())
                 .map(|(key, _)| key.clone());
             match oldest {
@@ -361,11 +373,21 @@ mod tests {
         assert_eq!(store.reserve(key(), "fp"), Reservation::Proceed);
     }
 
+    /// A funding that completed: what eviction drops (CS-723).
+    fn funded(store: &mut IdempotencyStore, key: RecordKey) {
+        assert_eq!(store.reserve(key.clone(), "fp"), Reservation::Proceed);
+        store.complete(key, "fp", Outcome::Funded(response("aabb")));
+    }
+
+    fn replays(store: &mut IdempotencyStore, key: RecordKey) -> bool {
+        matches!(store.reserve(key, "fp"), Reservation::Replay(_))
+    }
+
     #[test]
     fn the_store_is_bounded_by_max_entries() {
         let mut store = IdempotencyStore::new(Duration::from_secs(600), 3);
         for i in 0..10 {
-            store.reserve(RecordKey::new("id1", format!("key{i}")), "fp");
+            funded(&mut store, RecordKey::new("id1", format!("key{i}")));
         }
         assert_eq!(store.len(), 3);
     }
@@ -376,15 +398,14 @@ mod tests {
     fn sr_sec_029_a_flooding_client_evicts_its_own_records() {
         let mut store = IdempotencyStore::new(Duration::from_secs(600), 10);
         let victim = RecordKey::new("victim", "their-retry");
-        store.reserve(victim.clone(), "fp");
+        funded(&mut store, victim.clone());
         std::thread::sleep(Duration::from_millis(2));
         for i in 0..100 {
-            store.reserve(RecordKey::new("flooder", format!("k{i}")), "fp");
+            funded(&mut store, RecordKey::new("flooder", format!("k{i}")));
         }
         assert_eq!(store.len(), 10);
-        assert_eq!(
-            store.reserve(victim, "fp"),
-            Reservation::InProgress,
+        assert!(
+            replays(&mut store, victim),
             "the victim's record must survive the flood"
         );
     }
@@ -393,19 +414,16 @@ mod tests {
     #[test]
     fn sr_sec_029_eviction_takes_the_biggest_holders_oldest() {
         let mut store = IdempotencyStore::new(Duration::from_secs(600), 4);
-        store.reserve(RecordKey::new("a", "1"), "fp");
+        funded(&mut store, RecordKey::new("a", "1"));
         std::thread::sleep(Duration::from_millis(2));
-        store.reserve(RecordKey::new("b", "1"), "fp");
+        funded(&mut store, RecordKey::new("b", "1"));
         std::thread::sleep(Duration::from_millis(2));
-        store.reserve(RecordKey::new("b", "2"), "fp");
+        funded(&mut store, RecordKey::new("b", "2"));
         std::thread::sleep(Duration::from_millis(2));
-        store.reserve(RecordKey::new("b", "3"), "fp");
+        funded(&mut store, RecordKey::new("b", "3"));
         // Full: b holds three, so b's oldest goes, not a's older one.
-        store.reserve(RecordKey::new("c", "1"), "fp");
-        assert_eq!(
-            store.reserve(RecordKey::new("a", "1"), "fp"),
-            Reservation::InProgress
-        );
+        funded(&mut store, RecordKey::new("c", "1"));
+        assert!(replays(&mut store, RecordKey::new("a", "1")));
         assert_eq!(
             store.reserve(RecordKey::new("b", "1"), "fp"),
             Reservation::Proceed
@@ -463,5 +481,36 @@ mod tests {
             &["76a914aa88ac".to_string(), "76a914cc88ac".to_string()],
         );
         assert_ne!(a, b);
+    }
+
+    /// CS-723: a full store drops completed records, never one in flight: a
+    /// request of unknown outcome stays in flight so its retry is told so,
+    /// and dropping it let the retry fund again.
+    #[test]
+    fn cs_723_eviction_never_drops_a_record_in_flight() {
+        let mut store = IdempotencyStore::new(Duration::from_secs(600), 3);
+        let key = |client: &str, k: &str| RecordKey::new(client, k);
+
+        // In flight: an outcome-unknown broadcast, left to expire.
+        assert_eq!(
+            store.reserve(key("a", "unknown"), "f"),
+            Reservation::Proceed
+        );
+        // Completed records from the same client fill the store.
+        for k in ["done-1", "done-2"] {
+            assert_eq!(store.reserve(key("a", k), "f"), Reservation::Proceed);
+            store.complete(key("a", k), "f", Outcome::Funded(response(k)));
+        }
+        // More arrive, and each needs room.
+        for k in ["next-1", "next-2", "next-3"] {
+            assert_eq!(store.reserve(key("a", k), "f"), Reservation::Proceed);
+        }
+        assert_eq!(
+            store.reserve(key("a", "unknown"), "f"),
+            Reservation::InProgress,
+            "the in-flight record was evicted, so its retry would fund again"
+        );
+        // Over the bound by the records in flight, and no more.
+        assert_eq!(store.len(), 4);
     }
 }

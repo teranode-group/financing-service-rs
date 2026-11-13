@@ -100,6 +100,30 @@ pub struct PersistedReservation {
     pub since_unix: u64,
 }
 
+/// A transaction handed to a caller, in a form that survives a restart
+/// (CS-723): it is how the service knows change as its own.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PersistedHandedOut {
+    pub txid: String,
+    pub since_unix: u64,
+}
+
+/// Own change a transaction spent, in a form that survives a restart
+/// (CS-723, SR-FUND-033).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PersistedSpentChange {
+    pub txid: String,
+    pub outpoints: Vec<PersistedOutpoint>,
+    pub since_unix: u64,
+}
+
+/// An outpoint, as the chain names it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PersistedOutpoint {
+    pub tx_hash: String,
+    pub tx_pos: u32,
+}
+
 /// A pending change output, in a form that survives a restart (CS-465).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PersistedPendingChange {
@@ -125,11 +149,19 @@ pub struct InflightState {
     pub reserved: Vec<PersistedReservation>,
     #[serde(default)]
     pub pending_change: Vec<PersistedPendingChange>,
+    /// Absent from a file an earlier version wrote, so read as empty.
+    #[serde(default)]
+    pub handed_out: Vec<PersistedHandedOut>,
+    #[serde(default)]
+    pub spent_change: Vec<PersistedSpentChange>,
 }
 
 impl InflightState {
     pub fn is_empty(&self) -> bool {
-        self.reserved.is_empty() && self.pending_change.is_empty()
+        self.reserved.is_empty()
+            && self.pending_change.is_empty()
+            && self.handed_out.is_empty()
+            && self.spent_change.is_empty()
     }
 }
 
@@ -570,9 +602,45 @@ impl Client {
             .collect();
         pending_change.sort_by(|a, b| (&a.tx_hash, a.tx_pos).cmp(&(&b.tx_hash, b.tx_pos)));
 
+        // Both kept too (CS-723): without what was handed out, change is not
+        // known as the service's own; without what spent it, a lagging index
+        // can list spent own change and have it offered again.
+        let mut handed_out: Vec<PersistedHandedOut> = self
+            .handed_out
+            .iter()
+            .map(|(txid, since)| PersistedHandedOut {
+                txid: txid.clone(),
+                since_unix: to_unix(*since, now, now_unix),
+            })
+            .collect();
+        handed_out.sort_by(|a, b| a.txid.cmp(&b.txid));
+        let mut spent_change: Vec<PersistedSpentChange> = self
+            .spent_change
+            .iter()
+            .map(|(txid, spent)| {
+                let mut outpoints: Vec<PersistedOutpoint> = spent
+                    .outpoints
+                    .iter()
+                    .map(|(tx_hash, tx_pos)| PersistedOutpoint {
+                        tx_hash: tx_hash.clone(),
+                        tx_pos: *tx_pos,
+                    })
+                    .collect();
+                outpoints.sort_by(|a, b| (&a.tx_hash, a.tx_pos).cmp(&(&b.tx_hash, b.tx_pos)));
+                PersistedSpentChange {
+                    txid: txid.clone(),
+                    outpoints,
+                    since_unix: to_unix(spent.since, now, now_unix),
+                }
+            })
+            .collect();
+        spent_change.sort_by(|a, b| a.txid.cmp(&b.txid));
+
         InflightState {
             reserved,
             pending_change,
+            handed_out,
+            spent_change,
         }
     }
 
@@ -602,6 +670,22 @@ impl Client {
                 };
                 self.pending_change
                     .insert(outpoint_key(&entry), PendingChange { entry, since });
+            }
+        }
+        for handed in state.handed_out {
+            if let Some(since) = from_unix(handed.since_unix, now, now_unix) {
+                self.handed_out.insert(handed.txid, since);
+            }
+        }
+        for spent in state.spent_change {
+            if let Some(since) = from_unix(spent.since_unix, now, now_unix) {
+                let outpoints = spent
+                    .outpoints
+                    .into_iter()
+                    .map(|outpoint| (outpoint.tx_hash, outpoint.tx_pos))
+                    .collect();
+                self.spent_change
+                    .insert(spent.txid, SpentChange { outpoints, since });
             }
         }
     }
@@ -1071,8 +1155,15 @@ impl Client {
         self.unspent
             .retain(|utxo| !spent.contains(&outpoint_key(utxo)));
         // No entry when the change was dust and went to the fee (CS-452).
+        // Nor a second one (CS-723): a refresh between the node accepting the
+        // transaction and this commit can already list its change, and a
+        // second copy overstated the balance and could be picked twice in
+        // one plan, which the node refuses as bad-txns-inputs-duplicate.
         if let Some(change_entry) = change_entry {
-            self.unspent.push(change_entry);
+            let key = outpoint_key(&change_entry);
+            if !self.unspent.iter().any(|utxo| outpoint_key(utxo) == key) {
+                self.unspent.push(change_entry);
+            }
         }
         self.unspent.sort_by_key(|utxo| utxo.value);
     }
@@ -2183,6 +2274,7 @@ mod tests {
                 height: UNCONFIRMED_HEIGHT,
                 since_unix: long_ago,
             }],
+            ..Default::default()
         });
         assert!(client.inflight_state().is_empty(), "expired while down");
     }
@@ -2200,8 +2292,91 @@ mod tests {
                 since_unix: unix_now() + 3_600,
             }],
             pending_change: Vec::new(),
+            ..Default::default()
         });
         assert_eq!(client.reserved_outpoint_count(), 1);
+    }
+
+    // ---- CS-723: a commit's change listed once ----
+
+    /// A refresh between the node accepting a transaction and its commit can
+    /// already list the change. The commit does not add a second copy.
+    #[test]
+    fn cs_723_a_commit_does_not_list_change_a_refresh_already_listed() {
+        let mut client = test_client_with_utxos(&[10_000]);
+        let (_, plan) = client
+            .plan_funding_tx(&sample_fund_request(1_000))
+            .expect("plans");
+        let change = plan.change_entry.clone().expect("has change");
+        client.claim_inputs(&plan);
+        // The refresh lists the change, as the chain now does.
+        client.apply_chain_state(vec![change.clone()]);
+        client.commit_funding_spend(plan).expect("commits");
+
+        let copies = client
+            .unspent
+            .iter()
+            .filter(|utxo| outpoint_key(utxo) == outpoint_key(&change))
+            .count();
+        assert_eq!(copies, 1, "{:?}", client.unspent);
+        assert_eq!(
+            client.get_balance().confirmed + client.get_balance().unconfirmed,
+            change.value
+        );
+    }
+
+    // ---- CS-723: spent change and handed-out transactions survive a restart
+
+    /// Own change spent before a restart stays withheld after it, while a
+    /// lagging index lists it: first not at all, then the transaction that
+    /// made it but not the one that spent it. The in-flight file used to keep
+    /// only reservations and pending change, so the restarted service let the
+    /// reservation go when the index did not list the change, then offered it
+    /// when the index did.
+    #[test]
+    fn cs_723_own_change_spent_before_a_restart_is_not_offered_after_it() {
+        let mut client = test_client_with_utxos(&[10_000]);
+        let fund = |client: &mut Client| {
+            let (_, plan) = client
+                .plan_funding_tx(&sample_fund_request(1_000))
+                .expect("plans");
+            client.claim_inputs(&plan);
+            client.commit_funding_spend(plan.clone()).expect("commits");
+            plan
+        };
+        let first = fund(&mut client);
+        let change = first.change_entry.clone().expect("has change");
+        let second = fund(&mut client);
+        assert_eq!(
+            second.spent_outpoints[0], change,
+            "the second spends the first's change"
+        );
+
+        // The index has seen neither transaction yet, over two refreshes,
+        // then only the first.
+        let lagging = |client: &mut Client| {
+            client.apply_chain_state(Vec::new());
+            client.apply_chain_state(Vec::new());
+            client.apply_chain_state(vec![change.clone()]);
+        };
+        let mut restarted = test_client_with_utxos(&[]);
+        restarted.restore_inflight_state(client.inflight_state());
+        lagging(&mut client);
+        assert!(
+            !client.unspent.contains(&change),
+            "without a restart the change is withheld"
+        );
+        lagging(&mut restarted);
+        assert!(
+            !restarted.unspent.contains(&change),
+            "the first's change, spent by the second, was offered again"
+        );
+        assert!(
+            restarted
+                .plan_funding_tx(&sample_fund_request(1_000))
+                .map_or(true, |(_, plan)| !plan.spent_outpoints.contains(&change)),
+            "and planned"
+        );
     }
 
     // ---- CS-473: concurrent requests must not share an input ----
