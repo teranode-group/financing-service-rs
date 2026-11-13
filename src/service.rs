@@ -2311,90 +2311,6 @@ mod tests {
         assert_eq!(settled.outpoints.len(), 1);
     }
 
-    /// CS-723: a client deleted while its funding broadcast, and re-added
-    /// under the same id with another wallet, is not the client the funding
-    /// is settled against. The caller still gets the outpoints on the network
-    /// (CS-501), and the new client is handed neither the old wallet's change
-    /// nor, after a refusal, its inputs.
-    #[tokio::test]
-    async fn cs_723_a_funding_is_settled_against_the_client_it_was_planned_for() {
-        let config = test_config(&unique_dynamic_config_path());
-        let service = Arc::new(
-            Service::new_for_test(&config, test_blockchain_interface(&config).await).await,
-        );
-        let replace_client = || async {
-            let other = Client::try_new(
-                &ClientConfig {
-                    client_id: TEST_CLIENT_ID.to_string(),
-                    wif_key: crate::test_support::OTHER_TEST_WIF.to_string(),
-                    api_key: None,
-                },
-                &config.blockchain_interface.network,
-            )
-            .unwrap();
-            let other = Arc::new(RwLock::new(other));
-            service
-                .clients
-                .write()
-                .await
-                .insert(TEST_CLIENT_ID.to_string(), Arc::clone(&other));
-            other
-        };
-        let holds_nothing = |client: &Client| {
-            let balance = client.get_balance();
-            balance.confirmed == 0 && balance.unconfirmed == 0
-        };
-
-        // A success: committed against nobody, answered all the same.
-        let request = sample_fund_request(TEST_CLIENT_ID);
-        let (broadcaster, prepared) = Service::prepare_funding_outpoints(&service, &request)
-            .await
-            .expect("prepared");
-        let response = Service::broadcast_prepared_funding(broadcaster, &prepared)
-            .await
-            .expect("broadcast");
-        let other = replace_client().await;
-        let settled = Service::conclude_broadcast(&service, &prepared, response)
-            .await
-            .expect("the outpoints are the caller's");
-        assert_eq!(settled.outpoints.len(), 1);
-        assert!(
-            holds_nothing(&*other.read().await),
-            "the new wallet was given the old one's change"
-        );
-
-        // A refusal: its inputs go back to nobody either.
-        let service = Arc::new(
-            Service::new_for_test(&config, test_blockchain_interface(&config).await).await,
-        );
-        let (_, prepared) = Service::prepare_funding_outpoints(&service, &request)
-            .await
-            .expect("prepared");
-        let other = Arc::new(RwLock::new(
-            Client::try_new(
-                &ClientConfig {
-                    client_id: TEST_CLIENT_ID.to_string(),
-                    wif_key: crate::test_support::OTHER_TEST_WIF.to_string(),
-                    api_key: None,
-                },
-                &config.blockchain_interface.network,
-            )
-            .unwrap(),
-        ));
-        service
-            .clients
-            .write()
-            .await
-            .insert(TEST_CLIENT_ID.to_string(), Arc::clone(&other));
-        Service::release_prepared_funding(&service, &prepared, false, false).await;
-        Service::reserve_uncertain_funding(&service, &prepared).await;
-        assert!(
-            holds_nothing(&*other.read().await),
-            "the new wallet was given the old one's inputs"
-        );
-        assert_eq!(other.read().await.reserved_outpoint_count(), 0);
-    }
-
     /// CS-502. A chain read that is accepted and never answered no longer
     /// holds the client's refresh: it fails at the interface deadline, the
     /// refresh lock is released, and the next refresh goes through.
@@ -4034,6 +3950,23 @@ mod tests {
         );
     }
 
+    /// A state file that cannot be read is survived: the service starts, as it
+    /// would have with no file at all, rather than refusing to.
+    #[tokio::test]
+    async fn cs_465_an_unreadable_state_file_does_not_stop_startup() {
+        let config = test_config(&unique_dynamic_config_path());
+        std::fs::write(config.inflight_state_path(), "{ not json").unwrap();
+
+        let service = Arc::new(
+            Service::new_for_test(&config, test_blockchain_interface(&config).await).await,
+        );
+        let client = service.client_handle(TEST_CLIENT_ID).await.expect("client");
+        assert_eq!(client.read().await.reserved_outpoint_count(), 0);
+        fund_single_transaction(&service, &sample_fund_request(TEST_CLIENT_ID))
+            .await
+            .expect("and funds as before");
+    }
+
     /// CS-723: the in-flight file is the owner's alone, whatever the umask
     /// or a leftover file's mode, and one an earlier version wrote, without
     /// the handed-out and spent-change records, still reads.
@@ -4067,23 +4000,6 @@ mod tests {
         .unwrap();
         assert_eq!(mode(&path), 0o600);
         std::fs::remove_dir_all(&dir).unwrap();
-    }
-
-    /// A state file that cannot be read is survived: the service starts, as it
-    /// would have with no file at all, rather than refusing to.
-    #[tokio::test]
-    async fn cs_465_an_unreadable_state_file_does_not_stop_startup() {
-        let config = test_config(&unique_dynamic_config_path());
-        std::fs::write(config.inflight_state_path(), "{ not json").unwrap();
-
-        let service = Arc::new(
-            Service::new_for_test(&config, test_blockchain_interface(&config).await).await,
-        );
-        let client = service.client_handle(TEST_CLIENT_ID).await.expect("client");
-        assert_eq!(client.read().await.reserved_outpoint_count(), 0);
-        fund_single_transaction(&service, &sample_fund_request(TEST_CLIENT_ID))
-            .await
-            .expect("and funds as before");
     }
 
     // ---- CS-495: commits share in-flight saves ----
@@ -4216,6 +4132,90 @@ mod tests {
             3,
             "all three spends, once it could"
         );
+    }
+
+    /// CS-723: a client deleted while its funding broadcast, and re-added
+    /// under the same id with another wallet, is not the client the funding
+    /// is settled against. The caller still gets the outpoints on the network
+    /// (CS-501), and the new client is handed neither the old wallet's change
+    /// nor, after a refusal, its inputs.
+    #[tokio::test]
+    async fn cs_723_a_funding_is_settled_against_the_client_it_was_planned_for() {
+        let config = test_config(&unique_dynamic_config_path());
+        let service = Arc::new(
+            Service::new_for_test(&config, test_blockchain_interface(&config).await).await,
+        );
+        let replace_client = || async {
+            let other = Client::try_new(
+                &ClientConfig {
+                    client_id: TEST_CLIENT_ID.to_string(),
+                    wif_key: crate::test_support::OTHER_TEST_WIF.to_string(),
+                    api_key: None,
+                },
+                &config.blockchain_interface.network,
+            )
+            .unwrap();
+            let other = Arc::new(RwLock::new(other));
+            service
+                .clients
+                .write()
+                .await
+                .insert(TEST_CLIENT_ID.to_string(), Arc::clone(&other));
+            other
+        };
+        let holds_nothing = |client: &Client| {
+            let balance = client.get_balance();
+            balance.confirmed == 0 && balance.unconfirmed == 0
+        };
+
+        // A success: committed against nobody, answered all the same.
+        let request = sample_fund_request(TEST_CLIENT_ID);
+        let (broadcaster, prepared) = Service::prepare_funding_outpoints(&service, &request)
+            .await
+            .expect("prepared");
+        let response = Service::broadcast_prepared_funding(broadcaster, &prepared)
+            .await
+            .expect("broadcast");
+        let other = replace_client().await;
+        let settled = Service::conclude_broadcast(&service, &prepared, response)
+            .await
+            .expect("the outpoints are the caller's");
+        assert_eq!(settled.outpoints.len(), 1);
+        assert!(
+            holds_nothing(&*other.read().await),
+            "the new wallet was given the old one's change"
+        );
+
+        // A refusal: its inputs go back to nobody either.
+        let service = Arc::new(
+            Service::new_for_test(&config, test_blockchain_interface(&config).await).await,
+        );
+        let (_, prepared) = Service::prepare_funding_outpoints(&service, &request)
+            .await
+            .expect("prepared");
+        let other = Arc::new(RwLock::new(
+            Client::try_new(
+                &ClientConfig {
+                    client_id: TEST_CLIENT_ID.to_string(),
+                    wif_key: crate::test_support::OTHER_TEST_WIF.to_string(),
+                    api_key: None,
+                },
+                &config.blockchain_interface.network,
+            )
+            .unwrap(),
+        ));
+        service
+            .clients
+            .write()
+            .await
+            .insert(TEST_CLIENT_ID.to_string(), Arc::clone(&other));
+        Service::release_prepared_funding(&service, &prepared, false, false).await;
+        Service::reserve_uncertain_funding(&service, &prepared).await;
+        assert!(
+            holds_nothing(&*other.read().await),
+            "the new wallet was given the old one's inputs"
+        );
+        assert_eq!(other.read().await.reserved_outpoint_count(), 0);
     }
 
     // ---- CS-473: concurrent requests for one client ----

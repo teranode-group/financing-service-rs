@@ -2297,88 +2297,6 @@ mod tests {
         assert_eq!(client.reserved_outpoint_count(), 1);
     }
 
-    // ---- CS-723: a commit's change listed once ----
-
-    /// A refresh between the node accepting a transaction and its commit can
-    /// already list the change. The commit does not add a second copy.
-    #[test]
-    fn cs_723_a_commit_does_not_list_change_a_refresh_already_listed() {
-        let mut client = test_client_with_utxos(&[10_000]);
-        let (_, plan) = client
-            .plan_funding_tx(&sample_fund_request(1_000))
-            .expect("plans");
-        let change = plan.change_entry.clone().expect("has change");
-        client.claim_inputs(&plan);
-        // The refresh lists the change, as the chain now does.
-        client.apply_chain_state(vec![change.clone()]);
-        client.commit_funding_spend(plan).expect("commits");
-
-        let copies = client
-            .unspent
-            .iter()
-            .filter(|utxo| outpoint_key(utxo) == outpoint_key(&change))
-            .count();
-        assert_eq!(copies, 1, "{:?}", client.unspent);
-        assert_eq!(
-            client.get_balance().confirmed + client.get_balance().unconfirmed,
-            change.value
-        );
-    }
-
-    // ---- CS-723: spent change and handed-out transactions survive a restart
-
-    /// Own change spent before a restart stays withheld after it, while a
-    /// lagging index lists it: first not at all, then the transaction that
-    /// made it but not the one that spent it. The in-flight file used to keep
-    /// only reservations and pending change, so the restarted service let the
-    /// reservation go when the index did not list the change, then offered it
-    /// when the index did.
-    #[test]
-    fn cs_723_own_change_spent_before_a_restart_is_not_offered_after_it() {
-        let mut client = test_client_with_utxos(&[10_000]);
-        let fund = |client: &mut Client| {
-            let (_, plan) = client
-                .plan_funding_tx(&sample_fund_request(1_000))
-                .expect("plans");
-            client.claim_inputs(&plan);
-            client.commit_funding_spend(plan.clone()).expect("commits");
-            plan
-        };
-        let first = fund(&mut client);
-        let change = first.change_entry.clone().expect("has change");
-        let second = fund(&mut client);
-        assert_eq!(
-            second.spent_outpoints[0], change,
-            "the second spends the first's change"
-        );
-
-        // The index has seen neither transaction yet, over two refreshes,
-        // then only the first.
-        let lagging = |client: &mut Client| {
-            client.apply_chain_state(Vec::new());
-            client.apply_chain_state(Vec::new());
-            client.apply_chain_state(vec![change.clone()]);
-        };
-        let mut restarted = test_client_with_utxos(&[]);
-        restarted.restore_inflight_state(client.inflight_state());
-        lagging(&mut client);
-        assert!(
-            !client.unspent.contains(&change),
-            "without a restart the change is withheld"
-        );
-        lagging(&mut restarted);
-        assert!(
-            !restarted.unspent.contains(&change),
-            "the first's change, spent by the second, was offered again"
-        );
-        assert!(
-            restarted
-                .plan_funding_tx(&sample_fund_request(1_000))
-                .map_or(true, |(_, plan)| !plan.spent_outpoints.contains(&change)),
-            "and planned"
-        );
-    }
-
     // ---- CS-473: concurrent requests must not share an input ----
 
     /// Two requests planned against the same cache, as concurrent requests
@@ -3427,6 +3345,88 @@ mod tests {
             unique.len(),
             spent.len(),
             "an input was spent twice, which the network refuses as a conflict: {spent:?}"
+        );
+    }
+
+    // ---- CS-723: a commit's change listed once ----
+
+    /// A refresh between the node accepting a transaction and its commit can
+    /// already list the change. The commit does not add a second copy.
+    #[test]
+    fn cs_723_a_commit_does_not_list_change_a_refresh_already_listed() {
+        let mut client = test_client_with_utxos(&[10_000]);
+        let (_, plan) = client
+            .plan_funding_tx(&sample_fund_request(1_000))
+            .expect("plans");
+        let change = plan.change_entry.clone().expect("has change");
+        client.claim_inputs(&plan);
+        // The refresh lists the change, as the chain now does.
+        client.apply_chain_state(vec![change.clone()]);
+        client.commit_funding_spend(plan).expect("commits");
+
+        let copies = client
+            .unspent
+            .iter()
+            .filter(|utxo| outpoint_key(utxo) == outpoint_key(&change))
+            .count();
+        assert_eq!(copies, 1, "{:?}", client.unspent);
+        assert_eq!(
+            client.get_balance().confirmed + client.get_balance().unconfirmed,
+            change.value
+        );
+    }
+
+    // ---- CS-723: spent change and handed-out transactions survive a restart
+
+    /// Own change spent before a restart stays withheld after it, while a
+    /// lagging index lists it: first not at all, then the transaction that
+    /// made it but not the one that spent it. The in-flight file used to keep
+    /// only reservations and pending change, so the restarted service let the
+    /// reservation go when the index did not list the change, then offered it
+    /// when the index did.
+    #[test]
+    fn cs_723_own_change_spent_before_a_restart_is_not_offered_after_it() {
+        let mut client = test_client_with_utxos(&[10_000]);
+        let fund = |client: &mut Client| {
+            let (_, plan) = client
+                .plan_funding_tx(&sample_fund_request(1_000))
+                .expect("plans");
+            client.claim_inputs(&plan);
+            client.commit_funding_spend(plan.clone()).expect("commits");
+            plan
+        };
+        let first = fund(&mut client);
+        let change = first.change_entry.clone().expect("has change");
+        let second = fund(&mut client);
+        assert_eq!(
+            second.spent_outpoints[0], change,
+            "the second spends the first's change"
+        );
+
+        // The index has seen neither transaction yet, over two refreshes,
+        // then only the first.
+        let lagging = |client: &mut Client| {
+            client.apply_chain_state(Vec::new());
+            client.apply_chain_state(Vec::new());
+            client.apply_chain_state(vec![change.clone()]);
+        };
+        let mut restarted = test_client_with_utxos(&[]);
+        restarted.restore_inflight_state(client.inflight_state());
+        lagging(&mut client);
+        assert!(
+            !client.unspent.contains(&change),
+            "without a restart the change is withheld"
+        );
+        lagging(&mut restarted);
+        assert!(
+            !restarted.unspent.contains(&change),
+            "the first's change, spent by the second, was offered again"
+        );
+        assert!(
+            restarted
+                .plan_funding_tx(&sample_fund_request(1_000))
+                .map_or(true, |(_, plan)| !plan.spent_outpoints.contains(&change)),
+            "and planned"
         );
     }
 
