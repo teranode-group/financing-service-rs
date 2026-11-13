@@ -511,19 +511,9 @@ impl Service {
     pub async fn new(config: &Config) -> Result<Service, String> {
         let backend = blockchain_factory(config)?;
 
-        // Warned about, not fatal (CS-505, SR-BCHN-018) -- for the reason the
-        // mapi-lite probe below is not: exiting ties this service's lifecycle
-        // to an upstream it cannot fix. A WhatsOnChain that answered one 429
-        // used to stop startup, and the restart that followed hit the same
-        // rate limit. Serving degraded keeps /status and /health up, and
-        // GET /ready reports the service unready until a chain read succeeds
-        // (SR-BCHN-017).
-        if let Err(e) = backend.interface.status().await {
-            log::warn!(
-                "Unable to reach the blockchain interface at startup: {e}. Funding will fail \
-                 until it answers; GET /ready reports the service unready meanwhile."
-            );
-        }
+        // The blockchain interface is not asked anything here: see
+        // [`Service::start_chain`], which runs once the server is listening
+        // (CS-722).
 
         // The write path. Without [mapi_lite] it wraps the interface probed
         // just above, so only mapi-lite needs a probe of its own -- and gets
@@ -570,12 +560,42 @@ impl Service {
             }
         }
 
-        let service = Self::build(config, backend, broadcaster)?;
+        Self::build(config, backend, broadcaster)
+    }
+
+    /// What startup asks of the blockchain interface, run behind the server
+    /// rather than in front of it (CS-722): the status probe, the node's
+    /// address watch (`rpc`), and the first read of every client's chain
+    /// state.
+    ///
+    /// They used to run before the server bound: a probe bounded at
+    /// `timeout_seconds`, then each client read in turn, each bounded the
+    /// same. With a chain source that accepts and never answers and three
+    /// clients, `/health` was unreachable for over two minutes, the
+    /// container health check marked it unhealthy at about 100s, and the
+    /// orchestrator restarted it into the same wait, which SR-BCHN-018 set
+    /// out to prevent. Now `/health` answers at once, `GET /ready` reports
+    /// the service unready until a chain read succeeds (SR-BCHN-017), and a
+    /// funding request meanwhile waits for, or makes, its client's read.
+    ///
+    /// The first read is the periodic sweep's, which holds no client lock
+    /// while it reads, so a client's balance can be asked for meanwhile.
+    pub async fn start_chain(service: &Arc<Service>) {
+        // Warned about, not fatal (CS-505, SR-BCHN-018) -- for the reason the
+        // mapi-lite probe is not: exiting ties this service's lifecycle to an
+        // upstream it cannot fix. A WhatsOnChain that answered one 429 used
+        // to stop startup, and the restart that followed hit the same rate
+        // limit.
+        if let Err(e) = service.blockchain_interface.status().await {
+            log::warn!(
+                "Unable to reach the blockchain interface at startup: {e}. Funding will fail \
+                 until it answers; GET /ready reports the service unready meanwhile."
+            );
+        }
         // Before the first balance read, so the backend already knows the
         // addresses it is about to be asked about.
         service.watch_configured_client_addresses().await;
-        service.update_balances().await;
-        Ok(service)
+        Self::refresh_balances(service).await;
     }
 
     #[cfg(test)]
@@ -932,7 +952,10 @@ impl Service {
         *self.blockchain_update_time.write().await = Some(SystemTime::now());
     }
 
-    /// Update client balances at startup.
+    /// Read every client's chain state in turn, each under its client's
+    /// lock: how the test constructors load it. Production does this behind
+    /// the server, in [`Service::start_chain`] (CS-722).
+    #[cfg(test)]
     pub async fn update_balances(&self) {
         let handles = self.client_handles().await;
         if handles.is_empty() {
