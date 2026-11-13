@@ -1054,8 +1054,12 @@ impl Service {
             let Ok(_refreshing) = service.chain_refresh_lock(&client_id).try_lock_owned() else {
                 continue;
             };
+            let since = client.read().await.invalidations();
             match fetch_chain_state(blockchain.as_ref(), &address).await {
-                Ok(utxo) => client.write().await.apply_chain_state(utxo),
+                Ok(utxo) => client
+                    .write()
+                    .await
+                    .apply_chain_state_read_since(utxo, since),
                 Err(e) => {
                     service.record_chain_failure(&e).await;
                     status = BlockchainConnectionStatus::Failed;
@@ -1232,7 +1236,12 @@ impl Service {
             .client_handle(client_id)
             .await
             .ok_or_else(|| format!("Unknown client_id {client_id}"))?;
-        let address = client.read().await.get_address();
+        // Noted before the read, so an invalidation while it runs keeps its
+        // answer from being stamped fresh (CS-721).
+        let (address, since) = {
+            let client = client.read().await;
+            (client.get_address(), client.invalidations())
+        };
         let chain_state =
             match fetch_chain_state(service.blockchain_interface.as_ref(), &address).await {
                 Ok(state) => {
@@ -1244,7 +1253,10 @@ impl Service {
                     return Err(e);
                 }
             };
-        client.write().await.apply_chain_state(chain_state);
+        client
+            .write()
+            .await
+            .apply_chain_state_read_since(chain_state, since);
         *service.blockchain_status.write().await = BlockchainConnectionStatus::Connected;
         *service.blockchain_update_time.write().await = Some(SystemTime::now());
         Ok(())
@@ -2243,6 +2255,49 @@ mod tests {
             .await
             .expect("the outpoints are the caller's");
         assert_eq!(settled.outpoints.len(), 1);
+    }
+
+    /// CS-721: a broadcast refused while a chain read is in flight
+    /// invalidates the state, and the read's answer predates the refusal. It
+    /// is applied but not stamped fresh, so the next request fetches again
+    /// rather than funding from the input the refusal spent. Without the
+    /// invalidation the same read is fresh, and the next request uses it.
+    #[tokio::test]
+    async fn cs_721_a_read_that_began_before_an_invalidation_is_not_fresh() {
+        use crate::test_support::GatedBlockchain;
+
+        for invalidated in [true, false] {
+            let mut config = test_config(&unique_dynamic_config_path());
+            config.service.chain_state_max_age_seconds = Some(60);
+            let gated = GatedBlockchain::new(&config).await;
+            let service = Arc::new(Service::new_for_test(&config, gated.clone()).await);
+
+            gated.close();
+            let started = gated.utxo_read_count();
+            let refresh = tokio::spawn({
+                let service = Arc::clone(&service);
+                async move { Service::refresh_client_chain_state(&service, TEST_CLIENT_ID).await }
+            });
+            while gated.utxo_read_count() == started {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            // The refusal lands while the read is held at the gate.
+            if invalidated {
+                Service::invalidate_chain_state(&service, TEST_CLIENT_ID).await;
+            }
+            gated.open();
+            refresh.await.unwrap().expect("the read answers");
+
+            let reads = gated.utxo_read_count();
+            Service::refresh_client_chain_state_if_stale(&service, TEST_CLIENT_ID)
+                .await
+                .expect("refreshes");
+            assert_eq!(
+                gated.utxo_read_count() > reads,
+                invalidated,
+                "invalidated during the read: {invalidated}"
+            );
+        }
     }
 
     /// CS-502. A chain read that is accepted and never answered no longer
