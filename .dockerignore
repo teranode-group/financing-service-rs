@@ -15,14 +15,15 @@ data/*.tmp*
 
 # Key material and local configuration. local*.toml holds a developer's WIFs
 # in plaintext.
-data/local*.toml
-certs
 # A pattern is relative to the context root and * does not cross a /, so
-# key files are matched with **/ to catch them at any depth (CS-682).
+# every name below that isn't tied to a directory starts with **/ to match
+# at any depth (CS-682).
+data/local*.toml
+**/certs
 **/*.pem
 **/*.key
-.env
-.env.*
+**/.env
+**/.env.*
 
 # Editor and OS clutter.
 .DS_Store

@@ -88,7 +88,7 @@ To build the docker image associated with the service run the following comand i
 ```
 This builds the Docker image `financing-service-rust`. The image includes a health check against `GET /health`, the liveness endpoint.
 
-The image is built with `--locked` from the committed `Cargo.lock`, from base images pinned by digest, and runs as an unprivileged user (`fs`, uid 10001). `.dockerignore` keeps `.git`, `target/`, the runtime files in `data/` — which can hold client WIFs — and any `*.pem` or `*.key` file, at whatever depth, out of the build context.
+The image is built with `--locked` from the committed `Cargo.lock`, from base images pinned by digest, and runs as an unprivileged user (`fs`, uid 10001). `.dockerignore` keeps `.git`, `target/`, the runtime files in `data/` — which can hold client WIFs — and, at whatever depth, any `certs` directory and `*.pem`, `*.key` or `.env` file out of the build context.
 ### 2) To Run the Image
 To start the Docker container:
 ```bash

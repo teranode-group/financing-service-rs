@@ -344,9 +344,11 @@ mod tests {
             "target",
             "data/dynamic*",
             "data/*.inflight.json",
-            "certs",
+            "**/certs",
             "**/*.pem",
             "**/*.key",
+            "**/.env",
+            "**/.env.*",
         ] {
             assert!(
                 ignore.iter().any(|l| l == required),
@@ -354,11 +356,21 @@ mod tests {
             );
         }
         // A pattern is relative to the context root and `*` does not cross a
-        // `/`, so a bare `*.pem` lets config/x.pem through (CS-682).
+        // `/`, so a bare `*.pem` lets config/x.pem through (CS-682). Only
+        // build output and editor clutter may match at the root alone.
+        const ROOT_ONLY: [&str; 7] = [
+            ".git",
+            ".github",
+            "target",
+            ".DS_Store",
+            "*.swp",
+            "out.txt",
+            "tree.txt",
+        ];
         for line in &ignore {
-            if line.ends_with(".pem") || line.ends_with(".key") {
+            if !line.contains('/') {
                 assert!(
-                    line.starts_with("**/") || line.contains('/'),
+                    ROOT_ONLY.contains(&line.as_str()),
                     "{line} only matches at the context root"
                 );
             }
