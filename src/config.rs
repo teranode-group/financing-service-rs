@@ -57,6 +57,10 @@ pub struct BlockchainInterfaceConfig {
 /// The per-call deadline when `timeout_seconds` is unset (CS-502).
 pub const DEFAULT_INTERFACE_TIMEOUT_SECONDS: u64 = 30;
 
+/// What the shutdown grace adds to the worst-case fund (CS-719): the commit
+/// and the in-flight state's write after the broadcast answers.
+pub const SHUTDOWN_MARGIN: Duration = Duration::from_secs(5);
+
 fn default_rpc_import_addresses() -> bool {
     true
 }
@@ -855,6 +859,16 @@ impl Config {
             None => read,
         };
         Some(read * 3 + broadcast)
+    }
+
+    /// How long, after SIGTERM or SIGINT, the server waits for the requests
+    /// in flight before it drops them (CS-719): the longest a `POST /fund`
+    /// can take, plus [`SHUTDOWN_MARGIN`], so a deploy does not cut a funding
+    /// off mid-broadcast. actix's own default, 30s, is shorter than one.
+    /// `None` when chain reads have no deadline, so nothing bounds a fund,
+    /// and actix's default applies.
+    pub fn shutdown_grace(&self) -> Option<Duration> {
+        Some(self.fund_worst_case()? + SHUTDOWN_MARGIN)
     }
 
     /// On mainnet and testnet, `[mapi_lite]` must name the keys its answers
@@ -1959,6 +1973,20 @@ filename = "./data/dynamic.toml"
 
     /// What `GET /status` publishes: three chain reads and the broadcast, or
     /// nothing when chain reads have no deadline (CS-624).
+    #[test]
+    fn cs_719_the_shutdown_grace_outlasts_the_worst_case_fund() {
+        let mut config: Config = toml::from_str(MINIMAL_TOML).unwrap();
+        config.mapi_lite = Some(MapiLiteConfig::for_base_url("http://mapi"));
+        // 135s with mapi-lite at the defaults, against actix's 30s.
+        assert_eq!(
+            config.shutdown_grace(),
+            Some(Duration::from_secs(3 * 30 + 45 + 5))
+        );
+        assert!(config.shutdown_grace() > config.fund_worst_case());
+        config.blockchain_interface.timeout_seconds = Some(0);
+        assert_eq!(config.shutdown_grace(), None, "nothing bounds a fund");
+    }
+
     #[test]
     fn sr_cfg_011_the_fund_worst_case_is_three_reads_and_the_broadcast() {
         let mut config: Config = toml::from_str(MINIMAL_TOML).unwrap();
