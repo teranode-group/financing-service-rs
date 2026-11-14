@@ -159,7 +159,7 @@ It bounds a whole call, and WhatsOnChain's UTXO listing is one call made of seve
 Most keys have defaults, and most sections can be left out. These cannot, and the service refuses to start without them:
 
 * `blockchain_interface.interface_type` and `blockchain_interface.network`
-* `service.utxo_refresh_period`
+* `service.utxo_refresh_period`, at least 1 (CS-723: `0` used to stop the periodic sweep silently; to refresh on every request, set `service.chain_state_max_age_seconds = 0`)
 * `dynamic_config.filename`
 
 Within an optional section, `mapi_lite.base_url` is required when `[mapi_lite]` is present, and `client_id` and `wif_key` in each `[[client]]`.
@@ -355,6 +355,8 @@ After a restart the service now picks up where it stopped: inputs it spent stay 
 **The file has to survive a restart**, the same as `dynamic.toml` beside it. A deployment that already keeps `dynamic.toml` on a volume keeps this too, with nothing to add. If the file is missing the service starts with no in-flight state, which is normal on first run; if it is unreadable, that is logged as an error and the service starts without it rather than refusing to — in that case outpoints spent shortly before the restart may be handed out again, which is the behaviour this replaced.
 
 The ten-minute window is backed by the chain itself, from chain-gang 0.11.5. WhatsOnChain goes on listing an output after a mempool transaction spends it, flagged `isSpentInMempoolTx`; earlier chain-gang releases ignored the flag and reported such outputs as unspent, so a transaction still unconfirmed when its reservation ran out would have had its input offered again. Now the read interface drops them, the way a node's own `listunspent` does, and the reservation is a guard against the read interface lagging rather than the only thing standing between an input and a second spend.
+
+**What else the file holds** (CS-723). Besides reservations and pending change, it keeps which transactions were handed to callers and which of the service's own change each one spent. Without them, a restarted service could offer own change it had already spent once a lagging read source listed it again. The file is written readable by its owner alone (`0600`), whatever the umask, and its directory is flushed after each write, so a crash cannot undo the rename. A file an earlier version wrote, without the new records, still reads.
 
 **Commits share writes** (CS-495). Each write serialises and flushes the whole state, so writing once per commit capped a busy client at the rate one write takes — and that rate falls as the state grows, which it does through each refresh window under load. Commits that finish while a write is in progress now wait for the next one, which covers them all, so a burst costs one write rather than one per request. Every request is still answered only after a write that includes it. The file is written compact rather than pretty-printed; `jq . dynamic.inflight.json` reads it.
 

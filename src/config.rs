@@ -259,6 +259,22 @@ impl ServiceConfig {
             .unwrap_or_else(|| (self.utxo_refresh_period.saturating_mul(3)).max(60));
         (seconds > 0).then(|| std::time::Duration::from_secs(seconds))
     }
+
+    /// `utxo_refresh_period` must be at least 1 (CS-723). `0` was accepted,
+    /// and `tokio::time::interval` panics on a zero period inside the task
+    /// that runs the periodic sweep, which stopped the sweep and the
+    /// fee-quote refresh without a word.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.utxo_refresh_period == 0 {
+            return Err(
+                "service.utxo_refresh_period is 0: it must be at least 1 second. To refresh \
+                 chain state on every request, set service.chain_state_max_age_seconds = 0 \
+                 instead"
+                    .to_string(),
+            );
+        }
+        Ok(())
+    }
 }
 
 /// Retention policy for `POST /fund` idempotency records.
@@ -1053,6 +1069,7 @@ pub fn load_config(path: &str) -> Result<Config, String> {
     config.fees.validate()?;
     config.dynamic_config.validate()?;
     config.funding_limits.validate()?;
+    config.service.validate()?;
     config.check_auth_policy()?;
     config.check_chain_reads()?;
     if let Some(mapi_lite) = &config.mapi_lite {
@@ -1657,6 +1674,18 @@ filename = "./data/dynamic.toml"
     fn sr_cfg_002_the_sample_config_holds_only_keys_settings_read() {
         let config = with_env(&[], || get_config(DEFAULT_CONFIG_FILE).unwrap());
         assert_eq!(config.listen_addr, DEFAULT_LISTEN_ADDR);
+    }
+
+    #[test]
+    fn cs_723_a_zero_refresh_period_is_refused() {
+        let service = |period| ServiceConfig {
+            utxo_refresh_period: period,
+            ..ServiceConfig::default()
+        };
+        let error = service(0).validate().unwrap_err();
+        assert!(error.contains("utxo_refresh_period"), "{error}");
+        assert!(service(1).validate().is_ok());
+        assert!(service(60).validate().is_ok());
     }
 
     #[test]
