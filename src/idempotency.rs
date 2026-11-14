@@ -204,7 +204,11 @@ impl IdempotencyStore {
     /// rather than funded again; evicted under load -- above about 16.7
     /// fundings a second at the defaults -- that retry funded a second time.
     /// With nothing completed left to drop the store goes over its bound, by
-    /// at most the requests in flight, which the funding limits bound.
+    /// at most the records still in flight: requests being funded now, and
+    /// those whose outcome was unknown, each held until its TTL (CS-741). So
+    /// the overshoot is bounded by the requests that arrive within the TTL,
+    /// and where `[funding_limits]` is set by what each client may be paid in
+    /// its period, since an unknown outcome keeps its hold.
     fn make_room_for_one(&mut self) {
         while self.entries.len() >= self.max_entries {
             let mut held: HashMap<&str, usize> = HashMap::new();
@@ -510,7 +514,8 @@ mod tests {
             Reservation::InProgress,
             "the in-flight record was evicted, so its retry would fund again"
         );
-        // Over the bound by the records in flight, and no more.
+        // Over the bound by the record in flight -- here one of unknown
+        // outcome, held until its TTL -- and no more.
         assert_eq!(store.len(), 4);
     }
 }
