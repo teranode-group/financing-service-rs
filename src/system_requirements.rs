@@ -305,6 +305,30 @@ mod tests {
         assert!(run.contains("-p \"${PUBLISH_ADDRESS}:8080:8080\""), "{run}");
     }
 
+    /// CS-739: `docker stop` waits the shutdown grace out (CS-719) before it
+    /// kills the container, where Docker's own 10s cut a funding off.
+    #[test]
+    fn cs_739_run_sh_lets_a_funding_finish_before_docker_kills_it() {
+        let run = instructions("run.sh").join("\n");
+        assert!(run.contains("--stop-timeout \"${STOP_TIMEOUT}\""), "{run}");
+        let default: u64 = run
+            .split("FS_STOP_TIMEOUT:-")
+            .nth(1)
+            .and_then(|rest| rest.split('}').next())
+            .and_then(|n| n.parse().ok())
+            .expect("FS_STOP_TIMEOUT has a numeric default");
+        let config = crate::config::Config {
+            mapi_lite: Some(crate::config::MapiLiteConfig::for_base_url("http://mapi")),
+            ..Default::default()
+        };
+        let grace = config.shutdown_grace().expect("bounded at the defaults");
+        assert!(
+            default > grace.as_secs(),
+            "run.sh stops after {default}s, before the {}s grace",
+            grace.as_secs()
+        );
+    }
+
     #[test]
     fn sr_sec_025_the_image_builds_the_committed_lockfile() {
         let build = instructions("Dockerfile")

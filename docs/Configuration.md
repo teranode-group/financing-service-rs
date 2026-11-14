@@ -366,6 +366,8 @@ The ten-minute window is backed by the chain itself, from chain-gang 0.11.5. Wha
 
 One window remains: the moment between a broadcast succeeding and the commit reaching disk. A process killed in that moment keeps the inputs reserved, but not the change the transaction created, until the chain lists it.
 
+**Deployments give it that long** (CS-739). `run.sh` passes `--stop-timeout 150` to `docker run`, or `FS_STOP_TIMEOUT`, so `docker stop` waits the grace out rather than killing the process after Docker's 10s. uls-rs's compose sets `stop_grace_period` from the timeouts it renders. Elsewhere set it yourself, at least `fund_worst_case_seconds` plus 5s. A rolling deploy can therefore take up to that long per instance.
+
 ### How often the service reads the chain
 
 Every chain-state refresh is one request to the blockchain interface, and `POST /fund` and `GET /balance` each want current state. Refreshing on every request means the cost scales with traffic, which is what runs into a public API's rate limit — see [Outbound rate limiting](#outbound-rate-limiting).
