@@ -1569,20 +1569,32 @@ impl Client {
 
     /// Keep a refused plan's inputs out of selection for
     /// [`REFUSED_INPUT_QUARANTINE`], after the broadcaster refused it as
-    /// missing an input or spending one already spent (CS-720). Returns how
-    /// many were quarantined.
+    /// missing an input, or as spending one already spent when `conflicted`
+    /// (CS-720). Returns how many were quarantined.
     ///
     /// Call after [`Self::release_claim`], which put them back. The refusal
-    /// does not say which input it was, so every input the chain listed is
-    /// held; the service's own change is not, being handled by
-    /// [`Self::forget_refused_own_change`] and [`Self::release_claim`]
-    /// (CS-506, CS-691). Funding usually spends one input, so this is rarely
-    /// more than the culprit.
-    pub fn quarantine_refused_inputs(&mut self, plan: &FundingSpendPlan) -> usize {
+    /// does not say which input it was. After a conflict every input the
+    /// chain listed is held: nobody outside can cause one on this wallet's
+    /// coins without its keys. After a missing input only the unconfirmed
+    /// ones are (#167 review): a coin the nodes do not have is necessarily
+    /// unconfirmed -- a confirmed one can be missing only once spent, and the
+    /// next refresh drops it then -- and holding a confirmed coin selected
+    /// beside it would let one cheap unconfirmed payment freeze it, every ten
+    /// minutes. The service's own change is not held either way, being
+    /// handled by [`Self::forget_refused_own_change`] and
+    /// [`Self::release_claim`] (CS-506, CS-691).
+    pub fn quarantine_refused_inputs(
+        &mut self,
+        plan: &FundingSpendPlan,
+        conflicted: bool,
+    ) -> usize {
         let now = Instant::now();
         let mut held = 0;
         for entry in &plan.spent_outpoints {
             if self.handed_out.contains_key(&entry.tx_hash) {
+                continue;
+            }
+            if !conflicted && entry.height > 0 {
                 continue;
             }
             let key = outpoint_key(entry);
@@ -2284,7 +2296,7 @@ mod tests {
         assert_eq!(plan.spent_outpoints[0].value, 10_000, "the smallest");
         client.claim_inputs(&plan);
         client.release_claim(&plan, false);
-        assert_eq!(client.quarantine_refused_inputs(&plan), 1);
+        assert_eq!(client.quarantine_refused_inputs(&plan, true), 1);
 
         let next = |client: &mut Client| {
             client.apply_chain_state(listed.clone());
@@ -2296,6 +2308,48 @@ mod tests {
         assert_eq!(next(&mut client), 50_000, "held out though listed");
         client.backdate_quarantine(REFUSED_INPUT_QUARANTINE);
         assert_eq!(next(&mut client), 10_000, "offered again after it");
+    }
+
+    /// #167 review: after a missing-inputs refusal only the unconfirmed
+    /// inputs are held, so a confirmed coin selected beside a cheap phantom
+    /// -- because the phantom alone did not cover the request -- is offered
+    /// again at once. After a conflict both are held.
+    #[test]
+    fn cs_720_a_missing_input_holds_only_the_unconfirmed_inputs() {
+        let utxo = |seed: char, height: i32, value: i64| UtxoEntry {
+            height,
+            tx_pos: 0,
+            tx_hash: seed.to_string().repeat(64),
+            value,
+        };
+        let listed = || {
+            vec![
+                utxo('a', UNCONFIRMED_HEIGHT, 10_000),
+                utxo('b', 800_000, 15_000),
+            ]
+        };
+        for (conflicted, held, offered) in [(false, 1, vec![15_000]), (true, 2, vec![])] {
+            let mut client = client_holding(listed());
+            let (_, plan) = client
+                .plan_funding_tx(&sample_fund_request(20_000))
+                .expect("plans");
+            assert_eq!(
+                plan.spent_outpoints.len(),
+                2,
+                "the phantom alone does not cover it"
+            );
+            client.claim_inputs(&plan);
+            client.release_claim(&plan, conflicted);
+            assert_eq!(
+                client.quarantine_refused_inputs(&plan, conflicted),
+                held,
+                "conflicted: {conflicted}"
+            );
+
+            client.apply_chain_state(listed());
+            let values: Vec<i64> = client.unspent.iter().map(|u| u.value).collect();
+            assert_eq!(values, offered, "conflicted: {conflicted}");
+        }
     }
 
     // ---- CS-473: concurrent requests must not share an input ----

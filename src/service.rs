@@ -1755,8 +1755,9 @@ impl Service {
     /// And when the node said an input is missing or conflicted, the inputs
     /// the chain listed are kept out of selection for a while, though the
     /// read source goes on listing them (CS-720): it can be listing a coin
-    /// the broadcaster's nodes do not have. Not when the reason was unread,
-    /// which could be any refusal.
+    /// the broadcaster's nodes do not have. After a missing input only the
+    /// unconfirmed ones, since such a coin is necessarily unconfirmed. Not
+    /// when the reason was unread, which could be any refusal.
     ///
     /// The in-flight state is saved after every release (CS-719): the claim
     /// was saved as reservations before the broadcast, and left on disk they
@@ -1774,7 +1775,7 @@ impl Service {
                 let mut client = client.write().await;
                 client.release_claim(&prepared.spend_plan, inputs_conflicted || reason_unread);
                 if inputs_missing || inputs_conflicted {
-                    client.quarantine_refused_inputs(&prepared.spend_plan);
+                    client.quarantine_refused_inputs(&prepared.spend_plan, inputs_conflicted);
                 }
                 if inputs_missing {
                     client.forget_refused_own_change(&prepared.spend_plan);
@@ -3120,8 +3121,13 @@ mod tests {
     async fn cs_720_an_input_refused_as_missing_or_conflicted_is_not_selected_again() {
         use crate::test_support::{blockchain_listing, ScriptedBroadcaster};
 
+        // The phantom is unconfirmed, as a coin the nodes do not have must be.
         let utxo = |seed: char, value| chain_gang::interface::UtxoEntry {
-            height: 1517000,
+            height: if seed == 'a' {
+                chain_gang::interface::blockchain_interface::UNCONFIRMED_HEIGHT
+            } else {
+                1517000
+            },
             tx_pos: 0,
             tx_hash: seed.to_string().repeat(64),
             value,
