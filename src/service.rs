@@ -772,7 +772,8 @@ impl Service {
     /// Called after each commit, so what is on disk is never behind what has
     /// been broadcast by more than the moment between the two. A failure is
     /// logged, not returned: the transaction is already on the network, and
-    /// the caller has nothing it could do with the error.
+    /// the caller has nothing it could do with the error. Before a broadcast
+    /// there is, so that save uses [`Self::try_save_inflight_state`] (CS-737).
     ///
     /// Commits share writes. Each takes a ticket, then queues for the save
     /// lock; whoever holds it snapshots every client and writes, and that
@@ -787,6 +788,19 @@ impl Service {
     /// finishing together would otherwise each snapshot, then write in either
     /// order -- and whichever snapshot is older could land last.
     pub async fn save_inflight_state(&self) {
+        if let Err(e) = self.try_save_inflight_state().await {
+            log::error!(
+                "cannot save in-flight funding state to {}: {e}. A restart before the chain \
+                 catches up could hand the same outpoints out again.",
+                self.inflight_state_path.display()
+            );
+        }
+    }
+
+    /// [`Self::save_inflight_state`], returning whether the state the caller
+    /// changed is on disk: `Ok` once a write that includes it has succeeded,
+    /// here or by another caller sharing it.
+    pub async fn try_save_inflight_state(&self) -> std::io::Result<()> {
         use std::sync::atomic::Ordering;
 
         // Taken after the caller applied its commit, so any snapshot that
@@ -794,7 +808,7 @@ impl Service {
         let ticket = self.inflight_commits.fetch_add(1, Ordering::SeqCst) + 1;
         let mut written_through = self.inflight_save.lock().await;
         if *written_through >= ticket {
-            return;
+            return Ok(());
         }
         let covers = self.inflight_commits.load(Ordering::SeqCst);
 
@@ -826,16 +840,11 @@ impl Service {
             .unwrap_or_else(|e| Err(std::io::Error::other(e)));
         #[cfg(test)]
         self.inflight_writes.fetch_add(1, Ordering::SeqCst);
-        match written {
-            Ok(()) => *written_through = covers,
-            // Not marked written, so the next commit tries again rather than
-            // being told a failed write covered it.
-            Err(e) => log::error!(
-                "cannot save in-flight funding state to {}: {e}. A restart before the chain \
-                 catches up could hand the same outpoints out again.",
-                self.inflight_state_path.display()
-            ),
-        }
+        // A failed write is not marked written, so the next caller tries
+        // again rather than being told a failed write covered it.
+        written?;
+        *written_through = covers;
+        Ok(())
     }
 
     async fn client_handles(&self) -> Vec<Arc<RwLock<Client>>> {
@@ -1720,7 +1729,24 @@ impl Service {
         // selected again while its spend sat in a node's mempool. Restored,
         // the reservation withholds it until the chain catches up or the
         // reservation window ends, as an uncertain outcome's does.
-        service.save_inflight_state().await;
+        //
+        // A claim that could not be saved is given back and the funding
+        // refused, since nothing has been sent (CS-737). Going ahead would
+        // broadcast with the claim held only in memory: the gap the save
+        // closes, silently open for as long as the disk is unwritable.
+        if let Err(e) = service.try_save_inflight_state().await {
+            log::error!(
+                "cannot save in-flight funding state to {}: {e}. Refusing the funding before \
+                 broadcasting it: its claim on the inputs would be held only in memory.",
+                service.inflight_state_path.display()
+            );
+            client.write().await.release_claim(&spend_plan, false);
+            return Err(CodedError::new(
+                ErrorCode::BroadcastFailed,
+                "Nothing was sent: the service could not save its claim on the inputs to disk. \
+                 Nothing was spent; an operator has to fix the in-flight state file.",
+            ));
+        }
         Ok((
             service.broadcaster(),
             PreparedFunding {
@@ -4241,10 +4267,11 @@ mod tests {
         assert_eq!(inflight_writes(&service) - before, 4);
     }
 
-    /// A write that fails covers nothing. Commits queued behind it are not
-    /// answered on the strength of it: the next one tries again. And once the
-    /// file can be written it holds every spend, including those whose own
-    /// write failed.
+    /// A write that fails covers nothing. Saves queued behind it are not
+    /// answered on the strength of it: each tries again, and is told it
+    /// failed, which a funding about to broadcast is refused on (CS-737).
+    /// Once the file can be written, the next funding's claim and commit
+    /// reach it.
     #[tokio::test]
     async fn cs_495_a_failed_write_is_not_taken_as_covering_anything() {
         let config = test_config(&unique_dynamic_config_path());
@@ -4258,31 +4285,34 @@ mod tests {
         std::fs::write(path.join("occupied"), "").unwrap();
         let before = inflight_writes(&service);
 
-        // two commits queued behind a write in progress, as in the sharing case
+        // two saves queued behind a write in progress, as in the sharing case
         let writing = service.inflight_save.lock().await;
-        let requests: Vec<_> = (0..2)
+        let saves: Vec<_> = (0..2)
             .map(|_| {
                 let service = Arc::clone(&service);
-                tokio::spawn(async move {
-                    fund_single_transaction(&service, &sample_fund_request(TEST_CLIENT_ID)).await
-                })
+                tokio::spawn(async move { service.try_save_inflight_state().await })
             })
             .collect();
         tokio::time::sleep(Duration::from_millis(50)).await;
         drop(writing);
-        for request in requests {
-            request
-                .await
-                .unwrap()
-                .expect("funds, though the state cannot be saved");
+        for save in saves {
+            assert!(
+                save.await.unwrap().is_err(),
+                "a save was answered on the strength of a write that failed"
+            );
         }
-        // Two claims, then two commits (CS-719): each tried again after the
-        // write before it failed.
         assert_eq!(
             inflight_writes(&service) - before,
-            4,
-            "the second commit should have tried again after the first write failed"
+            2,
+            "the second save should have tried again after the first write failed"
         );
+
+        // A funding meanwhile is refused, unsent, rather than broadcast with
+        // its claim held only in memory (CS-737).
+        let refused = fund_single_transaction(&service, &sample_fund_request(TEST_CLIENT_ID))
+            .await
+            .expect_err("its claim cannot be saved");
+        assert_eq!(refused.code, ErrorCode::BroadcastFailed);
 
         std::fs::remove_dir_all(&path).unwrap();
         fund_single_transaction(&service, &sample_fund_request(TEST_CLIENT_ID))
@@ -4290,9 +4320,58 @@ mod tests {
             .expect("funds");
         assert_eq!(
             reservations_on_disk(&config),
-            3,
-            "all three spends, once it could"
+            1,
+            "the funded spend, once it could; the refused one gave its claim back"
         );
+    }
+
+    /// CS-737: a claim that cannot be saved to disk before its broadcast is
+    /// given back and the funding refused `broadcast_failed`, with nothing
+    /// sent. Going ahead would hold the claim only in memory, the gap CS-719
+    /// closes.
+    #[tokio::test]
+    async fn cs_737_a_claim_that_cannot_be_saved_is_refused_unsent() {
+        use crate::test_support::CountingBroadcaster;
+
+        let mut config = test_config(&unique_dynamic_config_path());
+        // A directory that does not exist, so every write fails.
+        let missing = std::env::temp_dir().join(format!(
+            "fs-cs737-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        config.service.inflight_state_file =
+            Some(missing.join("inflight.json").to_string_lossy().into_owned());
+        let broadcaster = CountingBroadcaster::new();
+        let service = service_with(
+            &config,
+            test_blockchain_interface(&config).await,
+            broadcaster.clone(),
+        )
+        .await;
+        let client = service.client_handle(TEST_CLIENT_ID).await.expect("client");
+        let held_before = client.read().await.inflight_state();
+
+        let refused = Service::execute_funding(&service, &sample_fund_request(TEST_CLIENT_ID))
+            .await
+            .expect_err("the claim could not be saved");
+        assert_eq!(refused.code, ErrorCode::BroadcastFailed);
+        assert!(
+            refused.description.contains("Nothing was sent"),
+            "{}",
+            refused.description
+        );
+        assert_eq!(broadcaster.broadcast_count(), 0, "nothing was broadcast");
+        assert_eq!(
+            client.read().await.reserved_outpoint_count(),
+            0,
+            "the claim was given back"
+        );
+        assert_eq!(client.read().await.inflight_state(), held_before);
+        assert!(!missing.exists());
     }
 
     /// CS-723: a client deleted while its funding broadcast, and re-added
