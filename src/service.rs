@@ -1813,7 +1813,8 @@ impl Service {
                         service,
                         &prepared,
                         inputs_missing,
-                        inputs_conflicted || reason_unread,
+                        inputs_conflicted,
+                        reason_unread,
                     )
                     .await;
                 }
@@ -1852,6 +1853,13 @@ impl Service {
     /// may have been a conflict, so the change waits for the chain to list
     /// it, as before CS-691.
     ///
+    /// And when the node said an input is missing or conflicted, the inputs
+    /// the chain listed are kept out of selection for a while, though the
+    /// read source goes on listing them (CS-720): it can be listing a coin
+    /// the broadcaster's nodes do not have. After a missing input only the
+    /// unconfirmed ones, since such a coin is necessarily unconfirmed. Not
+    /// when the reason was unread, which could be any refusal.
+    ///
     /// The in-flight state is saved after every release (CS-719): the claim
     /// was saved as reservations before the broadcast, and left on disk they
     /// would withhold the inputs after a restart. That save also keeps any
@@ -1861,11 +1869,15 @@ impl Service {
         prepared: &PreparedFunding,
         inputs_missing: bool,
         inputs_conflicted: bool,
+        reason_unread: bool,
     ) {
         if let Some(client) = service.prepared_client(prepared).await {
             {
                 let mut client = client.write().await;
-                client.release_claim(&prepared.spend_plan, inputs_conflicted);
+                client.release_claim(&prepared.spend_plan, inputs_conflicted || reason_unread);
+                if inputs_missing || inputs_conflicted {
+                    client.quarantine_refused_inputs(&prepared.spend_plan, inputs_conflicted);
+                }
                 if inputs_missing {
                     client.forget_refused_own_change(&prepared.spend_plan);
                 }
@@ -1962,7 +1974,8 @@ impl Service {
                                     service,
                                     &prepared,
                                     inputs_missing,
-                                    inputs_conflicted || reason_unread,
+                                    inputs_conflicted,
+                                    reason_unread,
                                 )
                                 .await;
                             }
@@ -3240,6 +3253,88 @@ mod tests {
             !spends_first(&sent[2]),
             "the next request did not select the refused change again"
         );
+    }
+
+    /// CS-720: a coin the read source lists and the broadcaster's nodes do
+    /// not have -- anyone can pay the funding address with one -- is refused
+    /// as missing (or conflicted) when spent. It is then kept out of
+    /// selection for the quarantine, though every refresh lists it again, so
+    /// the next request funds from another input rather than being refused
+    /// the same way. A refusal whose reason was not read quarantines nothing.
+    #[tokio::test]
+    async fn cs_720_an_input_refused_as_missing_or_conflicted_is_not_selected_again() {
+        use crate::test_support::{blockchain_listing, ScriptedBroadcaster};
+
+        // The phantom is unconfirmed, as a coin the nodes do not have must be.
+        let utxo = |seed: char, value| chain_gang::interface::UtxoEntry {
+            height: if seed == 'a' {
+                chain_gang::interface::blockchain_interface::UNCONFIRMED_HEIGHT
+            } else {
+                1517000
+            },
+            tx_pos: 0,
+            tx_hash: seed.to_string().repeat(64),
+            value,
+        };
+        let phantom = "a".repeat(64);
+        let spends_phantom = |tx: &Tx| {
+            tx.inputs
+                .iter()
+                .any(|input| input.prev_output.hash.encode() == phantom)
+        };
+        let refusal = |reason: &str, reads: bool| {
+            let error = BroadcastError::Rejected {
+                description: reason.to_string(),
+                retryable: true,
+                conflicted_with: Vec::new(),
+            };
+            if reads {
+                ScriptedBroadcaster::reading_reasons(vec![Some(error)])
+            } else {
+                ScriptedBroadcaster::new(vec![Some(error)])
+            }
+        };
+
+        for (reason, reads, held) in [
+            (
+                "Mempool error, retry again later. (details: 16 missing-inputs)",
+                true,
+                true,
+            ),
+            ("258: txn-mempool-conflict", true, true),
+            ("some refusal nobody read", false, false),
+        ] {
+            let config = test_config(&unique_dynamic_config_path());
+            // The phantom is the smallest suitable UTXO, so it is picked first.
+            let blockchain =
+                blockchain_listing(&config, &[utxo('a', 10_000), utxo('b', 50_000)]).await;
+            let broadcaster = refusal(reason, reads);
+            let service = service_with(&config, blockchain, broadcaster.clone()).await;
+            let request = FundRequest {
+                satoshi: 1_000,
+                ..sample_fund_request(TEST_CLIENT_ID)
+            };
+
+            fund_single_transaction(&service, &request)
+                .await
+                .expect_err("the phantom is refused");
+            // A refresh in between, which lists the phantom again.
+            Service::refresh_client_chain_state(&service, TEST_CLIENT_ID)
+                .await
+                .expect("refreshes");
+            fund_single_transaction(&service, &request)
+                .await
+                .expect("the next request funds");
+
+            let sent = broadcaster.sent();
+            assert!(spends_phantom(&sent[0]), "{reason}: the first spent it");
+            assert_eq!(
+                !spends_phantom(&sent[1]),
+                held,
+                "{reason}: the next request {} the refused input",
+                if held { "selected" } else { "did not select" }
+            );
+        }
     }
 
     /// CS-691, #160 review: a refusal from a broadcaster that cannot read
