@@ -2046,7 +2046,8 @@ impl Service {
                 error,
                 inputs_missing: e.inputs_missing(),
                 inputs_conflicted: e.inputs_conflicted(),
-                reason_unread: !broadcaster.reads_node_reasons(),
+                // A transaction that never left has no reason to read (CS-736).
+                reason_unread: e.was_sent() && !broadcaster.reads_node_reasons(),
             });
         }
         log::info!(
@@ -2185,8 +2186,9 @@ fn coded_broadcast_error(error: &BroadcastError) -> CodedError {
             "The upstream refused the funding transaction and will not accept it on retry. \
              See the service log for its reason.",
         ),
-        // Unreachable, or refused in a way the upstream itself called worth
-        // retrying. Either way nothing was spent: since CS-501 every failure
+        // Unreachable, refused in a way the upstream itself called worth
+        // retrying, or never sent because its rate-limit slot was too far
+        // away (CS-736). Either way nothing was spent: since CS-501 every failure
         // that may have delivered the transaction is an unknown outcome
         // instead, including an acceptance mapi-lite could not record.
         _ => CodedError::new(
@@ -4452,6 +4454,59 @@ mod tests {
             "nothing left claimed"
         );
         assert_eq!(client.read().await.inflight_state(), held_before);
+    }
+
+    /// CS-736: a broadcast refused before it was sent -- its rate-limit slot
+    /// too far away -- is `broadcast_failed`, and its claim goes straight
+    /// back. Nothing reached the node, so there is no unread reason to hold
+    /// own change for, even through a broadcaster that cannot read reasons.
+    #[tokio::test]
+    async fn cs_736_a_broadcast_never_sent_gives_everything_back() {
+        use crate::test_support::ScriptedBroadcaster;
+        let not_sent = || {
+            vec![Some(BroadcastError::NotSent(
+                "the next request slot is 40.0s away".to_string(),
+            ))]
+        };
+
+        let config = test_config(&unique_dynamic_config_path());
+        let service = service_with(
+            &config,
+            test_blockchain_interface(&config).await,
+            ScriptedBroadcaster::new(not_sent()),
+        )
+        .await;
+        let (broadcaster, prepared) =
+            Service::prepare_funding_outpoints(&service, &sample_fund_request(TEST_CLIENT_ID))
+                .await
+                .expect("prepared");
+        let refused = Service::broadcast_prepared_funding(broadcaster, &prepared)
+            .await
+            .expect_err("not sent");
+        assert_eq!(refused.error.code, ErrorCode::BroadcastFailed);
+        assert!(!refused.reason_unread, "nothing reached the node");
+        assert!(!refused.inputs_conflicted && !refused.inputs_missing);
+
+        let config = test_config(&unique_dynamic_config_path());
+        let service = service_with(
+            &config,
+            test_blockchain_interface(&config).await,
+            ScriptedBroadcaster::new(not_sent()),
+        )
+        .await;
+        let client = service.client_handle(TEST_CLIENT_ID).await.expect("client");
+        let held_before = client.read().await.inflight_state();
+        let failed = Service::execute_funding(&service, &sample_fund_request(TEST_CLIENT_ID))
+            .await
+            .expect_err("not sent");
+        assert_eq!(failed.code, ErrorCode::BroadcastFailed);
+        assert_eq!(client.read().await.reserved_outpoint_count(), 0);
+        assert_eq!(client.read().await.inflight_state(), held_before);
+        // The script has run out, so the next request is sent, spending
+        // what the first one gave back.
+        Service::execute_funding(&service, &sample_fund_request(TEST_CLIENT_ID))
+            .await
+            .expect("funded");
     }
 
     /// When one UTXO is all the client has, a second request arriving while

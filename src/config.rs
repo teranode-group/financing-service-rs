@@ -115,11 +115,6 @@ fn check_network(network: &str) -> Result<(), String> {
 }
 
 impl BlockchainInterfaceConfig {
-    /// Outbound requests per second to allow, or `None` for no limit.
-    ///
-    /// An explicit setting always wins, including an explicit `0` meaning
-    /// unlimited. Otherwise only the interfaces that call somebody else's
-    /// server are limited.
     /// The deadline on each interface call, or `None` when it is turned off
     /// (CS-502).
     pub fn call_timeout(&self) -> Option<std::time::Duration> {
@@ -132,6 +127,21 @@ impl BlockchainInterfaceConfig {
         }
     }
 
+    /// Whether this service paces the interface's calls itself
+    /// ([`crate::outbound_rate_limit::RateLimited`]): a limit is set and the
+    /// interface cannot pace its own requests. Then a broadcast may wait up to
+    /// [`Self::call_timeout`] for its slot before its own deadline starts
+    /// (CS-718, CS-736).
+    pub fn paced_here(&self) -> bool {
+        self.outbound_rate_limit().is_some()
+            && !crate::blockchain_factory::paces_its_own_requests(&self.interface_type)
+    }
+
+    /// Outbound requests per second to allow, or `None` for no limit.
+    ///
+    /// An explicit setting always wins, including an explicit `0` meaning
+    /// unlimited. Otherwise only the interfaces that call somebody else's
+    /// server are limited.
     pub fn outbound_rate_limit(&self) -> Option<u32> {
         match self.max_requests_per_second {
             Some(0) => None,
@@ -862,8 +872,9 @@ impl Config {
     /// commit is refused. Chain reads are bounded by
     /// `blockchain_interface.timeout_seconds`, the broadcast by
     /// `mapi_lite.total_timeout_seconds`, or the same per-call bound without
-    /// `[mapi_lite]`. `None` when chain reads have no deadline, so nothing
-    /// bounds it.
+    /// `[mapi_lite]` -- twice over where this service paces the interface,
+    /// since the broadcast may first wait that long for its slot (CS-736).
+    /// `None` when chain reads have no deadline, so nothing bounds it.
     ///
     /// Requests queued behind a failing chain read each wait their turn, so
     /// during an outage a request can take longer; and `multiple_tx` repeats
@@ -872,6 +883,7 @@ impl Config {
         let read = self.blockchain_interface.call_timeout()?;
         let broadcast = match &self.mapi_lite {
             Some(mapi_lite) => mapi_lite.total_timeout(),
+            None if self.blockchain_interface.paced_here() => read * 2,
             None => read,
         };
         Some(read * 3 + broadcast)
@@ -2033,6 +2045,34 @@ filename = "./data/dynamic.toml"
         );
         config.blockchain_interface.timeout_seconds = Some(0);
         assert_eq!(config.fund_worst_case(), None);
+    }
+
+    /// CS-736: where this service paces the interface, a broadcast may wait
+    /// a whole `timeout_seconds` for its slot before its own deadline starts,
+    /// so without [mapi_lite] the worst case counts it twice. `woc` paces
+    /// inside chain-gang, under one deadline, and mapi-lite broadcasts
+    /// without the interface.
+    #[test]
+    fn cs_736_the_fund_worst_case_counts_a_paced_broadcasts_wait_for_its_slot() {
+        let mut config: Config = toml::from_str(MINIMAL_TOML).unwrap();
+        config.blockchain_interface.max_requests_per_second = Some(2);
+        assert!(config.blockchain_interface.paced_here());
+        assert_eq!(
+            config.fund_worst_case(),
+            Some(Duration::from_secs(3 * 30 + 2 * 30))
+        );
+        assert!(config.shutdown_grace() > config.fund_worst_case());
+
+        config.mapi_lite = Some(MapiLiteConfig::for_base_url("http://mapi"));
+        assert_eq!(
+            config.fund_worst_case(),
+            Some(Duration::from_secs(3 * 30 + 45))
+        );
+
+        config.mapi_lite = None;
+        config.blockchain_interface.interface_type = "woc".to_string();
+        assert!(!config.blockchain_interface.paced_here());
+        assert_eq!(config.fund_worst_case(), Some(Duration::from_secs(4 * 30)));
     }
 
     /// The settings the budget replaces are refused, not ignored (CS-624).

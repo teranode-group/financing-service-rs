@@ -34,7 +34,7 @@ pub struct Backend {
 /// limit that prompted this does not apply to them; they keep the decorator,
 /// which is the only thing available. `mapi_lite` among them: mapi-lite paces
 /// its own WhatsOnChain requests, so nothing is limited here unless set.
-fn paces_its_own_requests(interface_type: &str) -> bool {
+pub(crate) fn paces_its_own_requests(interface_type: &str) -> bool {
     interface_type == "woc"
 }
 
@@ -46,7 +46,9 @@ pub fn blockchain_factory(config: &Config) -> Result<Backend, String> {
     // well as the read itself: what it bounds is how long a caller waits.
     // Not a broadcast's, where this service paces (CS-718): one that ran out
     // of time queued behind reads would be reported as possibly sent, and
-    // hold its inputs for nothing. That one is bounded inside the pacing.
+    // hold its inputs for nothing. That one is bounded inside the pacing,
+    // and its wait for a slot by the pacing itself, which refuses a slot
+    // further away than the same deadline as never sent (CS-736).
     match timeout {
         Some(timeout) => {
             log::info!(
@@ -71,8 +73,10 @@ pub fn blockchain_factory(config: &Config) -> Result<Backend, String> {
 
 /// The interface, paced, and whether this service does the pacing: then a
 /// broadcast's deadline, `timeout`, is put on inside it, so it starts once
-/// the broadcast's slot is granted (CS-718). `woc` paces inside chain-gang's
-/// own call, where nothing here can start a deadline after the wait.
+/// the broadcast's slot is granted (CS-718), and the wait for that slot is
+/// limited to `timeout` too: a call whose slot is further away is refused
+/// unsent and books nothing (CS-736). `woc` paces inside chain-gang's own
+/// call, where nothing here can start a deadline after the wait.
 fn paced_backend(config: &Config, timeout: Option<Duration>) -> Result<(Backend, bool), String> {
     let limit = config.blockchain_interface.outbound_rate_limit();
     let interface_type = config.blockchain_interface.interface_type.as_str();
@@ -102,7 +106,7 @@ fn paced_backend(config: &Config, timeout: Option<Duration>) -> Result<(Backend,
     log::info!("limiting {interface_type} to {rps} interface call(s) per second");
     Ok((
         Backend {
-            interface: Arc::new(RateLimited::new(inner, rps)),
+            interface: Arc::new(RateLimited::new(inner, rps).with_max_wait(timeout)),
             address_watcher: backend.address_watcher,
         },
         true,
@@ -262,48 +266,69 @@ mod tests {
         }
     }
 
-    /// CS-718: where this service paces, a broadcast's deadline starts once
-    /// its slot is granted. Queued behind reads past `timeout_seconds`, it
-    /// is still sent, rather than timing out unsent and holding its inputs
-    /// as a possibly-sent broadcast. A read keeps its deadline over the wait.
+    /// CS-718, CS-736: where this service paces, a broadcast's deadline
+    /// starts once its slot is granted, and its wait for that slot is limited
+    /// to the same `timeout_seconds`. One whose slot is within reach waits
+    /// for it and is sent, past the deadline counted from when it was asked;
+    /// one whose slot is further away is refused at once as never sent, so
+    /// its inputs can be given back. A read whose slot is too far is refused
+    /// the same way and books nothing, so the slots cannot run away.
     #[tokio::test]
-    async fn cs_718_a_broadcast_is_bounded_from_its_slot_and_a_read_from_its_call() {
+    async fn cs_736_a_broadcast_waits_for_a_slot_within_its_deadline_and_no_further() {
+        use crate::outbound_rate_limit::never_sent;
+        use std::time::{Duration, Instant};
+
         let mut config = base_config("test", None);
         config.blockchain_interface.max_requests_per_second = Some(1);
         config.blockchain_interface.timeout_seconds = Some(1);
         let interface = blockchain_factory(&config).expect("builds").interface;
 
-        // Three reads book the next three slots, a second apart; the
-        // broadcast's is the fourth, about 3s out.
+        // Three reads ask for the next three slots, a second apart: the
+        // third's, 2s out, is past the 1s limit, so it is refused unbooked.
         let booked: Vec<_> = (0..3)
             .map(|_| {
                 let interface = interface.clone();
                 tokio::spawn(async move { interface.status().await })
             })
             .collect();
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        let queued = std::time::Instant::now();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // The next free slot is ~2s out, past the limit: refused at once.
+        let asked = Instant::now();
+        let error = interface
+            .broadcast_tx(&crate::test_support::sample_tx())
+            .await
+            .expect_err("its slot is too far away");
+        assert!(never_sent(&error), "{error}");
+        assert!(
+            asked.elapsed() < Duration::from_millis(500),
+            "refused after {:?}, not at once",
+            asked.elapsed()
+        );
+
+        // 1.2s in, that slot is 0.8s away: the broadcast waits and is sent,
+        // although that is most of its 1s deadline.
+        tokio::time::sleep(Duration::from_millis(1150)).await;
+        let queued = Instant::now();
         interface
             .broadcast_tx(&crate::test_support::sample_tx())
             .await
-            .expect("sent once its slot came, past the 1s deadline");
+            .expect("sent once its slot came");
         assert!(
-            queued.elapsed() >= std::time::Duration::from_secs(2),
+            queued.elapsed() >= Duration::from_millis(500),
             "it did wait for its slot: {:?}",
             queued.elapsed()
         );
 
-        // A read queued 2s out ran out of time, as before. (The one 1s out
-        // races its own deadline, so it is not asserted either way.)
         let mut reads = Vec::new();
         for read in booked {
             reads.push(read.await.unwrap());
         }
-        let timed_out = reads
+        let refused = reads
             .iter()
-            .filter(|read| matches!(read, Err(e) if crate::interface_timeout::is_timeout(e)))
+            .filter(|read| matches!(read, Err(e) if never_sent(e)))
             .count();
-        assert!(timed_out >= 1, "{reads:?}");
+        assert_eq!(refused, 1, "{reads:?}");
         assert!(reads.iter().any(Result::is_ok), "{reads:?}");
     }
 
