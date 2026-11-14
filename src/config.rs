@@ -146,13 +146,13 @@ impl BlockchainInterfaceConfig {
     pub fn validate(&self) -> Result<(), String> {
         check_network(&self.network)?;
         match self.interface_type.as_str() {
-            "uaas" => {
-                if self.url.as_deref().unwrap_or("").is_empty() {
-                    return Err(
-                        "blockchain_interface.url is required for interface_type = \"uaas\""
-                            .to_string(),
-                    );
-                }
+            // A guard rather than an `if` in the arm: clippy 1.95 asks for it
+            // (collapsible_match), and later versions accept either (CS-742).
+            "uaas" if self.url.as_deref().unwrap_or("").is_empty() => {
+                return Err(
+                    "blockchain_interface.url is required for interface_type = \"uaas\""
+                        .to_string(),
+                );
             }
             "rpc" => {
                 if self.url.as_deref().unwrap_or("").is_empty() {
@@ -2092,6 +2092,26 @@ filename = "./data/dynamic.toml"
         assert_eq!(mapi_lite.authorization().as_deref(), Some("Bearer secret"));
         assert_eq!(mapi_lite.total_timeout(), Duration::from_secs(30));
         assert!(mapi_lite.validate().is_ok());
+    }
+
+    /// `uaas` needs a `url`; the check is a match guard since CS-742, and
+    /// any other interface type is not asked for one.
+    #[test]
+    fn uaas_without_a_url_is_refused_at_startup() {
+        let interface = |interface_type: &str, url: Option<&str>| BlockchainInterfaceConfig {
+            interface_type: interface_type.to_string(),
+            network: "testnet".to_string(),
+            url: url.map(str::to_string),
+            ..Default::default()
+        };
+        for url in [None, Some("")] {
+            let error = interface("uaas", url).validate().unwrap_err();
+            assert!(error.contains("url is required"), "{error}");
+        }
+        assert!(interface("uaas", Some("http://uaas:5010"))
+            .validate()
+            .is_ok());
+        assert!(interface("woc", None).validate().is_ok());
     }
 
     #[test]
