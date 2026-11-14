@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::time::Duration;
 
 use chain_gang::interface::{
     BlockchainInterface, RpcInterface, TestInterface, UaaSInterface, WocInterface,
@@ -6,7 +7,7 @@ use chain_gang::interface::{
 
 use crate::address_watcher::AddressWatcher;
 use crate::config::Config;
-use crate::interface_timeout::Bounded;
+use crate::interface_timeout::{Bounded, Scope};
 use crate::mapi_lite_interface::MapiLiteInterface;
 use crate::outbound_rate_limit::RateLimited;
 
@@ -39,17 +40,22 @@ fn paces_its_own_requests(interface_type: &str) -> bool {
 
 /// Takes a config and returns the appropriate configured object that implements BlockchainInterface
 pub fn blockchain_factory(config: &Config) -> Result<Backend, String> {
-    let backend = paced_backend(config)?;
-    // Outermost, so the deadline covers a call's wait for a pacing slot as
-    // well as the call itself: what it bounds is how long a caller waits.
-    match config.blockchain_interface.call_timeout() {
+    let timeout = config.blockchain_interface.call_timeout();
+    let (backend, paced_here) = paced_backend(config, timeout)?;
+    // Outermost, so the deadline covers a read's wait for a pacing slot as
+    // well as the read itself: what it bounds is how long a caller waits.
+    // Not a broadcast's, where this service paces (CS-718): one that ran out
+    // of time queued behind reads would be reported as possibly sent, and
+    // hold its inputs for nothing. That one is bounded inside the pacing.
+    match timeout {
         Some(timeout) => {
             log::info!(
                 "bounding each blockchain interface call to {}s",
                 timeout.as_secs()
             );
+            let scope = if paced_here { Scope::Reads } else { Scope::All };
             Ok(Backend {
-                interface: Arc::new(Bounded::new(backend.interface, timeout)),
+                interface: Arc::new(Bounded::covering(backend.interface, timeout, scope)),
                 address_watcher: backend.address_watcher,
             })
         }
@@ -63,18 +69,30 @@ pub fn blockchain_factory(config: &Config) -> Result<Backend, String> {
     }
 }
 
-fn paced_backend(config: &Config) -> Result<Backend, String> {
+/// The interface, paced, and whether this service does the pacing: then a
+/// broadcast's deadline, `timeout`, is put on inside it, so it starts once
+/// the broadcast's slot is granted (CS-718). `woc` paces inside chain-gang's
+/// own call, where nothing here can start a deadline after the wait.
+fn paced_backend(config: &Config, timeout: Option<Duration>) -> Result<(Backend, bool), String> {
     let limit = config.blockchain_interface.outbound_rate_limit();
     let interface_type = config.blockchain_interface.interface_type.as_str();
     let backend = build_backend(config, limit)?;
 
     let Some(rps) = limit else {
-        return Ok(backend);
+        return Ok((backend, false));
     };
     if paces_its_own_requests(interface_type) {
         log::info!("limiting {interface_type} to {rps} HTTP request(s) per second");
-        return Ok(backend);
+        return Ok((backend, false));
     }
+    let inner = match timeout {
+        Some(timeout) => Arc::new(Bounded::covering(
+            backend.interface,
+            timeout,
+            Scope::Broadcasts,
+        )) as Arc<dyn BlockchainInterface + Send + Sync>,
+        None => backend.interface,
+    };
 
     // Wrapped last, so every outbound call goes through it whatever the
     // interface -- and so the inner interface is fully configured first.
@@ -82,10 +100,13 @@ fn paced_backend(config: &Config) -> Result<Backend, String> {
     // address happens once per client at startup and is not what runs into a
     // rate limit.
     log::info!("limiting {interface_type} to {rps} interface call(s) per second");
-    Ok(Backend {
-        interface: Arc::new(RateLimited::new(backend.interface, rps)),
-        address_watcher: backend.address_watcher,
-    })
+    Ok((
+        Backend {
+            interface: Arc::new(RateLimited::new(inner, rps)),
+            address_watcher: backend.address_watcher,
+        },
+        true,
+    ))
 }
 
 fn build_backend(config: &Config, limit: Option<u32>) -> Result<Backend, String> {
@@ -239,6 +260,51 @@ mod tests {
             },
             ..Default::default()
         }
+    }
+
+    /// CS-718: where this service paces, a broadcast's deadline starts once
+    /// its slot is granted. Queued behind reads past `timeout_seconds`, it
+    /// is still sent, rather than timing out unsent and holding its inputs
+    /// as a possibly-sent broadcast. A read keeps its deadline over the wait.
+    #[tokio::test]
+    async fn cs_718_a_broadcast_is_bounded_from_its_slot_and_a_read_from_its_call() {
+        let mut config = base_config("test", None);
+        config.blockchain_interface.max_requests_per_second = Some(1);
+        config.blockchain_interface.timeout_seconds = Some(1);
+        let interface = blockchain_factory(&config).expect("builds").interface;
+
+        // Three reads book the next three slots, a second apart; the
+        // broadcast's is the fourth, about 3s out.
+        let booked: Vec<_> = (0..3)
+            .map(|_| {
+                let interface = interface.clone();
+                tokio::spawn(async move { interface.status().await })
+            })
+            .collect();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let queued = std::time::Instant::now();
+        interface
+            .broadcast_tx(&crate::test_support::sample_tx())
+            .await
+            .expect("sent once its slot came, past the 1s deadline");
+        assert!(
+            queued.elapsed() >= std::time::Duration::from_secs(2),
+            "it did wait for its slot: {:?}",
+            queued.elapsed()
+        );
+
+        // A read queued 2s out ran out of time, as before. (The one 1s out
+        // races its own deadline, so it is not asserted either way.)
+        let mut reads = Vec::new();
+        for read in booked {
+            reads.push(read.await.unwrap());
+        }
+        let timed_out = reads
+            .iter()
+            .filter(|read| matches!(read, Err(e) if crate::interface_timeout::is_timeout(e)))
+            .count();
+        assert!(timed_out >= 1, "{reads:?}");
+        assert!(reads.iter().any(Result::is_ok), "{reads:?}");
     }
 
     /// CS-601: `mapi_lite` builds from the [mapi_lite] section, watches no

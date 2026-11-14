@@ -9,7 +9,7 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use chain_gang::{interface::BlockchainInterface, messages::Tx};
+use chain_gang::{interface::BlockchainInterface, messages::Tx, util::ChainGangError};
 
 use super::{BroadcastError, TxBroadcaster};
 
@@ -39,11 +39,10 @@ impl TxBroadcaster for WocBroadcaster {
     async fn broadcast_tx(&self, tx: &Tx) -> Result<String, BroadcastError> {
         // chain-gang's interfaces do not distinguish a rejection from a
         // transport failure in their error type, so most things are upstream.
-        // Not a call that ran out of time or lost its answer after sending,
-        // though (CS-502): the transaction may be on the network, and
+        // Not one that may have reached the network, though (CS-502, CS-718):
         // reporting it as failed would release inputs it spent (CS-501).
         self.inner.broadcast_tx(tx).await.map_err(|e| {
-            if crate::interface_timeout::may_have_been_delivered(&e) {
+            if broadcast_may_have_been_delivered(&e) {
                 BroadcastError::Indeterminate(e.to_string())
             } else {
                 BroadcastError::Upstream(e.to_string())
@@ -64,6 +63,59 @@ impl TxBroadcaster for WocBroadcaster {
     fn reads_node_reasons(&self) -> bool {
         self.name == "rpc"
     }
+}
+
+/// Whether a failed broadcast may still have reached the network (CS-718).
+///
+/// Beyond a call that ran out of time or lost its answer after sending
+/// ([`crate::interface_timeout::may_have_been_delivered`]):
+///
+/// * **An answer cut off once it had begun.** Its status was already sent,
+///   which for `woc` and `uaas` means a 200: they read the body only then.
+///   For `rpc` it can be any status, and reading the node's verdict is what
+///   failed.
+/// * **A 5xx other than 503.** chain-gang 0.13.1 turns every status but 200
+///   into `ResponseError("response.status() = 502 Bad Gateway")`, keeping
+///   only the status. A gateway's 502 or 504 can follow WhatsOnChain relaying
+///   the transaction, and a 500 can be WhatsOnChain failing after it. A 503
+///   is a server turning the request away, and a 4xx is it refusing it.
+/// * **An answer that is not one.** `rpc` reads the node's body for every
+///   status; one it cannot parse is a node, or something in front of it, that
+///   may have taken the transaction first, unless its status says the request
+///   was turned away.
+///
+/// `rpc`'s own refusals are JSON-RPC errors (`sendrawtransaction failed with
+/// code ..`), the node's verdict, and stay definite.
+pub fn broadcast_may_have_been_delivered(error: &ChainGangError) -> bool {
+    if crate::interface_timeout::may_have_been_delivered(error) {
+        return true;
+    }
+    match error {
+        ChainGangError::ReqwestError(e) => e.is_body() || e.is_decode(),
+        ChainGangError::ResponseError(message) => {
+            status_in(message, "response.status() = ").is_some_and(maybe_relayed)
+        }
+        ChainGangError::JSONParseError(message) => {
+            !status_in(message, "returned status ").is_some_and(turned_away)
+        }
+        _ => false,
+    }
+}
+
+/// The HTTP status chain-gang wrote after `prefix` in an error message.
+fn status_in(message: &str, prefix: &str) -> Option<u16> {
+    let rest = &message[message.find(prefix)? + prefix.len()..];
+    rest.get(..3)?.parse().ok()
+}
+
+/// A status after which the transaction may have been relayed anyway.
+fn maybe_relayed(status: u16) -> bool {
+    (500..600).contains(&status) && status != 503
+}
+
+/// A status saying the request was not taken: refused, or turned away.
+fn turned_away(status: u16) -> bool {
+    (400..500).contains(&status) || status == 503
 }
 
 #[cfg(test)]
@@ -239,5 +291,157 @@ mod tests {
                 .expect_err("refused");
             assert!(!error.inputs_conflicted(), "classified as: {error}");
         }
+    }
+
+    // --- CS-718: what a failed HTTP broadcast says about delivery ---------
+
+    /// A `uaas` broadcaster against a server answering every broadcast with
+    /// `response`. `uaas` is chain-gang's WhatsOnChain client in every way
+    /// that matters here (`woc_interface.rs` and `uaas_interface.rs` share
+    /// the code), with a URL a test can point at.
+    async fn uaas_answering(
+        response: wiremock::ResponseTemplate,
+    ) -> (wiremock::MockServer, WocBroadcaster) {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .respond_with(response)
+            .mount(&server)
+            .await;
+        let uaas = chain_gang::interface::UaaSInterface::new(&server.uri()).unwrap();
+        (server, WocBroadcaster::new(Arc::new(uaas), "uaas"))
+    }
+
+    /// CS-718: a gateway's 502 or 504, or a 500, may follow the transaction
+    /// being relayed, so it is an unknown outcome and its inputs stay
+    /// reserved; a 503 or a 4xx is a server not taking it, so nothing was
+    /// spent.
+    #[tokio::test]
+    async fn cs_718_a_5xx_but_503_is_an_unknown_outcome_and_a_503_or_4xx_a_failure() {
+        for status in [500, 502, 504] {
+            let (_server, broadcaster) =
+                uaas_answering(wiremock::ResponseTemplate::new(status)).await;
+            let error = broadcaster.broadcast_tx(&sample_tx()).await.unwrap_err();
+            assert!(
+                matches!(error, BroadcastError::Indeterminate(_)),
+                "{status}: {error:?}"
+            );
+        }
+        for status in [503, 400, 404, 422] {
+            let (_server, broadcaster) =
+                uaas_answering(wiremock::ResponseTemplate::new(status)).await;
+            let error = broadcaster.broadcast_tx(&sample_tx()).await.unwrap_err();
+            assert!(
+                matches!(error, BroadcastError::Upstream(_)),
+                "{status}: {error:?}"
+            );
+        }
+    }
+
+    /// CS-718: a 200 whose body is cut off: the server took the transaction
+    /// and its answer was lost, so the outcome is unknown.
+    #[tokio::test]
+    async fn cs_718_a_body_cut_off_after_a_200_is_an_unknown_outcome() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = vec![0u8; 64 * 1024];
+            let _ = socket.read(&mut request).await;
+            // 64 bytes promised, 10 sent, then the connection closes.
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 64\r\n\r\n\"abcdef12")
+                .await
+                .unwrap();
+            socket.shutdown().await.unwrap();
+        });
+
+        let uaas = chain_gang::interface::UaaSInterface::new(&format!("http://{address}")).unwrap();
+        let broadcaster = WocBroadcaster::new(Arc::new(uaas), "uaas");
+        let error = broadcaster.broadcast_tx(&sample_tx()).await.unwrap_err();
+        assert!(
+            matches!(error, BroadcastError::Indeterminate(_)),
+            "{error:?}"
+        );
+        server.await.unwrap();
+    }
+
+    /// CS-718: through `rpc`, the node's own refusal, a JSON-RPC error on a
+    /// 500, stays a failure; a proxy's 502 page in front of it is an unknown
+    /// outcome, and its 503 page a failure.
+    #[tokio::test]
+    async fn cs_718_rpc_keeps_the_nodes_refusal_definite() {
+        let rpc = |response: wiremock::ResponseTemplate| async move {
+            let server = wiremock::MockServer::start().await;
+            wiremock::Mock::given(wiremock::matchers::method("POST"))
+                .respond_with(response)
+                .mount(&server)
+                .await;
+            let rpc = chain_gang::interface::RpcInterface::new(
+                &server.uri(),
+                "user",
+                "pass",
+                chain_gang::network::Network::BSV_Regtest,
+            );
+            let error = WocBroadcaster::new(Arc::new(rpc), "rpc")
+                .broadcast_tx(&sample_tx())
+                .await
+                .unwrap_err();
+            (server, error)
+        };
+
+        let (_s, refused) = rpc(wiremock::ResponseTemplate::new(500).set_body_json(
+            serde_json::json!({
+                "result": null,
+                "error": { "code": -26, "message": "258: txn-mempool-conflict" },
+                "id": "chain-gang",
+            }),
+        ))
+        .await;
+        assert!(
+            !matches!(refused, BroadcastError::Indeterminate(_)),
+            "{refused:?}"
+        );
+
+        let (_s, gateway) =
+            rpc(wiremock::ResponseTemplate::new(502).set_body_string("<html>Bad Gateway</html>"))
+                .await;
+        assert!(
+            matches!(gateway, BroadcastError::Indeterminate(_)),
+            "{gateway:?}"
+        );
+
+        let (_s, busy) =
+            rpc(wiremock::ResponseTemplate::new(503).set_body_string("<html>Unavailable</html>"))
+                .await;
+        assert!(
+            !matches!(busy, BroadcastError::Indeterminate(_)),
+            "{busy:?}"
+        );
+    }
+
+    #[test]
+    fn cs_718_the_status_is_read_from_chain_gangs_messages() {
+        assert_eq!(
+            status_in(
+                "response.status() = 502 Bad Gateway",
+                "response.status() = "
+            ),
+            Some(502)
+        );
+        assert_eq!(
+            status_in(
+                "sendrawtransaction returned status 200 OK and a body that is not a JSON-RPC \
+                 response: eof",
+                "returned status "
+            ),
+            Some(200)
+        );
+        assert_eq!(status_in("no status here", "response.status() = "), None);
+        assert_eq!(
+            status_in("response.status() = 5", "response.status() = "),
+            None
+        );
     }
 }
