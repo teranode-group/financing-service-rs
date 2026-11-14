@@ -235,7 +235,7 @@ Keys are scoped per `client_id`, so two clients may choose the same string witho
 
 **Two limits worth knowing:**
 
-* **Records are held in memory and are lost when the service restarts.** A retry that spans a restart can still produce a second funding transaction. Retention is bounded by `[idempotency] ttl_seconds` (default 600) and `max_entries` (default 10000); see [Configuration](Configuration.md).
+* **Records are held in memory and are lost when the service restarts.** A retry that spans a restart can still produce a second funding transaction. Retention is bounded by `[idempotency] ttl_seconds` (default 600) and `max_entries` (default 10000), which only records still in flight -- a request being funded, or one of unknown outcome until its TTL -- can exceed; see [Configuration](Configuration.md).
 * **After a failure that may have spent something, the key is not freed** — only the outcomes listed above free it. Any other failure leaves the key reserved until its TTL expires, and a retry with it returns `key_in_progress`. This is deliberate: a broadcast may have reached the node before the connection dropped, so releasing the key could cause the duplicate this mechanism exists to prevent. Use a fresh `idempotency_key` if you need to retry sooner.
 
 ### Error responses

@@ -391,7 +391,7 @@ max_entries = 10000
 ```
 
 * `ttl_seconds` — how long a completed record stays replayable. Should comfortably exceed your clients' retry window; too short and a legitimate retry funds a second time. Default `600`. For a client whose Event runs its UTXO cache, keep it above Event's `intent_resend_after_seconds`: see [below](#a-client-whose-event-runs-the-utxo-cache).
-* `max_entries` — upper bound on retained records, so a client sending a fresh `idempotency_key` on every request cannot grow the store without limit. When full, the oldest record of **whichever client holds the most** is dropped, so a client filling the store evicts its own records rather than other clients' (whose retries would then fund twice). Default `10000`.
+* `max_entries` — upper bound on retained records, so a client sending a fresh `idempotency_key` on every request cannot grow the store without limit. When full, the oldest record of **whichever client holds the most** is dropped, so a client filling the store evicts its own records rather than other clients' (whose retries would then fund twice). A record still in flight is never dropped (CS-723): a request being funded, or one whose outcome was unknown, which stays in flight until `ttl_seconds` so its retry is told it is in progress rather than funded twice. With nothing completed left to drop, the store goes over `max_entries` by those (CS-741), as many as arrive within the TTL, and with `[funding_limits]` no more than each client may be paid in its period, since an unknown outcome keeps its hold. Default `10000`.
 
 Each record holds a hash of the request rather than the request, and an `idempotency_key` may be at most 256 bytes, so a record's size does not depend on what the client sends.
 
