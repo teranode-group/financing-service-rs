@@ -334,8 +334,8 @@ mod tests {
         }
     }
 
-    /// Nothing that can hold a key reaches the build context, and the build
-    /// does not copy the data directory in at all.
+    /// Nothing that can hold a key reaches the build context, at any depth,
+    /// and the build does not copy the data directory in at all.
     #[test]
     fn sr_sec_025_the_build_context_excludes_secrets_and_history() {
         let ignore = instructions(".dockerignore");
@@ -344,12 +344,36 @@ mod tests {
             "target",
             "data/dynamic*",
             "data/*.inflight.json",
-            "certs",
+            "**/certs",
+            "**/*.pem",
+            "**/*.key",
+            "**/.env",
+            "**/.env.*",
         ] {
             assert!(
                 ignore.iter().any(|l| l == required),
                 ".dockerignore must exclude {required}"
             );
+        }
+        // A pattern is relative to the context root and `*` does not cross a
+        // `/`, so a bare `*.pem` lets config/x.pem through (CS-682). Only
+        // build output and editor clutter may match at the root alone.
+        const ROOT_ONLY: [&str; 7] = [
+            ".git",
+            ".github",
+            "target",
+            ".DS_Store",
+            "*.swp",
+            "out.txt",
+            "tree.txt",
+        ];
+        for line in &ignore {
+            if !line.contains('/') {
+                assert!(
+                    ROOT_ONLY.contains(&line.as_str()),
+                    "{line} only matches at the context root"
+                );
+            }
         }
         assert!(
             !instructions("Dockerfile")

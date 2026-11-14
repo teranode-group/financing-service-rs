@@ -106,6 +106,10 @@ impl FundingResponse {
 #[derive(Clone)]
 pub struct PreparedFunding {
     pub client_id: String,
+    /// The client this was planned for and claimed inputs from (CS-723).
+    /// Settled against it, not whatever holds `client_id` by then: see
+    /// [`Service::prepared_client`].
+    pub client: Arc<RwLock<Client>>,
     pub txs: Vec<Tx>,
     pub no_of_outpoints: u32,
     pub spend_plan: FundingSpendPlan,
@@ -244,7 +248,11 @@ fn load_inflight_file(path: &Path) -> BTreeMap<String, InflightState> {
 }
 
 /// Write `file` to `path` so that a reader never sees half of it: into a
-/// sibling first, flushed, then renamed over the original.
+/// sibling first, flushed, then renamed over the original, and the directory
+/// flushed so the rename itself survives a crash (CS-723).
+///
+/// Readable by the owner alone (CS-723): it names the outpoints and change of
+/// every client's wallet. It was written with the process umask.
 ///
 /// Compact rather than pretty-printed: it is written on the request path, and
 /// pretty-printing roughly doubles what has to be serialised and flushed
@@ -256,11 +264,54 @@ fn write_inflight_file(path: &Path, file: &InflightFile) -> std::io::Result<()> 
     temporary.push(".tmp");
     let temporary = PathBuf::from(temporary);
     {
-        let mut out = std::fs::File::create(&temporary)?;
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut out = options.open(&temporary)?;
+        // A leftover sibling keeps its mode through `open`, so set it too.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            out.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+        }
         out.write_all(text.as_bytes())?;
         out.sync_all()?;
     }
-    std::fs::rename(&temporary, path)
+    std::fs::rename(&temporary, path)?;
+    #[cfg(unix)]
+    {
+        let directory = match path.parent() {
+            Some(dir) if !dir.as_os_str().is_empty() => dir,
+            _ => Path::new("."),
+        };
+        std::fs::File::open(directory)?.sync_all()?;
+    }
+    Ok(())
+}
+
+/// Why chain reads are not recent enough to fund from (SR-BCHN-017).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChainNotReady {
+    /// For the log: names the client.
+    pub detail: String,
+    /// For the unauthenticated `GET /ready`: the same without the client id,
+    /// which would tell anyone who can reach it which clients exist (CS-723,
+    /// CS-661).
+    pub public: String,
+}
+
+impl ChainNotReady {
+    /// One that names no client, so the two are the same.
+    fn anonymous(detail: String) -> Self {
+        Self {
+            public: detail.clone(),
+            detail,
+        }
+    }
 }
 
 /// A run of failures talking to the blockchain interface.
@@ -511,19 +562,9 @@ impl Service {
     pub async fn new(config: &Config) -> Result<Service, String> {
         let backend = blockchain_factory(config)?;
 
-        // Warned about, not fatal (CS-505, SR-BCHN-018) -- for the reason the
-        // mapi-lite probe below is not: exiting ties this service's lifecycle
-        // to an upstream it cannot fix. A WhatsOnChain that answered one 429
-        // used to stop startup, and the restart that followed hit the same
-        // rate limit. Serving degraded keeps /status and /health up, and
-        // GET /ready reports the service unready until a chain read succeeds
-        // (SR-BCHN-017).
-        if let Err(e) = backend.interface.status().await {
-            log::warn!(
-                "Unable to reach the blockchain interface at startup: {e}. Funding will fail \
-                 until it answers; GET /ready reports the service unready meanwhile."
-            );
-        }
+        // The blockchain interface is not asked anything here: see
+        // [`Service::start_chain`], which runs once the server is listening
+        // (CS-722).
 
         // The write path. Without [mapi_lite] it wraps the interface probed
         // just above, so only mapi-lite needs a probe of its own -- and gets
@@ -570,12 +611,42 @@ impl Service {
             }
         }
 
-        let service = Self::build(config, backend, broadcaster)?;
+        Self::build(config, backend, broadcaster)
+    }
+
+    /// What startup asks of the blockchain interface, run behind the server
+    /// rather than in front of it (CS-722): the status probe, the node's
+    /// address watch (`rpc`), and the first read of every client's chain
+    /// state.
+    ///
+    /// They used to run before the server bound: a probe bounded at
+    /// `timeout_seconds`, then each client read in turn, each bounded the
+    /// same. With a chain source that accepts and never answers and three
+    /// clients, `/health` was unreachable for over two minutes, the
+    /// container health check marked it unhealthy at about 100s, and the
+    /// orchestrator restarted it into the same wait, which SR-BCHN-018 set
+    /// out to prevent. Now `/health` answers at once, `GET /ready` reports
+    /// the service unready until a chain read succeeds (SR-BCHN-017), and a
+    /// funding request meanwhile waits for, or makes, its client's read.
+    ///
+    /// The first read is the periodic sweep's, which holds no client lock
+    /// while it reads, so a client's balance can be asked for meanwhile.
+    pub async fn start_chain(service: &Arc<Service>) {
+        // Warned about, not fatal (CS-505, SR-BCHN-018) -- for the reason the
+        // mapi-lite probe is not: exiting ties this service's lifecycle to an
+        // upstream it cannot fix. A WhatsOnChain that answered one 429 used
+        // to stop startup, and the restart that followed hit the same rate
+        // limit.
+        if let Err(e) = service.blockchain_interface.status().await {
+            log::warn!(
+                "Unable to reach the blockchain interface at startup: {e}. Funding will fail \
+                 until it answers; GET /ready reports the service unready meanwhile."
+            );
+        }
         // Before the first balance read, so the backend already knows the
         // addresses it is about to be asked about.
         service.watch_configured_client_addresses().await;
-        service.update_balances().await;
-        Ok(service)
+        Self::refresh_balances(service).await;
     }
 
     #[cfg(test)]
@@ -932,7 +1003,10 @@ impl Service {
         *self.blockchain_update_time.write().await = Some(SystemTime::now());
     }
 
-    /// Update client balances at startup.
+    /// Read every client's chain state in turn, each under its client's
+    /// lock: how the test constructors load it. Production does this behind
+    /// the server, in [`Service::start_chain`] (CS-722).
+    #[cfg(test)]
     pub async fn update_balances(&self) {
         let handles = self.client_handles().await;
         if handles.is_empty() {
@@ -1054,8 +1128,12 @@ impl Service {
             let Ok(_refreshing) = service.chain_refresh_lock(&client_id).try_lock_owned() else {
                 continue;
             };
+            let since = client.read().await.invalidations();
             match fetch_chain_state(blockchain.as_ref(), &address).await {
-                Ok(utxo) => client.write().await.apply_chain_state(utxo),
+                Ok(utxo) => client
+                    .write()
+                    .await
+                    .apply_chain_state_read_since(utxo, since),
                 Err(e) => {
                     service.record_chain_failure(&e).await;
                     status = BlockchainConnectionStatus::Failed;
@@ -1232,7 +1310,12 @@ impl Service {
             .client_handle(client_id)
             .await
             .ok_or_else(|| format!("Unknown client_id {client_id}"))?;
-        let address = client.read().await.get_address();
+        // Noted before the read, so an invalidation while it runs keeps its
+        // answer from being stamped fresh (CS-721).
+        let (address, since) = {
+            let client = client.read().await;
+            (client.get_address(), client.invalidations())
+        };
         let chain_state =
             match fetch_chain_state(service.blockchain_interface.as_ref(), &address).await {
                 Ok(state) => {
@@ -1244,7 +1327,10 @@ impl Service {
                     return Err(e);
                 }
             };
-        client.write().await.apply_chain_state(chain_state);
+        client
+            .write()
+            .await
+            .apply_chain_state_read_since(chain_state, since);
         *service.blockchain_status.write().await = BlockchainConnectionStatus::Connected;
         *service.blockchain_update_time.write().await = Some(SystemTime::now());
         Ok(())
@@ -1423,7 +1509,9 @@ impl Service {
     }
 
     /// Whether chain reads are recent enough to fund from (CS-505,
-    /// SR-BCHN-017). `Err` names what is too old.
+    /// SR-BCHN-017). `Err` says what is too old: in full, client id and all,
+    /// for the log, and without the id for the unauthenticated `GET /ready`
+    /// (CS-723, CS-661).
     ///
     /// Every client's last read from the chain must be within
     /// `ready_max_chain_read_age`; with no clients, the blockchain interface's
@@ -1435,7 +1523,7 @@ impl Service {
     /// Reads nothing from the chain itself: the periodic sweep already does,
     /// and an unauthenticated probe spending a rate-limited allowance is the
     /// flood SR-SEC-013 guards against.
-    pub async fn chain_readiness(&self) -> Result<(), String> {
+    pub async fn chain_readiness(&self) -> Result<(), ChainNotReady> {
         let Some(limit) = self.ready_max_chain_read_age else {
             return Ok(());
         };
@@ -1449,30 +1537,30 @@ impl Service {
         if handles.is_empty() {
             return match self.chain_health.lock().await.last_success {
                 Some(at) if at.elapsed() <= limit => Ok(()),
-                Some(at) => Err(format!(
+                Some(at) => Err(ChainNotReady::anonymous(format!(
                     "the blockchain interface last answered {}s ago (limit {}s)",
                     at.elapsed().as_secs(),
                     limit.as_secs()
+                ))),
+                None => Err(ChainNotReady::anonymous(
+                    "the blockchain interface has not answered yet".to_string(),
                 )),
-                None => Err("the blockchain interface has not answered yet".to_string()),
             };
         }
         for (client_id, client) in handles {
-            match client.read().await.chain_read_age() {
-                Some(age) if age <= limit => {}
-                Some(age) => {
-                    return Err(format!(
-                        "client {client_id}'s chain state was last read {}s ago (limit {}s)",
-                        age.as_secs(),
-                        limit.as_secs()
-                    ))
-                }
-                None => {
-                    return Err(format!(
-                        "client {client_id}'s chain state has never been read"
-                    ))
-                }
-            }
+            let what = match client.read().await.chain_read_age() {
+                Some(age) if age <= limit => continue,
+                Some(age) => format!(
+                    "chain state was last read {}s ago (limit {}s)",
+                    age.as_secs(),
+                    limit.as_secs()
+                ),
+                None => "chain state has never been read".to_string(),
+            };
+            return Err(ChainNotReady {
+                detail: format!("client {client_id}'s {what}"),
+                public: format!("a client's {what}"),
+            });
         }
         Ok(())
     }
@@ -1637,6 +1725,7 @@ impl Service {
             service.broadcaster(),
             PreparedFunding {
                 client_id: fund_request.client_id.clone(),
+                client: Arc::clone(&client),
                 txs: vec![tx],
                 no_of_outpoints: fund_request.no_of_outpoints,
                 spend_plan,
@@ -1644,12 +1733,24 @@ impl Service {
         ))
     }
 
+    /// The client a prepared funding is settled against: the one it was
+    /// planned for, if the service still holds it under that id (CS-723).
+    ///
+    /// Looked up by id alone, a client deleted while its funding broadcast
+    /// and re-added with another wallet was handed the old wallet's change,
+    /// or its inputs. One that is not the same client is gone as far as the
+    /// funding is concerned, as a deleted one is (CS-501).
+    async fn prepared_client(&self, prepared: &PreparedFunding) -> Option<Arc<RwLock<Client>>> {
+        let current = self.client_handle(&prepared.client_id).await?;
+        Arc::ptr_eq(&current, &prepared.client).then_some(current)
+    }
+
     pub async fn commit_prepared_funding(
         service: &Arc<Service>,
         prepared: &PreparedFunding,
     ) -> Result<(), CommitError> {
         let client = service
-            .client_handle(&prepared.client_id)
+            .prepared_client(prepared)
             .await
             .ok_or_else(|| CommitError::ClientGone(prepared.client_id.clone()))?;
         client
@@ -1770,7 +1871,7 @@ impl Service {
         inputs_conflicted: bool,
         reason_unread: bool,
     ) {
-        if let Some(client) = service.client_handle(&prepared.client_id).await {
+        if let Some(client) = service.prepared_client(prepared).await {
             {
                 let mut client = client.write().await;
                 client.release_claim(&prepared.spend_plan, inputs_conflicted || reason_unread);
@@ -1786,7 +1887,7 @@ impl Service {
     }
 
     async fn reserve_uncertain_funding(service: &Arc<Service>, prepared: &PreparedFunding) {
-        match service.client_handle(&prepared.client_id).await {
+        match service.prepared_client(prepared).await {
             Some(client) => {
                 client
                     .write()
@@ -2262,6 +2363,49 @@ mod tests {
             .await
             .expect("the outpoints are the caller's");
         assert_eq!(settled.outpoints.len(), 1);
+    }
+
+    /// CS-721: a broadcast refused while a chain read is in flight
+    /// invalidates the state, and the read's answer predates the refusal. It
+    /// is applied but not stamped fresh, so the next request fetches again
+    /// rather than funding from the input the refusal spent. Without the
+    /// invalidation the same read is fresh, and the next request uses it.
+    #[tokio::test]
+    async fn cs_721_a_read_that_began_before_an_invalidation_is_not_fresh() {
+        use crate::test_support::GatedBlockchain;
+
+        for invalidated in [true, false] {
+            let mut config = test_config(&unique_dynamic_config_path());
+            config.service.chain_state_max_age_seconds = Some(60);
+            let gated = GatedBlockchain::new(&config).await;
+            let service = Arc::new(Service::new_for_test(&config, gated.clone()).await);
+
+            gated.close();
+            let started = gated.utxo_read_count();
+            let refresh = tokio::spawn({
+                let service = Arc::clone(&service);
+                async move { Service::refresh_client_chain_state(&service, TEST_CLIENT_ID).await }
+            });
+            while gated.utxo_read_count() == started {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            // The refusal lands while the read is held at the gate.
+            if invalidated {
+                Service::invalidate_chain_state(&service, TEST_CLIENT_ID).await;
+            }
+            gated.open();
+            refresh.await.unwrap().expect("the read answers");
+
+            let reads = gated.utxo_read_count();
+            Service::refresh_client_chain_state_if_stale(&service, TEST_CLIENT_ID)
+                .await
+                .expect("refreshes");
+            assert_eq!(
+                gated.utxo_read_count() > reads,
+                invalidated,
+                "invalidated during the read: {invalidated}"
+            );
+        }
     }
 
     /// CS-502. A chain read that is accepted and never answered no longer
@@ -3411,7 +3555,7 @@ mod tests {
             .backdate_chain_reads(READY_LIMIT + Duration::from_secs(1))
             .await;
 
-        let detail = service.chain_readiness().await.expect_err("too old");
+        let detail = service.chain_readiness().await.expect_err("too old").detail;
         assert!(detail.contains("last read 61s ago (limit 60s)"), "{detail}");
         assert!(
             detail.contains(TEST_CLIENT_ID),
@@ -3449,7 +3593,11 @@ mod tests {
         config.client = None;
         let service = ready_test_service(&config).await;
         // The test interface has no header read, so stand in for the sweep's.
-        let detail = service.chain_readiness().await.expect_err("nothing yet");
+        let detail = service
+            .chain_readiness()
+            .await
+            .expect_err("nothing yet")
+            .detail;
         assert!(detail.contains("has not answered yet"), "{detail}");
         service.record_chain_success().await;
         assert_eq!(service.chain_readiness().await, Ok(()));
@@ -3457,7 +3605,7 @@ mod tests {
         service
             .backdate_chain_reads(READY_LIMIT + Duration::from_secs(1))
             .await;
-        let detail = service.chain_readiness().await.expect_err("too old");
+        let detail = service.chain_readiness().await.expect_err("too old").detail;
         assert!(detail.contains("last answered"), "{detail}");
     }
 
@@ -3479,7 +3627,11 @@ mod tests {
         let service = Service::new(&config)
             .await
             .expect("an unreachable chain no longer stops startup");
-        let detail = service.chain_readiness().await.expect_err("not read yet");
+        let detail = service
+            .chain_readiness()
+            .await
+            .expect_err("not read yet")
+            .detail;
         assert!(detail.contains("never been read"), "{detail}");
     }
 
@@ -4053,6 +4205,41 @@ mod tests {
             .expect("and funds as before");
     }
 
+    /// CS-723: the in-flight file is the owner's alone, whatever the umask
+    /// or a leftover file's mode, and one an earlier version wrote, without
+    /// the handed-out and spent-change records, still reads.
+    #[cfg(unix)]
+    #[test]
+    fn cs_723_the_inflight_file_is_owner_only_and_reads_an_older_one() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("fs-cs723-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("dynamic.inflight.json");
+        let mode = |path: &Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+
+        // An older file, readable by all.
+        std::fs::write(
+            &path,
+            r#"{"version":1,"clients":{"c":{"reserved":[{"tx_hash":"aa","tx_pos":1,"since_unix":1}],"pending_change":[]}}}"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let read = load_inflight_file(&path);
+        assert_eq!(read["c"].reserved.len(), 1);
+        assert!(read["c"].handed_out.is_empty() && read["c"].spent_change.is_empty());
+
+        write_inflight_file(
+            &path,
+            &InflightFile {
+                version: INFLIGHT_FILE_VERSION,
+                clients: read,
+            },
+        )
+        .unwrap();
+        assert_eq!(mode(&path), 0o600);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
     // ---- CS-495: commits share in-flight saves ----
 
     fn inflight_writes(service: &Service) -> u64 {
@@ -4201,6 +4388,92 @@ mod tests {
             3,
             "all three spends, once it could"
         );
+    }
+
+    /// CS-723: a client deleted while its funding broadcast, and re-added
+    /// under the same id with another wallet, is not the client the funding
+    /// is settled against. The caller still gets the outpoints on the network
+    /// (CS-501), and the new client is handed neither the old wallet's change
+    /// nor, after a refusal, its inputs.
+    #[tokio::test]
+    async fn cs_723_a_funding_is_settled_against_the_client_it_was_planned_for() {
+        let config = test_config(&unique_dynamic_config_path());
+        let service = Arc::new(
+            Service::new_for_test(&config, test_blockchain_interface(&config).await).await,
+        );
+        let replace_client = || async {
+            let other = Client::try_new(
+                &ClientConfig {
+                    client_id: TEST_CLIENT_ID.to_string(),
+                    wif_key: crate::test_support::OTHER_TEST_WIF.to_string(),
+                    api_key: None,
+                },
+                &config.blockchain_interface.network,
+            )
+            .unwrap();
+            let other = Arc::new(RwLock::new(other));
+            service
+                .clients
+                .write()
+                .await
+                .insert(TEST_CLIENT_ID.to_string(), Arc::clone(&other));
+            other
+        };
+        let holds_nothing = |client: &Client| {
+            let balance = client.get_balance();
+            balance.confirmed == 0 && balance.unconfirmed == 0
+        };
+
+        // A success: committed against nobody, answered all the same.
+        let request = sample_fund_request(TEST_CLIENT_ID);
+        let (broadcaster, prepared) = Service::prepare_funding_outpoints(&service, &request)
+            .await
+            .expect("prepared");
+        let response = Service::broadcast_prepared_funding(broadcaster, &prepared)
+            .await
+            .expect("broadcast");
+        let other = replace_client().await;
+        let settled = Service::conclude_broadcast(&service, &prepared, response)
+            .await
+            .expect("the outpoints are the caller's");
+        assert_eq!(settled.outpoints.len(), 1);
+        assert!(
+            holds_nothing(&*other.read().await),
+            "the new wallet was given the old one's change"
+        );
+
+        // A refusal or an unknown outcome: its inputs go to nobody either.
+        let service = Arc::new(
+            Service::new_for_test(&config, test_blockchain_interface(&config).await).await,
+        );
+        let (_, prepared) = Service::prepare_funding_outpoints(&service, &request)
+            .await
+            .expect("prepared");
+        let other = Arc::new(RwLock::new(
+            Client::try_new(
+                &ClientConfig {
+                    client_id: TEST_CLIENT_ID.to_string(),
+                    wif_key: crate::test_support::OTHER_TEST_WIF.to_string(),
+                    api_key: None,
+                },
+                &config.blockchain_interface.network,
+            )
+            .unwrap(),
+        ));
+        service
+            .clients
+            .write()
+            .await
+            .insert(TEST_CLIENT_ID.to_string(), Arc::clone(&other));
+        // Release (after a refusal) and the uncertain-outcome reservation both
+        // settle through `prepared_client`, which no longer finds it.
+        assert!(service.prepared_client(&prepared).await.is_none());
+        Service::reserve_uncertain_funding(&service, &prepared).await;
+        assert!(
+            holds_nothing(&*other.read().await),
+            "the new wallet was given the old one's inputs"
+        );
+        assert_eq!(other.read().await.reserved_outpoint_count(), 0);
     }
 
     // ---- CS-473: concurrent requests for one client ----
