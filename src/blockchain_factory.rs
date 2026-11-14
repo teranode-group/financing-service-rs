@@ -5,7 +5,7 @@ use chain_gang::interface::{
     BlockchainInterface, RpcInterface, TestInterface, UaaSInterface, WocInterface,
 };
 
-use crate::address_watcher::AddressWatcher;
+use crate::address_watcher::{AddressWatcher, BoundedWatcher};
 use crate::config::Config;
 use crate::interface_timeout::{Bounded, Scope};
 use crate::mapi_lite_interface::MapiLiteInterface;
@@ -56,7 +56,11 @@ pub fn blockchain_factory(config: &Config) -> Result<Backend, String> {
             let scope = if paced_here { Scope::Reads } else { Scope::All };
             Ok(Backend {
                 interface: Arc::new(Bounded::covering(backend.interface, timeout, scope)),
-                address_watcher: backend.address_watcher,
+                // The node's address watch too: it goes to the same node,
+                // through a client with no timeout of its own (CS-740).
+                address_watcher: backend.address_watcher.map(|watcher| {
+                    Arc::new(BoundedWatcher::new(watcher, timeout)) as Arc<dyn AddressWatcher>
+                }),
             })
         }
         None => {
