@@ -259,6 +259,10 @@ pub struct Client {
     /// than the window, and only then may a refresh run behind a funding
     /// request instead of in front of it (SR-FUND-031).
     chain_state_usable: bool,
+    /// How many times [`Client::invalidate_chain_state`] has run (CS-721). A
+    /// chain read notes it when it starts; an invalidation since then means
+    /// the read began before whatever made the state untrustworthy.
+    invalidations: u64,
     /// Keyed by outpoint, valued by when it was reserved. Only the moment is
     /// needed: the balance is derived from what is left in `unspent`, so
     /// removing the entry from there is all it takes to withhold its value.
@@ -354,6 +358,7 @@ impl Client {
             chain_state_at: None,
             chain_read_at: None,
             chain_state_usable: false,
+            invalidations: 0,
             reserved: HashMap::new(),
             pending_change: HashMap::new(),
             handed_out: HashMap::new(),
@@ -376,7 +381,10 @@ impl Client {
         let unspent = blockchain_interface
             .get_utxo(&self.address.to_string())
             .await?;
-        self.apply_chain_state(unspent);
+        // Nothing can invalidate the state while this holds `&mut self`, but
+        // through the same path as every other read (CS-721).
+        let since = self.invalidations;
+        self.apply_chain_state_read_since(unspent, since);
         Ok(())
     }
 
@@ -387,7 +395,39 @@ impl Client {
     /// it was made: a transaction that has reached the network but is not yet
     /// visible to the read interface still reads as unspent, and the service
     /// would offer the same input to the next funding request.
+    ///
+    /// For a read with no gap between it and this; every read in the service
+    /// goes through [`Self::apply_chain_state_read_since`] (CS-721).
+    #[cfg(test)]
     pub fn apply_chain_state(&mut self, unspent: Utxo) {
+        self.apply_chain_state_read_since(unspent, self.invalidations);
+    }
+
+    /// [`Self::apply_chain_state`], for a read that started when
+    /// [`Self::invalidations`] was `since` (CS-721).
+    ///
+    /// A broadcast refused as a conflict while the read was in flight
+    /// invalidates the state, and the read's answer predates it: it can
+    /// still list the input the conflict spent. Applied and stamped fresh, it
+    /// sent the next request to that input again without a fetch, for up to
+    /// `chain_state_max_age`. So it is applied -- it is still the newest
+    /// answer -- but left stale and untrusted, and the next request fetches
+    /// again.
+    pub fn apply_chain_state_read_since(&mut self, unspent: Utxo, since: u64) {
+        self.apply_chain_state_now(unspent);
+        if self.invalidations != since {
+            self.chain_state_at = None;
+            self.chain_state_usable = false;
+        }
+    }
+
+    /// How many times the chain state has been invalidated: what a chain
+    /// read notes when it starts (CS-721).
+    pub fn invalidations(&self) -> u64 {
+        self.invalidations
+    }
+
+    fn apply_chain_state_now(&mut self, unspent: Utxo) {
         let now = Instant::now();
         self.chain_state_at = Some(now);
         self.chain_read_at = Some(now);
@@ -679,6 +719,7 @@ impl Client {
     /// a request the caller cannot use; marking the state stale instead makes
     /// the *next* request pay for it, and only if one comes.
     pub fn invalidate_chain_state(&mut self) {
+        self.invalidations += 1;
         self.chain_state_at = None;
         // Stale *and* untrusted, so the next request waits for the refresh
         // even where staleness alone would let it run behind (SR-FUND-031).
@@ -1749,6 +1790,27 @@ mod tests {
             .collect();
         client.unspent.sort_by_key(|utxo| utxo.value);
         client
+    }
+
+    // ---- CS-721: a read that began before an invalidation ----
+
+    #[test]
+    fn cs_721_a_read_noted_before_an_invalidation_is_applied_but_stale() {
+        let mut client = test_client_with_utxos(&[10_000]);
+        let chain = client.unspent.clone();
+        let window = Duration::from_secs(60);
+
+        let since = client.invalidations();
+        client.invalidate_chain_state();
+        client.apply_chain_state_read_since(chain.clone(), since);
+        assert_eq!(client.unspent, chain, "applied: it is the newest answer");
+        assert!(!client.chain_state_is_fresh(window));
+        assert!(!client.chain_state_usable());
+
+        let since = client.invalidations();
+        client.apply_chain_state_read_since(chain, since);
+        assert!(client.chain_state_is_fresh(window));
+        assert!(client.chain_state_usable());
     }
 
     fn sample_fund_request(satoshi: u64) -> FundRequest {

@@ -370,7 +370,7 @@ So a request reuses the cached state while it is younger than `chain_state_max_a
 
 **The trade is staleness.** Widening the window widens the period in which the service can build a funding transaction against a view of the chain that has moved on. It is narrower than it looks: the service applies its own spends to the cache as it makes them, so this only matters if something *outside* the service spends from the same client key — another service sharing the WIF, or an operator moving funds by hand. If that is your deployment, lower it. `0` refreshes on every request, which is what the service did before this existed.
 
-There is a backstop either way. A broadcast the upstream refuses — which is how a conflicting input shows up — marks the cached state stale, so the attempt after it works from a fresh read. Building on a stale view therefore costs one refused transaction, not a run of them.
+There is a backstop either way. A broadcast the upstream refuses — which is how a conflicting input shows up — marks the cached state stale, so the attempt after it works from a fresh read. A read already in flight when the refusal lands does not count as that fresh read: its answer predates the refusal, so it is applied but left stale, and the next attempt reads again (CS-721). Building on a stale view therefore costs one refused transaction, not a run of them.
 
 Requests that find the same client's state stale at the same moment **share one refresh**: the first fetches, and the rest wait for that answer rather than each fetching it again behind the rate limit. The periodic refresh leaves a client alone while a request is refreshing it.
 
