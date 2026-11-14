@@ -42,6 +42,39 @@ impl AddressWatcher for RpcInterface {
     }
 }
 
+/// Puts a deadline on another watcher's calls (CS-740).
+///
+/// `rpc`'s `importaddress` goes through a client with no timeout of its own,
+/// as every chain-gang interface call does, which [`crate::interface_timeout`]
+/// bounds. The watch was not bounded: a node that accepted the call and never
+/// answered held up whatever waited on it -- at startup the first sweep, and
+/// with it the periodic refresh and the fee-rate refresh, which then never
+/// ran, and at runtime a `POST /client`. Out of time, the watch fails like
+/// any refused import: warned about, and the service goes on (SR-BCHN-008).
+pub struct BoundedWatcher {
+    inner: std::sync::Arc<dyn AddressWatcher>,
+    timeout: std::time::Duration,
+}
+
+impl BoundedWatcher {
+    pub fn new(inner: std::sync::Arc<dyn AddressWatcher>, timeout: std::time::Duration) -> Self {
+        Self { inner, timeout }
+    }
+}
+
+#[async_trait]
+impl AddressWatcher for BoundedWatcher {
+    async fn watch_address(&self, address: &str) -> Result<(), String> {
+        match tokio::time::timeout(self.timeout, self.inner.watch_address(address)).await {
+            Ok(result) => result,
+            Err(_) => Err(format!(
+                "the node did not answer within {}s (blockchain_interface.timeout_seconds)",
+                self.timeout.as_secs()
+            )),
+        }
+    }
+}
+
 /// Records what it was asked to watch, and can be told to fail.
 ///
 /// Lets the service's import behaviour be tested without a node.
@@ -80,6 +113,52 @@ impl AddressWatcher for RecordingWatcher {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Accepts the call and never answers, as a hung node does.
+    struct SilentWatcher;
+
+    #[async_trait]
+    impl AddressWatcher for SilentWatcher {
+        async fn watch_address(&self, _address: &str) -> Result<(), String> {
+            std::future::pending().await
+        }
+    }
+
+    /// CS-740: a watch the node never answers fails at the deadline, as a
+    /// refused import does, instead of waiting forever.
+    #[tokio::test]
+    async fn cs_740_a_watch_the_node_never_answers_fails_at_the_deadline() {
+        let bounded = BoundedWatcher::new(
+            std::sync::Arc::new(SilentWatcher),
+            std::time::Duration::from_millis(50),
+        );
+        let error = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            bounded.watch_address("mwxrVFs"),
+        )
+        .await
+        .expect("the watch was not bounded")
+        .unwrap_err();
+        assert!(error.contains("did not answer"), "{error}");
+    }
+
+    /// One that answers in time is passed through, failure and all.
+    #[tokio::test]
+    async fn cs_740_a_watch_inside_the_deadline_is_unchanged() {
+        let recording = std::sync::Arc::new(RecordingWatcher::new(false));
+        let bounded = BoundedWatcher::new(recording.clone(), std::time::Duration::from_secs(5));
+        bounded.watch_address("n1jaAsK").await.unwrap();
+        assert_eq!(recording.watched(), vec!["n1jaAsK".to_string()]);
+
+        let failing = BoundedWatcher::new(
+            std::sync::Arc::new(RecordingWatcher::new(true)),
+            std::time::Duration::from_secs(5),
+        );
+        assert_eq!(
+            failing.watch_address("n1jaAsK").await.unwrap_err(),
+            "simulated import failure"
+        );
+    }
 
     #[tokio::test]
     async fn a_watcher_records_what_it_was_asked_to_watch() {

@@ -2267,6 +2267,41 @@ mod tests {
         assert!(err.contains("does not parse"), "{err}");
     }
 
+    /// CS-740: a node that accepts the address watch and never answers no
+    /// longer holds up the first sweep, and with it the periodic and fee-rate
+    /// refreshes: the watch fails at `timeout_seconds`, as a refused import
+    /// does, and `start_chain` goes on. Before, it waited forever.
+    #[tokio::test]
+    async fn cs_740_start_chain_goes_on_past_a_watch_the_node_never_answers() {
+        // Accepts every connection and never writes a byte.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let blackhole = tokio::spawn(async move {
+            let mut held = Vec::new();
+            loop {
+                if let Ok((socket, _)) = listener.accept().await {
+                    held.push(socket);
+                }
+            }
+        });
+
+        let mut config = test_config(&unique_dynamic_config_path());
+        config.blockchain_interface.interface_type = "rpc".to_string();
+        config.blockchain_interface.network = "regtest".to_string();
+        config.blockchain_interface.url = Some(address.to_string());
+        config.blockchain_interface.rpc_user = Some("user".to_string());
+        config.blockchain_interface.rpc_password = Some("pass".to_string());
+        config.blockchain_interface.rpc_import_addresses = true;
+        config.blockchain_interface.timeout_seconds = Some(1);
+        let service = Arc::new(Service::new(&config).await.expect("builds"));
+
+        // The probe, a watch per client and a read per client, each 1s.
+        tokio::time::timeout(Duration::from_secs(20), Service::start_chain(&service))
+            .await
+            .expect("start_chain waited on the address watch");
+        blackhole.abort();
+    }
+
     /// A node reports zero for an address it does not track, so the configured
     /// clients' addresses must be handed to it before the first balance read.
     #[tokio::test]
