@@ -752,6 +752,92 @@ impl TxBroadcaster for SlowRecordingBroadcaster {
     }
 }
 
+/// Takes every transaction and never answers, recording the inputs each one
+/// spends as it arrives: a broadcast the process is stopped in the middle of
+/// (CS-719).
+pub struct HangingBroadcaster {
+    spent: std::sync::Mutex<Vec<(String, u32)>>,
+}
+
+impl HangingBroadcaster {
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self {
+            spent: std::sync::Mutex::new(Vec::new()),
+        })
+    }
+
+    /// Every input of every transaction handed over, as `(txid, vout)`.
+    pub fn spent_inputs(&self) -> Vec<(String, u32)> {
+        self.spent.lock().unwrap().clone()
+    }
+}
+
+#[async_trait]
+impl TxBroadcaster for HangingBroadcaster {
+    fn name(&self) -> &str {
+        "hanging"
+    }
+
+    async fn broadcast_tx(&self, tx: &Tx) -> Result<String, BroadcastError> {
+        {
+            let mut spent = self.spent.lock().unwrap();
+            for input in &tx.inputs {
+                spent.push((input.prev_output.hash.encode(), input.prev_output.index));
+            }
+        }
+        std::future::pending().await
+    }
+
+    async fn health_check(&self) -> Result<(), BroadcastError> {
+        Ok(())
+    }
+}
+
+/// Takes every transaction, counts it, and answers only once
+/// [`GatedBroadcaster::open`] is called: fundings held mid-broadcast, their
+/// claims made, until a test lets them finish together (CS-719).
+pub struct GatedBroadcaster {
+    arrived: AtomicU32,
+    gate: tokio::sync::Semaphore,
+}
+
+impl GatedBroadcaster {
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self {
+            arrived: AtomicU32::new(0),
+            gate: tokio::sync::Semaphore::new(0),
+        })
+    }
+
+    /// How many broadcasts are waiting, or have waited, at the gate.
+    pub fn arrived(&self) -> u32 {
+        self.arrived.load(Ordering::SeqCst)
+    }
+
+    /// Lets every broadcast through, now and from now on.
+    pub fn open(&self) {
+        self.gate
+            .add_permits(tokio::sync::Semaphore::MAX_PERMITS / 2);
+    }
+}
+
+#[async_trait]
+impl TxBroadcaster for GatedBroadcaster {
+    fn name(&self) -> &str {
+        "gated"
+    }
+
+    async fn broadcast_tx(&self, tx: &Tx) -> Result<String, BroadcastError> {
+        self.arrived.fetch_add(1, Ordering::SeqCst);
+        let _ = self.gate.acquire().await;
+        Ok(tx.hash().encode())
+    }
+
+    async fn health_check(&self) -> Result<(), BroadcastError> {
+        Ok(())
+    }
+}
+
 /// Stands in for the mapi-lite broadcaster above the HTTP layer.
 ///
 /// It carries the mapi-lite name, so the service treats it as mapi-lite --

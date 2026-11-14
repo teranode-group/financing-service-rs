@@ -145,7 +145,23 @@ async fn main() -> std::io::Result<()> {
     });
 
     let governor_config = governor_config.clone();
-    HttpServer::new(move || {
+    // Long enough for a funding to finish once SIGTERM arrives (CS-719). Its
+    // claim is on disk from before the broadcast either way, so one cut off
+    // by a shorter orchestrator grace leaves its inputs reserved, not free.
+    let shutdown_grace = config.shutdown_grace();
+    match shutdown_grace {
+        Some(grace) => log::info!(
+            "on SIGTERM or SIGINT, requests in flight get {}s to finish (the longest a POST /fund \
+             can take, plus {}s); give the orchestrator at least that before it kills the process",
+            grace.as_secs(),
+            config::SHUTDOWN_MARGIN.as_secs()
+        ),
+        None => log::warn!(
+            "chain reads have no deadline (timeout_seconds = 0), so nothing bounds a POST /fund: \
+             on SIGTERM or SIGINT, requests in flight get actix's default 30s"
+        ),
+    }
+    let server = HttpServer::new(move || {
         App::new()
             .wrap(tracing_actix_web::TracingLogger::default())
             .wrap(Governor::new(&governor_config))
@@ -166,7 +182,11 @@ async fn main() -> std::io::Result<()> {
     .map_err(|e| {
         log::error!(r#"Unable to bind to address/port "{addr:?}": {e}"#);
         e
-    })?
+    })?;
+    match shutdown_grace {
+        Some(grace) => server.shutdown_timeout(grace.as_secs()),
+        None => server,
+    }
     .run()
     .await
 }

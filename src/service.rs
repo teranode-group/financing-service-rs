@@ -1624,6 +1624,15 @@ impl Service {
             client.claim_inputs(&plan);
             (tx, plan)
         };
+        // On disk before the broadcast starts, as reservations (CS-719). A
+        // process stopped mid-broadcast -- a deploy's SIGTERM past the
+        // shutdown grace, a `docker stop`, a crash -- runs neither the commit
+        // nor the uncertain-outcome reservation, and a claim held only in
+        // memory was lost with it: after the restart the input could be
+        // selected again while its spend sat in a node's mempool. Restored,
+        // the reservation withholds it until the chain catches up or the
+        // reservation window ends, as an uncertain outcome's does.
+        service.save_inflight_state().await;
         Ok((
             service.broadcaster(),
             PreparedFunding {
@@ -1742,8 +1751,10 @@ impl Service {
     /// may have been a conflict, so the change waits for the chain to list
     /// it, as before CS-691.
     ///
-    /// The in-flight state is saved whenever this changed the pending change,
-    /// so a restart does not lose it (CS-465).
+    /// The in-flight state is saved after every release (CS-719): the claim
+    /// was saved as reservations before the broadcast, and left on disk they
+    /// would withhold the inputs after a restart. That save also keeps any
+    /// change to the pending change (CS-465).
     async fn release_prepared_funding(
         service: &Arc<Service>,
         prepared: &PreparedFunding,
@@ -1751,19 +1762,14 @@ impl Service {
         inputs_conflicted: bool,
     ) {
         if let Some(client) = service.client_handle(&prepared.client_id).await {
-            let changed = {
+            {
                 let mut client = client.write().await;
-                let repended = client.release_claim(&prepared.spend_plan, inputs_conflicted);
-                let forgotten = if inputs_missing {
-                    client.forget_refused_own_change(&prepared.spend_plan)
-                } else {
-                    0
-                };
-                repended + forgotten
-            };
-            if changed > 0 {
-                service.save_inflight_state().await;
+                client.release_claim(&prepared.spend_plan, inputs_conflicted);
+                if inputs_missing {
+                    client.forget_refused_own_change(&prepared.spend_plan);
+                }
             }
+            service.save_inflight_state().await;
         }
     }
 
@@ -3876,6 +3882,65 @@ mod tests {
         );
     }
 
+    /// CS-719: a funding the process is stopped in the middle of -- its
+    /// handler dropped mid-broadcast, as a deploy's SIGTERM past the grace,
+    /// a `docker stop` or a crash does -- runs neither the commit nor the
+    /// uncertain-outcome reservation. Its claim is on disk from before the
+    /// broadcast, so after the restart its inputs are still reserved, and the
+    /// next funding spends others.
+    #[tokio::test]
+    async fn cs_719_a_funding_stopped_mid_broadcast_leaves_its_inputs_reserved() {
+        use crate::test_support::{HangingBroadcaster, SlowRecordingBroadcaster};
+
+        let config = test_config(&unique_dynamic_config_path());
+        let request = sample_fund_request(TEST_CLIENT_ID);
+
+        let hanging = HangingBroadcaster::new();
+        let before = service_with(
+            &config,
+            test_blockchain_interface(&config).await,
+            hanging.clone(),
+        )
+        .await;
+        let funding = tokio::spawn({
+            let before = before.clone();
+            let request = request.clone();
+            async move { fund_single_transaction(&before, &request).await }
+        });
+        let started = Instant::now();
+        while hanging.spent_inputs().is_empty() {
+            assert!(
+                started.elapsed() < Duration::from_secs(5),
+                "the broadcast never started"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        // The process stops: the handler is dropped where it waits.
+        funding.abort();
+        assert!(funding.await.unwrap_err().is_cancelled());
+        drop(before);
+
+        let sent = SlowRecordingBroadcaster::new(Duration::ZERO);
+        let after = service_with(
+            &config,
+            test_blockchain_interface(&config).await,
+            sent.clone(),
+        )
+        .await;
+        fund_single_transaction(&after, &request)
+            .await
+            .expect("funds from another input");
+
+        let stopped = hanging.spent_inputs();
+        for input in sent.spent_inputs() {
+            assert!(
+                !stopped.contains(&input),
+                "after the restart the service spent {input:?}, which the stopped broadcast \
+                 was spending"
+            );
+        }
+    }
+
     /// A state file that cannot be read is survived: the service starts, as it
     /// would have with no file at all, rather than refusing to.
     #[tokio::test]
@@ -3910,17 +3975,21 @@ mod tests {
     /// The ticket's point. Commits that finish while a write is in progress
     /// queue for the next one, and that one write covers all of them: three
     /// fundings, one write, and all three of their spends on disk before any
-    /// of them is answered.
+    /// of them is answered. Their claims were written before their
+    /// broadcasts (CS-719), so the fundings are held mid-broadcast until
+    /// those writes are done, and only the commits' writes are counted.
     #[tokio::test]
     async fn cs_495_commits_waiting_on_one_write_share_it() {
-        let config = test_config(&unique_dynamic_config_path());
-        let service = Arc::new(
-            Service::new_for_test(&config, test_blockchain_interface(&config).await).await,
-        );
-        let before = inflight_writes(&service);
+        use crate::test_support::GatedBroadcaster;
 
-        // a write in progress
-        let writing = service.inflight_save.lock().await;
+        let config = test_config(&unique_dynamic_config_path());
+        let gated = GatedBroadcaster::new();
+        let service = service_with(
+            &config,
+            test_blockchain_interface(&config).await,
+            gated.clone(),
+        )
+        .await;
         let requests: Vec<_> = (0..3)
             .map(|_| {
                 let service = Arc::clone(&service);
@@ -3929,6 +3998,16 @@ mod tests {
                 })
             })
             .collect();
+        let started = Instant::now();
+        while gated.arrived() < 3 {
+            assert!(started.elapsed() < Duration::from_secs(5));
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+
+        // a write in progress, and the broadcasts answered behind it
+        let writing = service.inflight_save.lock().await;
+        let before = inflight_writes(&service);
+        gated.open();
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert!(
             requests.iter().all(|request| !request.is_finished()),
@@ -3970,7 +4049,9 @@ mod tests {
             .await
             .expect("funds");
         assert_eq!(reservations_on_disk(&config), 2);
-        assert_eq!(inflight_writes(&service) - before, 2);
+        // Each funding writes its claim before broadcasting (CS-719), then its
+        // commit after: two each, none shared.
+        assert_eq!(inflight_writes(&service) - before, 4);
     }
 
     /// A write that fails covers nothing. Commits queued behind it are not
@@ -4008,9 +4089,11 @@ mod tests {
                 .unwrap()
                 .expect("funds, though the state cannot be saved");
         }
+        // Two claims, then two commits (CS-719): each tried again after the
+        // write before it failed.
         assert_eq!(
             inflight_writes(&service) - before,
-            2,
+            4,
             "the second commit should have tried again after the first write failed"
         );
 
