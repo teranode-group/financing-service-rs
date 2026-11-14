@@ -1147,6 +1147,63 @@ mod tests {
         assert_eq!(body, json!({ "status": "ok", "chain": { "ok": true } }));
     }
 
+    /// CS-722: with a chain source that accepts and never answers, the
+    /// service is built and `/health` answers at once, while `GET /ready`
+    /// says the chain has not been read. The status probe and the first
+    /// reads, each bounded at `timeout_seconds` (30s here), used to run
+    /// before the server bound, one client after another.
+    #[actix_web::test]
+    async fn cs_722_health_answers_at_once_while_the_chain_source_never_does() {
+        // Accepts every connection and never writes a byte.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let blackhole = tokio::spawn(async move {
+            let mut held = Vec::new();
+            loop {
+                if let Ok((socket, _)) = listener.accept().await {
+                    held.push(socket);
+                }
+            }
+        });
+
+        let mut config = test_config(&unique_dynamic_config_path());
+        config.blockchain_interface.interface_type = "uaas".to_string();
+        config.blockchain_interface.url = Some(format!("http://{address}"));
+        let started = std::time::Instant::now();
+        let service = Arc::new(
+            tokio::time::timeout(std::time::Duration::from_secs(5), Service::new(&config))
+                .await
+                .expect("startup waited on the chain source")
+                .expect("builds"),
+        );
+        actix_web::rt::spawn({
+            let service = Arc::clone(&service);
+            async move { Service::start_chain(&service).await }
+        });
+        let app = test::init_service(
+            App::new()
+                .app_data(web::Data::new(AppState::new(Arc::clone(&service))))
+                .service(health)
+                .service(ready),
+        )
+        .await;
+
+        let health_check =
+            test::call_service(&app, test::TestRequest::get().uri("/health").to_request()).await;
+        assert_eq!(health_check.status(), StatusCode::OK);
+        let readiness =
+            test::call_service(&app, test::TestRequest::get().uri("/ready").to_request()).await;
+        assert_eq!(readiness.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body: Value = test::read_body_json(readiness).await;
+        assert_eq!(body["chain"]["ok"], false, "{body}");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "{:?}",
+            started.elapsed()
+        );
+        blackhole.abort();
+    }
+
     /// SR-BCHN-017: chain reads older than the bound take the service out of
     /// rotation -- with `[mapi_lite]` it would otherwise go on funding from an
     /// ever older cache -- and liveness is untouched (SR-BCHN-004).

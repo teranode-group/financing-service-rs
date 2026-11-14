@@ -132,11 +132,16 @@ async fn main() -> std::io::Result<()> {
         .listen_socket_addr()
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
 
-    // Setup periodic task
-    let utxo_refresh_period = config.service.utxo_refresh_period;
+    // The startup chain reads, then the periodic refresh, behind the server
+    // rather than in front of it, so /health answers however long the chain
+    // source takes (CS-722).
+    let utxo_refresh_period = Duration::from_secs(config.service.utxo_refresh_period);
     tokio::spawn(async move {
-        // Every minute
-        let mut interval = time::interval(Duration::from_secs(utxo_refresh_period));
+        Service::start_chain(&app_state2.service).await;
+        let mut interval = time::interval_at(
+            time::Instant::now() + utxo_refresh_period,
+            utxo_refresh_period,
+        );
         loop {
             interval.tick().await;
             // Refresh the utxo for clients

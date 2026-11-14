@@ -3,7 +3,7 @@
 
 use chain_gang::{
     interface::blockchain_interface::UNCONFIRMED_HEIGHT,
-    interface::{Balance, BlockchainInterface, Utxo, UtxoEntry},
+    interface::{Balance, Utxo, UtxoEntry},
     messages::{OutPoint, Tx, TxIn, TxOut},
     network::Network,
     script::Script,
@@ -374,9 +374,10 @@ impl Client {
 
     /// Query the interface for the latest unspent set, and take the balance
     /// from it.
+    #[cfg(test)]
     pub async fn update_balance(
         &mut self,
-        blockchain_interface: &dyn BlockchainInterface,
+        blockchain_interface: &dyn chain_gang::interface::BlockchainInterface,
     ) -> Result<(), Box<dyn std::error::Error>> {
         let unspent = blockchain_interface
             .get_utxo(&self.address.to_string())
