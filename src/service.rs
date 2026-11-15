@@ -772,7 +772,8 @@ impl Service {
     /// Called after each commit, so what is on disk is never behind what has
     /// been broadcast by more than the moment between the two. A failure is
     /// logged, not returned: the transaction is already on the network, and
-    /// the caller has nothing it could do with the error.
+    /// the caller has nothing it could do with the error. Before a broadcast
+    /// there is, so that save uses [`Self::try_save_inflight_state`] (CS-737).
     ///
     /// Commits share writes. Each takes a ticket, then queues for the save
     /// lock; whoever holds it snapshots every client and writes, and that
@@ -787,6 +788,19 @@ impl Service {
     /// finishing together would otherwise each snapshot, then write in either
     /// order -- and whichever snapshot is older could land last.
     pub async fn save_inflight_state(&self) {
+        if let Err(e) = self.try_save_inflight_state().await {
+            log::error!(
+                "cannot save in-flight funding state to {}: {e}. A restart before the chain \
+                 catches up could hand the same outpoints out again.",
+                self.inflight_state_path.display()
+            );
+        }
+    }
+
+    /// [`Self::save_inflight_state`], returning whether the state the caller
+    /// changed is on disk: `Ok` once a write that includes it has succeeded,
+    /// here or by another caller sharing it.
+    pub async fn try_save_inflight_state(&self) -> std::io::Result<()> {
         use std::sync::atomic::Ordering;
 
         // Taken after the caller applied its commit, so any snapshot that
@@ -794,7 +808,7 @@ impl Service {
         let ticket = self.inflight_commits.fetch_add(1, Ordering::SeqCst) + 1;
         let mut written_through = self.inflight_save.lock().await;
         if *written_through >= ticket {
-            return;
+            return Ok(());
         }
         let covers = self.inflight_commits.load(Ordering::SeqCst);
 
@@ -826,16 +840,11 @@ impl Service {
             .unwrap_or_else(|e| Err(std::io::Error::other(e)));
         #[cfg(test)]
         self.inflight_writes.fetch_add(1, Ordering::SeqCst);
-        match written {
-            Ok(()) => *written_through = covers,
-            // Not marked written, so the next commit tries again rather than
-            // being told a failed write covered it.
-            Err(e) => log::error!(
-                "cannot save in-flight funding state to {}: {e}. A restart before the chain \
-                 catches up could hand the same outpoints out again.",
-                self.inflight_state_path.display()
-            ),
-        }
+        // A failed write is not marked written, so the next caller tries
+        // again rather than being told a failed write covered it.
+        written?;
+        *written_through = covers;
+        Ok(())
     }
 
     async fn client_handles(&self) -> Vec<Arc<RwLock<Client>>> {
@@ -1720,7 +1729,24 @@ impl Service {
         // selected again while its spend sat in a node's mempool. Restored,
         // the reservation withholds it until the chain catches up or the
         // reservation window ends, as an uncertain outcome's does.
-        service.save_inflight_state().await;
+        //
+        // A claim that could not be saved is given back and the funding
+        // refused, since nothing has been sent (CS-737). Going ahead would
+        // broadcast with the claim held only in memory: the gap the save
+        // closes, silently open for as long as the disk is unwritable.
+        if let Err(e) = service.try_save_inflight_state().await {
+            log::error!(
+                "cannot save in-flight funding state to {}: {e}. Refusing the funding before \
+                 broadcasting it: its claim on the inputs would be held only in memory.",
+                service.inflight_state_path.display()
+            );
+            client.write().await.release_claim(&spend_plan, false);
+            return Err(CodedError::new(
+                ErrorCode::BroadcastFailed,
+                "Nothing was sent: the service could not save its claim on the inputs to disk. \
+                 Nothing was spent; an operator has to fix the in-flight state file.",
+            ));
+        }
         Ok((
             service.broadcaster(),
             PreparedFunding {
@@ -1813,7 +1839,8 @@ impl Service {
                         service,
                         &prepared,
                         inputs_missing,
-                        inputs_conflicted || reason_unread,
+                        inputs_conflicted,
+                        reason_unread,
                     )
                     .await;
                 }
@@ -1852,6 +1879,13 @@ impl Service {
     /// may have been a conflict, so the change waits for the chain to list
     /// it, as before CS-691.
     ///
+    /// And when the node said an input is missing or conflicted, the inputs
+    /// the chain listed are kept out of selection for a while, though the
+    /// read source goes on listing them (CS-720): it can be listing a coin
+    /// the broadcaster's nodes do not have. After a missing input only the
+    /// unconfirmed ones, since such a coin is necessarily unconfirmed. Not
+    /// when the reason was unread, which could be any refusal.
+    ///
     /// The in-flight state is saved after every release (CS-719): the claim
     /// was saved as reservations before the broadcast, and left on disk they
     /// would withhold the inputs after a restart. That save also keeps any
@@ -1861,11 +1895,15 @@ impl Service {
         prepared: &PreparedFunding,
         inputs_missing: bool,
         inputs_conflicted: bool,
+        reason_unread: bool,
     ) {
         if let Some(client) = service.prepared_client(prepared).await {
             {
                 let mut client = client.write().await;
-                client.release_claim(&prepared.spend_plan, inputs_conflicted);
+                client.release_claim(&prepared.spend_plan, inputs_conflicted || reason_unread);
+                if inputs_missing || inputs_conflicted {
+                    client.quarantine_refused_inputs(&prepared.spend_plan, inputs_conflicted);
+                }
                 if inputs_missing {
                     client.forget_refused_own_change(&prepared.spend_plan);
                 }
@@ -1962,7 +2000,8 @@ impl Service {
                                     service,
                                     &prepared,
                                     inputs_missing,
-                                    inputs_conflicted || reason_unread,
+                                    inputs_conflicted,
+                                    reason_unread,
                                 )
                                 .await;
                             }
@@ -2046,7 +2085,8 @@ impl Service {
                 error,
                 inputs_missing: e.inputs_missing(),
                 inputs_conflicted: e.inputs_conflicted(),
-                reason_unread: !broadcaster.reads_node_reasons(),
+                // A transaction that never left has no reason to read (CS-736).
+                reason_unread: e.was_sent() && !broadcaster.reads_node_reasons(),
             });
         }
         log::info!(
@@ -2185,8 +2225,9 @@ fn coded_broadcast_error(error: &BroadcastError) -> CodedError {
             "The upstream refused the funding transaction and will not accept it on retry. \
              See the service log for its reason.",
         ),
-        // Unreachable, or refused in a way the upstream itself called worth
-        // retrying. Either way nothing was spent: since CS-501 every failure
+        // Unreachable, refused in a way the upstream itself called worth
+        // retrying, or never sent because its rate-limit slot was too far
+        // away (CS-736). Either way nothing was spent: since CS-501 every failure
         // that may have delivered the transaction is an unknown outcome
         // instead, including an acceptance mapi-lite could not record.
         _ => CodedError::new(
@@ -2265,6 +2306,41 @@ mod tests {
         );
         let err = result.err().expect("startup must fail");
         assert!(err.contains("does not parse"), "{err}");
+    }
+
+    /// CS-740: a node that accepts the address watch and never answers no
+    /// longer holds up the first sweep, and with it the periodic and fee-rate
+    /// refreshes: the watch fails at `timeout_seconds`, as a refused import
+    /// does, and `start_chain` goes on. Before, it waited forever.
+    #[tokio::test]
+    async fn cs_740_start_chain_goes_on_past_a_watch_the_node_never_answers() {
+        // Accepts every connection and never writes a byte.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let blackhole = tokio::spawn(async move {
+            let mut held = Vec::new();
+            loop {
+                if let Ok((socket, _)) = listener.accept().await {
+                    held.push(socket);
+                }
+            }
+        });
+
+        let mut config = test_config(&unique_dynamic_config_path());
+        config.blockchain_interface.interface_type = "rpc".to_string();
+        config.blockchain_interface.network = "regtest".to_string();
+        config.blockchain_interface.url = Some(address.to_string());
+        config.blockchain_interface.rpc_user = Some("user".to_string());
+        config.blockchain_interface.rpc_password = Some("pass".to_string());
+        config.blockchain_interface.rpc_import_addresses = true;
+        config.blockchain_interface.timeout_seconds = Some(1);
+        let service = Arc::new(Service::new(&config).await.expect("builds"));
+
+        // The probe, a watch per client and a read per client, each 1s.
+        tokio::time::timeout(Duration::from_secs(20), Service::start_chain(&service))
+            .await
+            .expect("start_chain waited on the address watch");
+        blackhole.abort();
     }
 
     /// A node reports zero for an address it does not track, so the configured
@@ -3240,6 +3316,88 @@ mod tests {
             !spends_first(&sent[2]),
             "the next request did not select the refused change again"
         );
+    }
+
+    /// CS-720: a coin the read source lists and the broadcaster's nodes do
+    /// not have -- anyone can pay the funding address with one -- is refused
+    /// as missing (or conflicted) when spent. It is then kept out of
+    /// selection for the quarantine, though every refresh lists it again, so
+    /// the next request funds from another input rather than being refused
+    /// the same way. A refusal whose reason was not read quarantines nothing.
+    #[tokio::test]
+    async fn cs_720_an_input_refused_as_missing_or_conflicted_is_not_selected_again() {
+        use crate::test_support::{blockchain_listing, ScriptedBroadcaster};
+
+        // The phantom is unconfirmed, as a coin the nodes do not have must be.
+        let utxo = |seed: char, value| chain_gang::interface::UtxoEntry {
+            height: if seed == 'a' {
+                chain_gang::interface::blockchain_interface::UNCONFIRMED_HEIGHT
+            } else {
+                1517000
+            },
+            tx_pos: 0,
+            tx_hash: seed.to_string().repeat(64),
+            value,
+        };
+        let phantom = "a".repeat(64);
+        let spends_phantom = |tx: &Tx| {
+            tx.inputs
+                .iter()
+                .any(|input| input.prev_output.hash.encode() == phantom)
+        };
+        let refusal = |reason: &str, reads: bool| {
+            let error = BroadcastError::Rejected {
+                description: reason.to_string(),
+                retryable: true,
+                conflicted_with: Vec::new(),
+            };
+            if reads {
+                ScriptedBroadcaster::reading_reasons(vec![Some(error)])
+            } else {
+                ScriptedBroadcaster::new(vec![Some(error)])
+            }
+        };
+
+        for (reason, reads, held) in [
+            (
+                "Mempool error, retry again later. (details: 16 missing-inputs)",
+                true,
+                true,
+            ),
+            ("258: txn-mempool-conflict", true, true),
+            ("some refusal nobody read", false, false),
+        ] {
+            let config = test_config(&unique_dynamic_config_path());
+            // The phantom is the smallest suitable UTXO, so it is picked first.
+            let blockchain =
+                blockchain_listing(&config, &[utxo('a', 10_000), utxo('b', 50_000)]).await;
+            let broadcaster = refusal(reason, reads);
+            let service = service_with(&config, blockchain, broadcaster.clone()).await;
+            let request = FundRequest {
+                satoshi: 1_000,
+                ..sample_fund_request(TEST_CLIENT_ID)
+            };
+
+            fund_single_transaction(&service, &request)
+                .await
+                .expect_err("the phantom is refused");
+            // A refresh in between, which lists the phantom again.
+            Service::refresh_client_chain_state(&service, TEST_CLIENT_ID)
+                .await
+                .expect("refreshes");
+            fund_single_transaction(&service, &request)
+                .await
+                .expect("the next request funds");
+
+            let sent = broadcaster.sent();
+            assert!(spends_phantom(&sent[0]), "{reason}: the first spent it");
+            assert_eq!(
+                !spends_phantom(&sent[1]),
+                held,
+                "{reason}: the next request {} the refused input",
+                if held { "selected" } else { "did not select" }
+            );
+        }
     }
 
     /// CS-691, #160 review: a refusal from a broadcaster that cannot read
@@ -4241,10 +4399,11 @@ mod tests {
         assert_eq!(inflight_writes(&service) - before, 4);
     }
 
-    /// A write that fails covers nothing. Commits queued behind it are not
-    /// answered on the strength of it: the next one tries again. And once the
-    /// file can be written it holds every spend, including those whose own
-    /// write failed.
+    /// A write that fails covers nothing. Saves queued behind it are not
+    /// answered on the strength of it: each tries again, and is told it
+    /// failed, which a funding about to broadcast is refused on (CS-737).
+    /// Once the file can be written, the next funding's claim and commit
+    /// reach it.
     #[tokio::test]
     async fn cs_495_a_failed_write_is_not_taken_as_covering_anything() {
         let config = test_config(&unique_dynamic_config_path());
@@ -4258,31 +4417,34 @@ mod tests {
         std::fs::write(path.join("occupied"), "").unwrap();
         let before = inflight_writes(&service);
 
-        // two commits queued behind a write in progress, as in the sharing case
+        // two saves queued behind a write in progress, as in the sharing case
         let writing = service.inflight_save.lock().await;
-        let requests: Vec<_> = (0..2)
+        let saves: Vec<_> = (0..2)
             .map(|_| {
                 let service = Arc::clone(&service);
-                tokio::spawn(async move {
-                    fund_single_transaction(&service, &sample_fund_request(TEST_CLIENT_ID)).await
-                })
+                tokio::spawn(async move { service.try_save_inflight_state().await })
             })
             .collect();
         tokio::time::sleep(Duration::from_millis(50)).await;
         drop(writing);
-        for request in requests {
-            request
-                .await
-                .unwrap()
-                .expect("funds, though the state cannot be saved");
+        for save in saves {
+            assert!(
+                save.await.unwrap().is_err(),
+                "a save was answered on the strength of a write that failed"
+            );
         }
-        // Two claims, then two commits (CS-719): each tried again after the
-        // write before it failed.
         assert_eq!(
             inflight_writes(&service) - before,
-            4,
-            "the second commit should have tried again after the first write failed"
+            2,
+            "the second save should have tried again after the first write failed"
         );
+
+        // A funding meanwhile is refused, unsent, rather than broadcast with
+        // its claim held only in memory (CS-737).
+        let refused = fund_single_transaction(&service, &sample_fund_request(TEST_CLIENT_ID))
+            .await
+            .expect_err("its claim cannot be saved");
+        assert_eq!(refused.code, ErrorCode::BroadcastFailed);
 
         std::fs::remove_dir_all(&path).unwrap();
         fund_single_transaction(&service, &sample_fund_request(TEST_CLIENT_ID))
@@ -4290,9 +4452,58 @@ mod tests {
             .expect("funds");
         assert_eq!(
             reservations_on_disk(&config),
-            3,
-            "all three spends, once it could"
+            1,
+            "the funded spend, once it could; the refused one gave its claim back"
         );
+    }
+
+    /// CS-737: a claim that cannot be saved to disk before its broadcast is
+    /// given back and the funding refused `broadcast_failed`, with nothing
+    /// sent. Going ahead would hold the claim only in memory, the gap CS-719
+    /// closes.
+    #[tokio::test]
+    async fn cs_737_a_claim_that_cannot_be_saved_is_refused_unsent() {
+        use crate::test_support::CountingBroadcaster;
+
+        let mut config = test_config(&unique_dynamic_config_path());
+        // A directory that does not exist, so every write fails.
+        let missing = std::env::temp_dir().join(format!(
+            "fs-cs737-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        config.service.inflight_state_file =
+            Some(missing.join("inflight.json").to_string_lossy().into_owned());
+        let broadcaster = CountingBroadcaster::new();
+        let service = service_with(
+            &config,
+            test_blockchain_interface(&config).await,
+            broadcaster.clone(),
+        )
+        .await;
+        let client = service.client_handle(TEST_CLIENT_ID).await.expect("client");
+        let held_before = client.read().await.inflight_state();
+
+        let refused = Service::execute_funding(&service, &sample_fund_request(TEST_CLIENT_ID))
+            .await
+            .expect_err("the claim could not be saved");
+        assert_eq!(refused.code, ErrorCode::BroadcastFailed);
+        assert!(
+            refused.description.contains("Nothing was sent"),
+            "{}",
+            refused.description
+        );
+        assert_eq!(broadcaster.broadcast_count(), 0, "nothing was broadcast");
+        assert_eq!(
+            client.read().await.reserved_outpoint_count(),
+            0,
+            "the claim was given back"
+        );
+        assert_eq!(client.read().await.inflight_state(), held_before);
+        assert!(!missing.exists());
     }
 
     /// CS-723: a client deleted while its funding broadcast, and re-added
@@ -4452,6 +4663,59 @@ mod tests {
             "nothing left claimed"
         );
         assert_eq!(client.read().await.inflight_state(), held_before);
+    }
+
+    /// CS-736: a broadcast refused before it was sent -- its rate-limit slot
+    /// too far away -- is `broadcast_failed`, and its claim goes straight
+    /// back. Nothing reached the node, so there is no unread reason to hold
+    /// own change for, even through a broadcaster that cannot read reasons.
+    #[tokio::test]
+    async fn cs_736_a_broadcast_never_sent_gives_everything_back() {
+        use crate::test_support::ScriptedBroadcaster;
+        let not_sent = || {
+            vec![Some(BroadcastError::NotSent(
+                "the next request slot is 40.0s away".to_string(),
+            ))]
+        };
+
+        let config = test_config(&unique_dynamic_config_path());
+        let service = service_with(
+            &config,
+            test_blockchain_interface(&config).await,
+            ScriptedBroadcaster::new(not_sent()),
+        )
+        .await;
+        let (broadcaster, prepared) =
+            Service::prepare_funding_outpoints(&service, &sample_fund_request(TEST_CLIENT_ID))
+                .await
+                .expect("prepared");
+        let refused = Service::broadcast_prepared_funding(broadcaster, &prepared)
+            .await
+            .expect_err("not sent");
+        assert_eq!(refused.error.code, ErrorCode::BroadcastFailed);
+        assert!(!refused.reason_unread, "nothing reached the node");
+        assert!(!refused.inputs_conflicted && !refused.inputs_missing);
+
+        let config = test_config(&unique_dynamic_config_path());
+        let service = service_with(
+            &config,
+            test_blockchain_interface(&config).await,
+            ScriptedBroadcaster::new(not_sent()),
+        )
+        .await;
+        let client = service.client_handle(TEST_CLIENT_ID).await.expect("client");
+        let held_before = client.read().await.inflight_state();
+        let failed = Service::execute_funding(&service, &sample_fund_request(TEST_CLIENT_ID))
+            .await
+            .expect_err("not sent");
+        assert_eq!(failed.code, ErrorCode::BroadcastFailed);
+        assert_eq!(client.read().await.reserved_outpoint_count(), 0);
+        assert_eq!(client.read().await.inflight_state(), held_before);
+        // The script has run out, so the next request is sent, spending
+        // what the first one gave back.
+        Service::execute_funding(&service, &sample_fund_request(TEST_CLIENT_ID))
+            .await
+            .expect("funded");
     }
 
     /// When one UTXO is all the client has, a second request arriving while

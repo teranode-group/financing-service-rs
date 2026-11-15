@@ -2982,6 +2982,38 @@ mod tests {
         assert!(funded.get("replayed").is_none(), "{funded}");
     }
 
+    /// CS-737: a funding whose claim cannot be saved before its broadcast is
+    /// `broadcast_failed` with nothing sent, so its `idempotency_key` is free:
+    /// the same request, key and all, is answered the same way rather than
+    /// `key_in_progress`.
+    #[actix_web::test]
+    async fn cs_737_an_unsaved_claim_is_broadcast_failed_and_frees_its_key() {
+        use crate::test_support::CountingBroadcaster;
+
+        let mut config = test_config(&unique_dynamic_config_path());
+        config.service.inflight_state_file = Some(
+            std::env::temp_dir()
+                .join(format!("fs-cs737-rest-{}-missing", std::process::id()))
+                .join("inflight.json")
+                .to_string_lossy()
+                .into_owned(),
+        );
+        let broadcaster = CountingBroadcaster::new();
+        let (app, _service) = build_app_over(
+            &config,
+            test_blockchain_interface(&config).await,
+            broadcaster.clone(),
+        )
+        .await;
+        let body = fund_body_with_key(TEST_CLIENT_ID, 123, LOCKING_SCRIPT_HEX, "unsaved");
+        for _ in 0..2 {
+            let (http, refused) = post_fund(&app, body.clone()).await;
+            assert_eq!(http, StatusCode::BAD_GATEWAY, "{refused}");
+            assert_eq!(refused["code"], "broadcast_failed");
+        }
+        assert_eq!(broadcaster.broadcast_count(), 0);
+    }
+
     #[actix_web::test]
     async fn sr_sec_011_index_unauthenticated_when_client_api_key_enabled() {
         let app = build_app_with_api_key(Some(TEST_API_KEY)).await;
