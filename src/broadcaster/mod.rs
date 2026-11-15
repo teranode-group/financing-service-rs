@@ -62,6 +62,12 @@ pub enum BroadcastError {
     /// (CS-618). Nothing reached the network; an operator has to fix the key
     /// list or mapi-lite's key.
     Untrusted(String),
+    /// Not sent: the service gave up before handing the transaction over,
+    /// because its wait for a rate-limit slot would have been longer than
+    /// `blockchain_interface.timeout_seconds` (CS-736). Nothing reached the
+    /// network, so its inputs are spendable again, where an
+    /// [`BroadcastError::Indeterminate`] outcome holds them.
+    NotSent(String),
 }
 
 impl BroadcastError {
@@ -83,8 +89,20 @@ impl BroadcastError {
         match self {
             BroadcastError::Rejected { description, .. } => Some(description.to_ascii_lowercase()),
             BroadcastError::Upstream(detail) => Some(detail.to_ascii_lowercase()),
-            BroadcastError::Indeterminate(_) | BroadcastError::Untrusted(_) => None,
+            BroadcastError::Indeterminate(_)
+            | BroadcastError::Untrusted(_)
+            | BroadcastError::NotSent(_) => None,
         }
+    }
+
+    /// Whether the transaction reached the upstream at all. One that never
+    /// did -- untrusted (CS-618) or not sent (CS-736) -- has no node's reason
+    /// to read, so nothing about it can have been a conflict.
+    pub fn was_sent(&self) -> bool {
+        !matches!(
+            self,
+            BroadcastError::Untrusted(_) | BroadcastError::NotSent(_)
+        )
     }
 
     /// Whether the node refused the transaction because an input is already
@@ -145,7 +163,9 @@ impl std::fmt::Display for BroadcastError {
             BroadcastError::Indeterminate(detail) => {
                 write!(f, "outcome unknown: {detail}")
             }
-            BroadcastError::Untrusted(detail) => write!(f, "not sent: {detail}"),
+            BroadcastError::Untrusted(detail) | BroadcastError::NotSent(detail) => {
+                write!(f, "not sent: {detail}")
+            }
         }
     }
 }

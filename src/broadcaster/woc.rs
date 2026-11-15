@@ -42,7 +42,10 @@ impl TxBroadcaster for WocBroadcaster {
         // Not one that may have reached the network, though (CS-502, CS-718):
         // reporting it as failed would release inputs it spent (CS-501).
         self.inner.broadcast_tx(tx).await.map_err(|e| {
-            if broadcast_may_have_been_delivered(&e) {
+            // Refused before it was sent, its slot too far away (CS-736).
+            if crate::outbound_rate_limit::never_sent(&e) {
+                BroadcastError::NotSent(e.to_string())
+            } else if broadcast_may_have_been_delivered(&e) {
                 BroadcastError::Indeterminate(e.to_string())
             } else {
                 BroadcastError::Upstream(e.to_string())
@@ -443,5 +446,33 @@ mod tests {
             status_in("response.status() = 5", "response.status() = "),
             None
         );
+    }
+
+    /// CS-736: a broadcast the pacing refused, its slot too far away, never
+    /// left. It is reported as not sent -- not as an unknown outcome, which
+    /// would hold its inputs, nor as an upstream failure whose reason might
+    /// have been a conflict.
+    #[tokio::test]
+    async fn cs_736_a_broadcast_refused_its_slot_is_not_sent() {
+        use crate::outbound_rate_limit::RateLimited;
+        use std::time::Duration;
+
+        let config = test_config(&unique_dynamic_config_path());
+        let paced = Arc::new(
+            RateLimited::new(
+                crate::test_support::test_blockchain_interface(&config).await,
+                1,
+            )
+            .with_max_wait(Some(Duration::from_millis(100))),
+        );
+        // The slot now goes to a read; the next is a second away.
+        paced.status().await.expect("first slot");
+        let broadcaster = WocBroadcaster::new(paced, "uaas");
+
+        let error = broadcaster.broadcast_tx(&sample_tx()).await.unwrap_err();
+        assert!(matches!(error, BroadcastError::NotSent(_)), "{error:?}");
+        assert!(!error.was_sent());
+        assert!(!error.inputs_conflicted() && !error.inputs_missing());
+        assert!(error.to_string().starts_with("not sent: "), "{error}");
     }
 }

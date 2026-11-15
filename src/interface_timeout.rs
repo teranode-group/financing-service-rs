@@ -39,6 +39,33 @@ pub enum Scope {
     Broadcasts,
 }
 
+/// The interface call a [`Bounded`] is bounding: what its [`Scope`] tells
+/// apart, and what a timeout names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Call {
+    Status,
+    GetBalance,
+    GetUtxo,
+    BroadcastTx,
+    GetTx,
+    GetLatestBlockHeader,
+    GetBlockHeaders,
+}
+
+impl Call {
+    fn name(self) -> &'static str {
+        match self {
+            Call::Status => "status",
+            Call::GetBalance => "get_balance",
+            Call::GetUtxo => "get_utxo",
+            Call::BroadcastTx => "broadcast_tx",
+            Call::GetTx => "get_tx",
+            Call::GetLatestBlockHeader => "get_latest_block_header",
+            Call::GetBlockHeaders => "get_block_headers",
+        }
+    }
+}
+
 impl Bounded {
     #[cfg(test)]
     pub fn new(inner: Arc<dyn BlockchainInterface + Send + Sync>, timeout: Duration) -> Self {
@@ -59,10 +86,10 @@ impl Bounded {
 
     async fn bound<T>(
         &self,
-        call: &str,
+        call: Call,
         future: impl Future<Output = Result<T, ChainGangError>>,
     ) -> Result<T, ChainGangError> {
-        let broadcast = call == "broadcast_tx";
+        let broadcast = call == Call::BroadcastTx;
         let covered = match self.scope {
             Scope::All => true,
             Scope::Reads => !broadcast,
@@ -73,7 +100,7 @@ impl Bounded {
         }
         match tokio::time::timeout(self.timeout, future).await {
             Ok(result) => result,
-            Err(_) => Err(timed_out(call, self.timeout)),
+            Err(_) => Err(timed_out(call.name(), self.timeout)),
         }
     }
 }
@@ -121,37 +148,38 @@ impl BlockchainInterface for Bounded {
     }
 
     async fn status(&self) -> Result<(), ChainGangError> {
-        self.bound("status", self.inner.status()).await
+        self.bound(Call::Status, self.inner.status()).await
     }
 
     async fn get_balance(&self, address: &str) -> Result<Balance, ChainGangError> {
-        self.bound("get_balance", self.inner.get_balance(address))
+        self.bound(Call::GetBalance, self.inner.get_balance(address))
             .await
     }
 
     async fn get_utxo(&self, address: &str) -> Result<Utxo, ChainGangError> {
-        self.bound("get_utxo", self.inner.get_utxo(address)).await
+        self.bound(Call::GetUtxo, self.inner.get_utxo(address))
+            .await
     }
 
     async fn broadcast_tx(&self, tx: &Tx) -> Result<String, ChainGangError> {
-        self.bound("broadcast_tx", self.inner.broadcast_tx(tx))
+        self.bound(Call::BroadcastTx, self.inner.broadcast_tx(tx))
             .await
     }
 
     async fn get_tx(&self, txid: &str) -> Result<Tx, ChainGangError> {
-        self.bound("get_tx", self.inner.get_tx(txid)).await
+        self.bound(Call::GetTx, self.inner.get_tx(txid)).await
     }
 
     async fn get_latest_block_header(&self) -> Result<BlockHeader, ChainGangError> {
         self.bound(
-            "get_latest_block_header",
+            Call::GetLatestBlockHeader,
             self.inner.get_latest_block_header(),
         )
         .await
     }
 
     async fn get_block_headers(&self) -> Result<String, ChainGangError> {
-        self.bound("get_block_headers", self.inner.get_block_headers())
+        self.bound(Call::GetBlockHeaders, self.inner.get_block_headers())
             .await
     }
 }
