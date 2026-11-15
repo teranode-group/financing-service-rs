@@ -96,7 +96,7 @@ To start the Docker container:
 ```
 This will provide a REST API at http://localhost:8080, on the host's loopback only. Set `FS_PUBLISH_ADDRESS` (for example `FS_PUBLISH_ADDRESS=0.0.0.0 ./run.sh`) to publish it more widely — and put the funding endpoints behind something that authenticates when you do.
 
-`run.sh` mounts `./data` as the data directory and runs the container as you, so it can write the dynamic config file there. It mounts nothing else from the host. Elsewhere, give the image a volume at `/app/bin/data` that uid 10001 can write, or run it with `--user` as `run.sh` does.
+`run.sh` gives `docker stop` 150s (`FS_STOP_TIMEOUT`) before it kills the container, so a funding in progress can finish (CS-739). It mounts `./data` as the data directory and runs the container as you, so it can write the dynamic config file there. It mounts nothing else from the host. Elsewhere, give the image a volume at `/app/bin/data` that uid 10001 can write, or run it with `--user` as `run.sh` does.
 
 
 ## To Build the Service
