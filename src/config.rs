@@ -57,6 +57,10 @@ pub struct BlockchainInterfaceConfig {
 /// The per-call deadline when `timeout_seconds` is unset (CS-502).
 pub const DEFAULT_INTERFACE_TIMEOUT_SECONDS: u64 = 30;
 
+/// What the shutdown grace adds to the worst-case fund (CS-719): the commit
+/// and the in-flight state's write after the broadcast answers.
+pub const SHUTDOWN_MARGIN: Duration = Duration::from_secs(5);
+
 fn default_rpc_import_addresses() -> bool {
     true
 }
@@ -254,6 +258,22 @@ impl ServiceConfig {
             .ready_max_chain_read_age_seconds
             .unwrap_or_else(|| (self.utxo_refresh_period.saturating_mul(3)).max(60));
         (seconds > 0).then(|| std::time::Duration::from_secs(seconds))
+    }
+
+    /// `utxo_refresh_period` must be at least 1 (CS-723). `0` was accepted,
+    /// and `tokio::time::interval` panics on a zero period inside the task
+    /// that runs the periodic sweep, which stopped the sweep and the
+    /// fee-quote refresh without a word.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.utxo_refresh_period == 0 {
+            return Err(
+                "service.utxo_refresh_period is 0: it must be at least 1 second. To refresh \
+                 chain state on every request, set service.chain_state_max_age_seconds = 0 \
+                 instead"
+                    .to_string(),
+            );
+        }
+        Ok(())
     }
 }
 
@@ -857,6 +877,16 @@ impl Config {
         Some(read * 3 + broadcast)
     }
 
+    /// How long, after SIGTERM or SIGINT, the server waits for the requests
+    /// in flight before it drops them (CS-719): the longest a `POST /fund`
+    /// can take, plus [`SHUTDOWN_MARGIN`], so a deploy does not cut a funding
+    /// off mid-broadcast. actix's own default, 30s, is shorter than one.
+    /// `None` when chain reads have no deadline, so nothing bounds a fund,
+    /// and actix's default applies.
+    pub fn shutdown_grace(&self) -> Option<Duration> {
+        Some(self.fund_worst_case()? + SHUTDOWN_MARGIN)
+    }
+
     /// On mainnet and testnet, `[mapi_lite]` must name the keys its answers
     /// are signed with (CS-624). Unpinned, a forged "accepted" spends real or
     /// shared coins on a transaction that never left; elsewhere it is still
@@ -1039,6 +1069,7 @@ pub fn load_config(path: &str) -> Result<Config, String> {
     config.fees.validate()?;
     config.dynamic_config.validate()?;
     config.funding_limits.validate()?;
+    config.service.validate()?;
     config.check_auth_policy()?;
     config.check_chain_reads()?;
     if let Some(mapi_lite) = &config.mapi_lite {
@@ -1646,6 +1677,18 @@ filename = "./data/dynamic.toml"
     }
 
     #[test]
+    fn cs_723_a_zero_refresh_period_is_refused() {
+        let service = |period| ServiceConfig {
+            utxo_refresh_period: period,
+            ..ServiceConfig::default()
+        };
+        let error = service(0).validate().unwrap_err();
+        assert!(error.contains("utxo_refresh_period"), "{error}");
+        assert!(service(1).validate().is_ok());
+        assert!(service(60).validate().is_ok());
+    }
+
+    #[test]
     fn sr_cfg_007_load_config_validates_telemetry_config() {
         let _env = env_lock();
         let dir = std::env::temp_dir().join(format!(
@@ -1959,6 +2002,20 @@ filename = "./data/dynamic.toml"
 
     /// What `GET /status` publishes: three chain reads and the broadcast, or
     /// nothing when chain reads have no deadline (CS-624).
+    #[test]
+    fn cs_719_the_shutdown_grace_outlasts_the_worst_case_fund() {
+        let mut config: Config = toml::from_str(MINIMAL_TOML).unwrap();
+        config.mapi_lite = Some(MapiLiteConfig::for_base_url("http://mapi"));
+        // 135s with mapi-lite at the defaults, against actix's 30s.
+        assert_eq!(
+            config.shutdown_grace(),
+            Some(Duration::from_secs(3 * 30 + 45 + 5))
+        );
+        assert!(config.shutdown_grace() > config.fund_worst_case());
+        config.blockchain_interface.timeout_seconds = Some(0);
+        assert_eq!(config.shutdown_grace(), None, "nothing bounds a fund");
+    }
+
     #[test]
     fn sr_cfg_011_the_fund_worst_case_is_three_reads_and_the_broadcast() {
         let mut config: Config = toml::from_str(MINIMAL_TOML).unwrap();

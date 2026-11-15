@@ -198,15 +198,16 @@ pub async fn readiness(service: &Service, log_failures: bool) -> HealthResponse 
             Some(CheckResult::failed("mapi-lite probe failed"))
         }
     };
-    // Its detail is an age and a client id, which a caller of /status can
-    // already see; nothing in it names an upstream.
+    // Its detail is an age, and nothing in it names an upstream. The client
+    // it concerns is logged, not answered: /ready is unauthenticated, and a
+    // client id there tells anyone which clients exist (CS-723, CS-661).
     let chain = match service.chain_readiness().await {
         Ok(()) => CheckResult::passed(),
-        Err(detail) => {
+        Err(not_ready) => {
             if log_failures {
-                log::warn!("chain readiness failed: {detail}");
+                log::warn!("chain readiness failed: {}", not_ready.detail);
             }
-            CheckResult::failed(detail)
+            CheckResult::failed(not_ready.public)
         }
     };
     HealthResponse::from_checks(mapi_lite, Some(chain))
@@ -692,7 +693,21 @@ pub async fn add_client(
     }
 
     match data.service.add_client(&client_config).await {
-        Ok(()) => json_ok(&SuccessResponse::new()),
+        Ok(()) => {
+            // Read now rather than at the next sweep (CS-723): a client never
+            // read fails readiness for the whole service, so every POST
+            // /client took the service out of rotation for up to a refresh
+            // period. In the background, so the answer does not wait on the
+            // chain; a failed read is counted and retried by the sweep.
+            let service = Arc::clone(&data.service);
+            let client_id = client_id.clone();
+            actix_web::rt::spawn(async move {
+                if let Err(e) = Service::refresh_client_chain_state(&service, &client_id).await {
+                    log::warn!("first chain read of new client {client_id} failed: {e}");
+                }
+            });
+            json_ok(&SuccessResponse::new())
+        }
         Err(error) => coded_error_response(error),
     }
 }
@@ -1147,6 +1162,63 @@ mod tests {
         assert_eq!(body, json!({ "status": "ok", "chain": { "ok": true } }));
     }
 
+    /// CS-722: with a chain source that accepts and never answers, the
+    /// service is built and `/health` answers at once, while `GET /ready`
+    /// says the chain has not been read. The status probe and the first
+    /// reads, each bounded at `timeout_seconds` (30s here), used to run
+    /// before the server bound, one client after another.
+    #[actix_web::test]
+    async fn cs_722_health_answers_at_once_while_the_chain_source_never_does() {
+        // Accepts every connection and never writes a byte.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let blackhole = tokio::spawn(async move {
+            let mut held = Vec::new();
+            loop {
+                if let Ok((socket, _)) = listener.accept().await {
+                    held.push(socket);
+                }
+            }
+        });
+
+        let mut config = test_config(&unique_dynamic_config_path());
+        config.blockchain_interface.interface_type = "uaas".to_string();
+        config.blockchain_interface.url = Some(format!("http://{address}"));
+        let started = std::time::Instant::now();
+        let service = Arc::new(
+            tokio::time::timeout(std::time::Duration::from_secs(5), Service::new(&config))
+                .await
+                .expect("startup waited on the chain source")
+                .expect("builds"),
+        );
+        actix_web::rt::spawn({
+            let service = Arc::clone(&service);
+            async move { Service::start_chain(&service).await }
+        });
+        let app = test::init_service(
+            App::new()
+                .app_data(web::Data::new(AppState::new(Arc::clone(&service))))
+                .service(health)
+                .service(ready),
+        )
+        .await;
+
+        let health_check =
+            test::call_service(&app, test::TestRequest::get().uri("/health").to_request()).await;
+        assert_eq!(health_check.status(), StatusCode::OK);
+        let readiness =
+            test::call_service(&app, test::TestRequest::get().uri("/ready").to_request()).await;
+        assert_eq!(readiness.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body: Value = test::read_body_json(readiness).await;
+        assert_eq!(body["chain"]["ok"], false, "{body}");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "{:?}",
+            started.elapsed()
+        );
+        blackhole.abort();
+    }
+
     /// SR-BCHN-017: chain reads older than the bound take the service out of
     /// rotation -- with `[mapi_lite]` it would otherwise go on funding from an
     /// ever older cache -- and liveness is untouched (SR-BCHN-004).
@@ -1164,14 +1236,50 @@ mod tests {
         let body: Value = test::read_body_json(resp).await;
         assert_eq!(body["status"], "unhealthy");
         assert_eq!(body["chain"]["ok"], false);
-        assert!(body["chain"]["detail"]
-            .as_str()
-            .unwrap()
-            .contains("last read"));
+        let detail = body["chain"]["detail"].as_str().unwrap();
+        assert!(detail.contains("last read"), "{detail}");
+        // Unauthenticated, so it says a client, not which (CS-723, CS-661).
+        assert!(detail.contains("a client's"), "{detail}");
+        assert!(!detail.contains(TEST_CLIENT_ID), "{detail}");
 
         let resp =
             test::call_service(&app, test::TestRequest::get().uri("/health").to_request()).await;
         assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    /// CS-723: a client added at runtime is read at once, rather than at the
+    /// next sweep. Never read, it failed readiness for the whole service, so
+    /// every `POST /client` took the service out of rotation for up to a
+    /// refresh period.
+    #[actix_web::test]
+    async fn cs_723_a_client_added_at_runtime_is_read_at_once() {
+        unsafe { std::env::set_var("FS_RUNTIME_WIF_TEST_CS_723", OTHER_TEST_WIF) };
+        let config = test_config(&unique_dynamic_config_path());
+        let (app, service) = build_app_with_service(config).await;
+        assert_eq!(service.chain_readiness().await, Ok(()));
+
+        let resp = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri("/client")
+                .set_json(json!({
+                    "client_id": "client_cs_723",
+                    "wif_env": "FS_RUNTIME_WIF_TEST_CS_723",
+                }))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let started = std::time::Instant::now();
+        while service.chain_readiness().await.is_err() {
+            assert!(
+                started.elapsed() < std::time::Duration::from_secs(5),
+                "the new client was not read: {:?}",
+                service.chain_readiness().await
+            );
+            actix_web::rt::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
     }
 
     #[actix_web::test]

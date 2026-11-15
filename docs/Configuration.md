@@ -138,6 +138,8 @@ Note that `GET /health` stays `ok` throughout: it is a liveness check and delibe
 
 **An unreachable blockchain interface at startup is a warning, not a fatal error** (CS-505). It used to stop the service — on a single WhatsOnChain 429 — and the restart that followed met the same rate limit. Now the service starts degraded, logs `Unable to reach the blockchain interface at startup`, and `GET /ready` answers 503 until the first chain read succeeds; `/health` and `/status` serve throughout.
 
+**The server listens before the chain is read** (CS-722). The startup status probe, the node's address watch (`rpc`) and the first read of every client's chain state run behind the server, not in front of it. Each is bounded by `timeout_seconds`, and they used to run one after another before the server bound: with a chain source that accepted connections and never answered, and three clients, `/health` was unreachable for over two minutes, longer than the container health check allows, so the orchestrator restarted the service into the same wait. Now `/health` answers at once. A funding request that arrives before its client's first read waits for that read, as it would for any stale state. The mapi-lite probe still runs before the server binds, since a network mismatch or a refused token stops startup.
+
 **`test` is a fixture, not a backend.** It is an in-process stub used by the unit tests, with a UTXO set injected directly by the test harness. It has no network of its own, so the `network` you set alongside it only affects address encoding. It will start and serve requests as a configured backend, but its UTXO set is empty, so balances read zero and funding is refused — useful for exercising the API surface, not for funding anything.
 
 ### Every interface call has a deadline
@@ -157,7 +159,7 @@ It bounds a whole call, and WhatsOnChain's UTXO listing is one call made of seve
 Most keys have defaults, and most sections can be left out. These cannot, and the service refuses to start without them:
 
 * `blockchain_interface.interface_type` and `blockchain_interface.network`
-* `service.utxo_refresh_period`
+* `service.utxo_refresh_period`, at least 1 (CS-723: `0` used to stop the periodic sweep silently; to refresh on every request, set `service.chain_state_max_age_seconds = 0`)
 * `dynamic_config.filename`
 
 Within an optional section, `mapi_lite.base_url` is required when `[mapi_lite]` is present, and `client_id` and `wif_key` in each `[[client]]`.
@@ -354,9 +356,15 @@ After a restart the service now picks up where it stopped: inputs it spent stay 
 
 The ten-minute window is backed by the chain itself, from chain-gang 0.11.5. WhatsOnChain goes on listing an output after a mempool transaction spends it, flagged `isSpentInMempoolTx`; earlier chain-gang releases ignored the flag and reported such outputs as unspent, so a transaction still unconfirmed when its reservation ran out would have had its input offered again. Now the read interface drops them, the way a node's own `listunspent` does, and the reservation is a guard against the read interface lagging rather than the only thing standing between an input and a second spend.
 
+**What else the file holds** (CS-723). Besides reservations and pending change, it keeps which transactions were handed to callers and which of the service's own change each one spent. Without them, a restarted service could offer own change it had already spent once a lagging read source listed it again. The file is written readable by its owner alone (`0600`), whatever the umask, and its directory is flushed after each write, so a crash cannot undo the rename. A file an earlier version wrote, without the new records, still reads.
+
 **Commits share writes** (CS-495). Each write serialises and flushes the whole state, so writing once per commit capped a busy client at the rate one write takes — and that rate falls as the state grows, which it does through each refresh window under load. Commits that finish while a write is in progress now wait for the next one, which covers them all, so a burst costs one write rather than one per request. Every request is still answered only after a write that includes it. The file is written compact rather than pretty-printed; `jq . dynamic.inflight.json` reads it.
 
-One window remains: the moment between a broadcast succeeding and the state reaching disk. A process killed in that moment can still lose it. A clean restart, or a crash at any other time, does not.
+**Claims reach disk before the broadcast** (CS-719). A funding's inputs are written as reservations when it claims them, before its transaction is sent, not only once the broadcast has settled. A process stopped mid-broadcast, by a deploy, a `docker stop` or a crash, runs neither the commit nor the uncertain-outcome reservation, and used to lose the claim with it: after the restart the input could be selected again while its spend sat in a node's mempool. Now the restored reservation withholds it, as an uncertain outcome's does, until the chain catches up or the ten-minute window ends. A release after a definite refusal writes the file again, so its inputs are not withheld for nothing.
+
+**Shutdown waits for a funding to finish** (CS-719). On SIGTERM or SIGINT the server stops taking requests and gives those in flight `fund_worst_case_seconds` plus 5s to finish, the longest a `POST /fund` can take: 140s with `[mapi_lite]` at the defaults, 125s without. actix's own 30s was shorter than one. Give the orchestrator at least as long before it kills the process, for example `stop_grace_period` in compose (10s by default) or `terminationGracePeriodSeconds` in Kubernetes (30s). A shorter one is safe since the claims are on disk, but cuts fundings off as unknown outcomes that would have finished. With `timeout_seconds = 0` nothing bounds a fund, and actix's 30s applies, with a warning at startup.
+
+One window remains: the moment between a broadcast succeeding and the commit reaching disk. A process killed in that moment keeps the inputs reserved, but not the change the transaction created, until the chain lists it.
 
 ### How often the service reads the chain
 
@@ -366,7 +374,7 @@ So a request reuses the cached state while it is younger than `chain_state_max_a
 
 **The trade is staleness.** Widening the window widens the period in which the service can build a funding transaction against a view of the chain that has moved on. It is narrower than it looks: the service applies its own spends to the cache as it makes them, so this only matters if something *outside* the service spends from the same client key — another service sharing the WIF, or an operator moving funds by hand. If that is your deployment, lower it. `0` refreshes on every request, which is what the service did before this existed.
 
-There is a backstop either way. A broadcast the upstream refuses — which is how a conflicting input shows up — marks the cached state stale, so the attempt after it works from a fresh read. Building on a stale view therefore costs one refused transaction, not a run of them.
+There is a backstop either way. A broadcast the upstream refuses — which is how a conflicting input shows up — marks the cached state stale, so the attempt after it works from a fresh read. A read already in flight when the refusal lands does not count as that fresh read: its answer predates the refusal, so it is applied but left stale, and the next attempt reads again (CS-721). Building on a stale view therefore costs one refused transaction, not a run of them.
 
 Requests that find the same client's state stale at the same moment **share one refresh**: the first fetches, and the rest wait for that answer rather than each fetching it again behind the rate limit. The periodic refresh leaves a client alone while a request is refreshing it.
 
