@@ -79,29 +79,44 @@ impl TxBroadcaster for WocBroadcaster {
     }
 }
 
+/// SV Node's reject codes: the P2P ones in `consensus/validation.h`
+/// (`REJECT_MALFORMED` to `REJECT_RATE_EXCEEDED`) and the internal ones in
+/// `validation.h` (`REJECT_HIGHFEE` to `REJECT_MEMPOOL_FULL`). The node words
+/// a refusal `<code>: <reason>`.
+const NODE_REJECT_CODES: [u32; 15] = [
+    1, 16, 17, 18, 19, 64, 65, 66, 67, 68, 69, 256, 257, 258, 259,
+];
+
 /// Whether chain-gang's `response.status() = <status>: <body>` has a body
-/// naming a node's reject code: a number followed by `: `, as in
-/// `258: txn-mempool-conflict` or WhatsOnChain's `unexpected response code
-/// 500: 16: missing-inputs`. The status (`400 Bad Request`) never holds `: `,
-/// so the body is what follows the first one.
+/// naming a node's reject code: one of [`NODE_REJECT_CODES`] followed by
+/// `: `, as in `258: txn-mempool-conflict` or WhatsOnChain's `unexpected
+/// response code 500: 16: missing-inputs`. Any other number is not the
+/// node's: a body echoing the HTTP status (`400: Bad Request`, aiohttp's
+/// default) names no reason (#172 review). The status (`400 Bad Request`)
+/// never holds `: `, so the body is what follows the first one.
 fn refusal_names_a_reject_code(text: &str) -> bool {
     let Some((_, status_and_body)) = text.split_once("response.status() = ") else {
         return false;
     };
-    let Some((_, body)) = status_and_body.split_once(": ") else {
+    let Some((_, mut rest)) = status_and_body.split_once(": ") else {
         return false;
     };
-    let body = body.as_bytes();
-    (0..body.len()).any(|start| {
-        let starts_number =
-            body[start].is_ascii_digit() && (start == 0 || !body[start - 1].is_ascii_digit());
-        let end = start
-            + body[start..]
-                .iter()
-                .take_while(|b| b.is_ascii_digit())
-                .count();
-        starts_number && body[end..].starts_with(b": ")
-    })
+    while let Some(start) = rest.find(|c: char| c.is_ascii_digit()) {
+        let digits = &rest[start..];
+        let len = digits
+            .find(|c: char| !c.is_ascii_digit())
+            .unwrap_or(digits.len());
+        let (number, after) = digits.split_at(len);
+        if after.starts_with(": ")
+            && number
+                .parse()
+                .is_ok_and(|code: u32| NODE_REJECT_CODES.contains(&code))
+        {
+            return true;
+        }
+        rest = after;
+    }
+    false
 }
 
 /// Whether a failed broadcast may still have reached the network (CS-718).
@@ -389,7 +404,8 @@ mod tests {
     /// is decided per refusal. One whose body names a reject code is read;
     /// one with an empty body, or an error page naming none, says nothing, so
     /// the service treats it as one that may have been a conflict and holds
-    /// the own change it claimed, as before chain-gang 0.13.2.
+    /// the own change it claimed, as before chain-gang 0.13.2. A body echoing
+    /// the HTTP status (`400: Bad Request`) names no reject code either.
     #[tokio::test]
     async fn cs_701_a_refusal_with_no_reject_code_is_not_read() {
         for (body, read) in [
@@ -397,6 +413,9 @@ mod tests {
             ("unexpected response code 500: 16: missing-inputs", true),
             ("", false),
             ("<html><body>Bad request</body></html>", false),
+            ("400: Bad Request", false),
+            ("404: Not Found", false),
+            ("Error 400: Bad Request", false),
         ] {
             let (_s, broadcaster) =
                 uaas_answering(wiremock::ResponseTemplate::new(400).set_body_string(body)).await;
@@ -408,6 +427,24 @@ mod tests {
                 "{body:?}: {error}"
             );
         }
+    }
+
+    /// #172 review: only SV Node's own reject codes are read; a number next
+    /// to one, or an HTTP status, is not.
+    #[test]
+    fn only_the_nodes_reject_codes_are_read() {
+        let refusal = |body: &str| format!("response.status() = 400 Bad Request: {body}");
+        for code in NODE_REJECT_CODES {
+            let body = format!("{code}: reason");
+            assert!(refusal_names_a_reject_code(&refusal(&body)), "{body}");
+        }
+        for code in [0, 2, 15, 20, 63, 70, 255, 260, 400, 404, 500, 503] {
+            let body = format!("{code}: reason");
+            assert!(!refusal_names_a_reject_code(&refusal(&body)), "{body}");
+        }
+        assert!(!refusal_names_a_reject_code(&refusal(
+            "99999999999999999999999: reason"
+        )));
     }
 
     /// #172 review: a refusal saying the node already has the transaction
