@@ -197,11 +197,30 @@ pub struct ClientConfig {
     pub api_key: Option<String>,
 }
 
+/// `[telemetry] traces_exporter`: whether spans are exported (CS-700), as
+/// mapi-lite (CS-698) and Event (CS-699) spell it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TelemetryExporter {
+    /// Off, as when the field is left out.
+    #[default]
+    None,
+    /// OTLP over gRPC.
+    Otlp,
+}
+
 /// OpenTelemetry trace export configuration.
 #[derive(Debug, Default, Deserialize, Clone)]
 pub struct TelemetryConfig {
+    /// Turns on traces and metrics together. Kept for existing deployments;
+    /// `traces_exporter` is the switch for traces alone.
     #[serde(default)]
     pub enabled: bool,
+    /// Span export, a switch of its own (CS-700): `"otlp"` or `"none"` (the
+    /// default). `OTEL_TRACES_EXPORTER`, when set, overrides it -- and
+    /// `enabled` too, as far as traces go. Metrics keep their own switches.
+    #[serde(default)]
+    pub traces_exporter: TelemetryExporter,
     #[serde(default)]
     pub service_name: Option<String>,
     #[serde(default)]
@@ -1766,6 +1785,10 @@ filename = "./data/dynamic.toml"
             load_config(path).unwrap()
         });
         assert_eq!(config.telemetry.export_interval_sec, Some(30));
+        assert_eq!(
+            config.telemetry.traces_exporter,
+            crate::config::TelemetryExporter::None
+        );
 
         let err = with_env(&[("FS__TELEMETRY__EXPORT_INTERVAL_SEC", "0")], || {
             load_config(path).unwrap_err()
@@ -1778,6 +1801,34 @@ filename = "./data/dynamic.toml"
         );
         let err = with_env(&[], || load_config(misspelt.to_str().unwrap()).unwrap_err());
         assert!(err.contains("telemetry.export_interval_secs"), "{err}");
+    }
+
+    /// `traces_exporter` reads `"otlp"` and `"none"`, `FS__` overrides it as
+    /// any key, and anything else is refused rather than read as off.
+    #[test]
+    fn sr_tele_014_telemetry_reads_traces_exporter() {
+        use crate::config::TelemetryExporter;
+
+        let on = write_temp_config(
+            "telemetry-traces-on",
+            &format!("{MINIMAL_TOML}\n[telemetry]\ntraces_exporter = \"otlp\"\n"),
+        );
+        let on = on.to_str().unwrap();
+        let config = with_env(&[], || load_config(on).unwrap());
+        assert_eq!(config.telemetry.traces_exporter, TelemetryExporter::Otlp);
+        assert!(!config.telemetry.enabled, "traces_exporter is not enabled");
+
+        let config = with_env(&[("FS__TELEMETRY__TRACES_EXPORTER", "none")], || {
+            load_config(on).unwrap()
+        });
+        assert_eq!(config.telemetry.traces_exporter, TelemetryExporter::None);
+
+        let wrong = write_temp_config(
+            "telemetry-traces-wrong",
+            &format!("{MINIMAL_TOML}\n[telemetry]\ntraces_exporter = \"jaeger\"\n"),
+        );
+        let err = with_env(&[], || load_config(wrong.to_str().unwrap()).unwrap_err());
+        assert!(err.contains("jaeger"), "{err}");
     }
 
     /// The smallest config the service accepts, for the [mapi_lite] tests to

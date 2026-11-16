@@ -30,6 +30,7 @@ opentelemetry-otlp = { version = "0.32", features = ["grpc-tonic", "trace", "met
 opentelemetry_sdk = { version = "0.32", features = ["trace", "metrics", "rt-tokio"] }
 tracing-actix-web = { version = "0.7", features = ["opentelemetry_0_32"] }
 tracing-log = "0.2"
+tracing = "0.1"
 tracing-opentelemetry = "0.33"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 actix-governor = "0.10.0"
@@ -40,15 +41,24 @@ actix-governor = "0.10.0"
 # pins (cargo needs the ssh:// URL form, and .cargo/config.toml hands the fetch
 # to the system git). They MUST name the same rev, and that rev's chain-gang
 # requirement must be satisfiable by the chain-gang line above, or the graph
-# carries two chain-gangs and their types stop unifying. This is the commit
-# mapi-lite tagged v0.9.0, on chain-gang 0.13 -- pinned by rev, which unlike a
-# tag cannot move. v0.6.0 publishes the nodes' network in /ready (CS-624);
+# carries two chain-gangs and their types stop unifying. This is a commit on
+# mapi-rs master after v0.10.0, on chain-gang 0.13 -- pinned by rev, which
+# unlike a tag cannot move -- taken for CS-698: every request uls-client sends
+# carries the current span's `traceparent`. No tag holds that change yet; repin
+# to the next tag once there is one. v0.6.0 publishes the nodes' network in /ready (CS-624);
 # v0.6.1 reports a 4xx after a landed attempt as an unknown outcome (CS-637);
 # v0.7.0 reports unmined and stuck transactions, server-side (CS-640, CS-641);
-# v0.9.0 refuses a transaction paying less than its fee quote (CS-643).
+# v0.9.0 refuses a transaction paying less than its fee quote (CS-643);
+# v0.10.0 adds mapi-lite's [telemetry] table (CS-671, CS-673).
+# uls-client finds the caller's span through tracing-opentelemetry, matching
+# the layer by type, so tracing-opentelemetry and opentelemetry above MUST stay
+# on the versions uls-client uses (0.33 and 0.32). Otherwise no traceparent is
+# sent and nothing fails;
+# broadcaster::mapi::tests::cs_700_uls_client_sees_this_services_spans
+# is what catches it.
 # See docs/Dependencies.md before changing it.
-uls-client = { git = "ssh://git@github.com/teranode-group/mapi-rs.git", rev = "59332eead81d82b1e55afea6e4e2b18f670f8414" }
-uls-core = { git = "ssh://git@github.com/teranode-group/mapi-rs.git", rev = "59332eead81d82b1e55afea6e4e2b18f670f8414" }
+uls-client = { git = "ssh://git@github.com/teranode-group/mapi-rs.git", rev = "ffb96ff8056efd922e819f494b24306087ea1e3a" }
+uls-core = { git = "ssh://git@github.com/teranode-group/mapi-rs.git", rev = "ffb96ff8056efd922e819f494b24306087ea1e3a" }
 # For the HTTP client the mapi-lite chain reader (mapi_lite_interface) hands
 # uls-client; the broadcaster uses uls-client's own timeouts (v0.5.0). Same
 # major.minor as mapi-lite's so one reqwest resolves; its TLS backend is

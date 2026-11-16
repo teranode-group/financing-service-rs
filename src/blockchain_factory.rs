@@ -10,6 +10,7 @@ use crate::config::Config;
 use crate::interface_timeout::{Bounded, Scope};
 use crate::mapi_lite_interface::MapiLiteInterface;
 use crate::outbound_rate_limit::RateLimited;
+use crate::traced_interface::Traced;
 
 /// A configured backend, plus the means to tell it which addresses to watch
 /// when it needs telling.
@@ -39,7 +40,22 @@ pub(crate) fn paces_its_own_requests(interface_type: &str) -> bool {
 }
 
 /// Takes a config and returns the appropriate configured object that implements BlockchainInterface
+///
+/// Traced outermost (CS-700), so a call's span covers all of what its caller
+/// waits for: the pacing slot, the deadline, the call itself.
 pub fn blockchain_factory(config: &Config) -> Result<Backend, String> {
+    let backend = bounded_backend(config)?;
+    Ok(Backend {
+        interface: Arc::new(Traced::new(
+            backend.interface,
+            &config.blockchain_interface.interface_type,
+        )),
+        address_watcher: backend.address_watcher,
+    })
+}
+
+/// The paced backend with each call's deadline on.
+fn bounded_backend(config: &Config) -> Result<Backend, String> {
     let timeout = config.blockchain_interface.call_timeout();
     let (backend, paced_here) = paced_backend(config, timeout)?;
     // Outermost, so the deadline covers a read's wait for a pacing slot as
