@@ -1276,7 +1276,8 @@ impl Service {
                 parent: &parent,
                 "chain refresh",
                 otel.name = "chain refresh",
-                otel.status_code = tracing::field::Empty,
+                otel.status_description = tracing::field::Empty,
+                error.type = tracing::field::Empty,
             )
         };
         let refresh = async move {
@@ -1297,7 +1298,12 @@ impl Service {
                 // Already recorded as a chain failure. The request this was
                 // started for has been funded from the cache, so there is
                 // nobody to return it to.
-                tracing::Span::current().record("otel.status_code", "ERROR");
+                // Its chain reads say why; this says the refresh failed.
+                crate::telemetry::mark_error(
+                    &tracing::Span::current(),
+                    "refresh_failed",
+                    "the background chain refresh failed",
+                );
                 log::warn!("background refresh_client_chain_state failed: {e}");
             }
         };

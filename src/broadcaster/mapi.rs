@@ -44,7 +44,6 @@ use std::time::Duration;
 use async_trait::async_trait;
 use chain_gang::messages::Tx;
 use chain_gang::util::Serializable;
-use tracing::Instrument as _;
 use uls_client::{Broadcast, BroadcastOptions, ClientError, MapiClient};
 use uls_core::wire::FeeAmount;
 
@@ -52,7 +51,7 @@ use super::{BroadcastError, TxBroadcaster, MAPI_LITE};
 use crate::config::{
     MapiLiteConfig, SubmitBudget, MAPI_LITE_PROBE_TIMEOUT, RETRY_BACKOFF_BASE, RETRY_BACKOFF_CAP,
 };
-use crate::telemetry::{MAPI_RS_PEER_SERVICE, SPAN_TARGET};
+use crate::telemetry::{in_span, SpanError, MAPI_RS_PEER_SERVICE, SPAN_TARGET};
 
 /// Hands transactions to a mapi-lite server.
 pub struct MapiBroadcaster {
@@ -417,6 +416,38 @@ impl MapiBroadcaster {
     }
 }
 
+/// A broadcast's error, as its span describes it: the kind, which is what
+/// the caller acts on, never the detail, which can carry a txid.
+impl SpanError for BroadcastError {
+    fn error_type(&self) -> &'static str {
+        match self {
+            BroadcastError::Rejected { .. } => "rejected",
+            BroadcastError::Upstream(_) => "upstream",
+            BroadcastError::Indeterminate(_) => "indeterminate",
+            BroadcastError::Untrusted(_) => "untrusted",
+            BroadcastError::NotSent(_) => "not_sent",
+        }
+    }
+
+    fn description(&self) -> &'static str {
+        match self {
+            BroadcastError::Rejected { .. } => "mapi-rs refused the transaction",
+            BroadcastError::Upstream(_) => {
+                "mapi-rs could not be reached or did not answer usably; the transaction was not sent"
+            }
+            BroadcastError::Indeterminate(_) => {
+                "the transaction was handed over and its outcome is unknown"
+            }
+            BroadcastError::Untrusted(_) => {
+                "not sent: mapi-rs signs with a key miner_id_public_keys does not list"
+            }
+            BroadcastError::NotSent(_) => {
+                "not sent: the wait for a rate-limit slot would pass the deadline"
+            }
+        }
+    }
+}
+
 impl From<ClientError> for BroadcastError {
     /// Split a client error by what it says about the transaction, not by how
     /// bad it looks.
@@ -453,7 +484,9 @@ impl TxBroadcaster for MapiBroadcaster {
     /// the trace shows the time the broadcast took apart from the chain
     /// reads. uls-client sends the span's `traceparent` with each attempt, so
     /// mapi-lite's spans for `POST /mapi/txs` join the same trace. A failed
-    /// broadcast, an unknown outcome among them, is marked an error.
+    /// broadcast, an unknown outcome among them, is marked an error, with
+    /// `error.type` naming the kind (`rejected`, `upstream`, `indeterminate`,
+    /// ...), and so is one dropped before it finished (`cancelled`).
     ///
     /// The span is named after the callee's deployed `service.name`,
     /// `mapi-rs`, and carries it as `peer.service`, so Tempo's service graph
@@ -464,16 +497,13 @@ impl TxBroadcaster for MapiBroadcaster {
             "mapi-rs broadcast",
             otel.name = "mapi-rs broadcast",
             otel.kind = "client",
-            otel.status_code = tracing::field::Empty,
+            otel.status_description = tracing::field::Empty,
+            error.type = tracing::field::Empty,
             peer.service = MAPI_RS_PEER_SERVICE,
             http.request.method = "POST",
             url.template = "/mapi/txs",
         );
-        let result = self.submit_tx(tx).instrument(span.clone()).await;
-        if result.is_err() {
-            span.record("otel.status_code", "ERROR");
-        }
-        result
+        in_span(span, self.submit_tx(tx)).await
     }
 
     /// Asks mapi-lite's `GET /ready` (CS-505).
@@ -583,6 +613,7 @@ mod tests {
     use crate::util::tx_as_hexstr;
     use serde_json::{json, Value};
     use std::time::Instant;
+    use tracing::Instrument as _;
     use uls_core::envelope::EnvelopeSigner;
     use wiremock::matchers::{header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -2046,10 +2077,65 @@ mod tests {
             .iter()
             .find(|s| s.name == "mapi-rs broadcast")
             .unwrap_or_else(|| panic!("no broadcast span: {spans:?}"));
+        // CS-700 review, comment 6: the kind of failure is on the span, so a
+        // refused token reads apart from an unknown outcome.
+        assert_eq!(
+            broadcast.status,
+            opentelemetry::trace::Status::error(
+                "mapi-rs could not be reached or did not answer usably; the transaction was not \
+                 sent"
+            )
+        );
+        let error_type = broadcast
+            .attributes
+            .iter()
+            .find(|kv| kv.key.as_str() == "error.type")
+            .map(|kv| kv.value.as_str().into_owned());
+        assert_eq!(error_type.as_deref(), Some("upstream"));
+    }
+
+    /// CS-700 review, comment 6: a broadcast dropped before it finished --
+    /// its caller gone, or an outer deadline -- is marked an error, not left
+    /// `Unset`.
+    #[tokio::test]
+    async fn sr_tele_016_a_cancelled_broadcast_marks_its_span_an_error() {
+        let server = MockServer::start().await;
+        let tx = sample_tx();
+        let expected = tx.hash().encode();
+        Mock::given(method("POST"))
+            .and(path("/mapi/txs"))
+            .respond_with(
+                ok(txs_payload(success(&expected, "")))
+                    .set_delay(std::time::Duration::from_secs(5)),
+            )
+            .mount(&server)
+            .await;
+        let broadcaster = broadcaster(&server);
+
+        let spans = crate::test_support::traced_spans(async {
+            tokio::time::timeout(
+                std::time::Duration::from_millis(50),
+                broadcaster.broadcast_tx(&tx),
+            )
+            .await
+            .expect_err("still waiting on mapi-rs");
+        })
+        .await;
+
+        let broadcast = spans
+            .iter()
+            .find(|s| s.name == "mapi-rs broadcast")
+            .unwrap_or_else(|| panic!("no broadcast span: {spans:?}"));
         assert!(
             matches!(broadcast.status, opentelemetry::trace::Status::Error { .. }),
             "{:?}",
             broadcast.status
         );
+        let error_type = broadcast
+            .attributes
+            .iter()
+            .find(|kv| kv.key.as_str() == "error.type")
+            .map(|kv| kv.value.as_str().into_owned());
+        assert_eq!(error_type.as_deref(), Some("cancelled"));
     }
 }

@@ -15,7 +15,9 @@
 //! was asked about. A call that goes to mapi-rs (the `mapi_lite` interface)
 //! also carries `peer.service = "mapi-rs"`, the callee's deployed
 //! `service.name`, so Tempo's service graph draws the edge to the mapi-rs
-//! node. A failed call sets `otel.status_code = "ERROR"`.
+//! node. A failed call marks the span an error, with `error.type` and a
+//! description from the kind of failure, never its message; so does a call
+//! dropped before it finished, as `cancelled`.
 //!
 //! The span is entered on every poll of the call, so a client that sends HTTP
 //! through uls-client -- the `mapi_lite` interface -- injects its
@@ -24,14 +26,12 @@
 use std::future::Future;
 use std::sync::Arc;
 
+use crate::telemetry::{in_span, SpanError, MAPI_RS_PEER_SERVICE, SPAN_TARGET};
 use async_trait::async_trait;
 use chain_gang::interface::{Balance, BlockchainInterface, Utxo};
 use chain_gang::messages::{BlockHeader, Tx};
 use chain_gang::network::Network;
 use chain_gang::util::ChainGangError;
-use tracing::Instrument as _;
-
-use crate::telemetry::{MAPI_RS_PEER_SERVICE, SPAN_TARGET};
 
 /// Wraps a blockchain interface and traces each call.
 pub struct Traced {
@@ -68,7 +68,8 @@ impl Traced {
                 "chain",
                 otel.name = name,
                 otel.kind = "client",
-                otel.status_code = tracing::field::Empty,
+                otel.status_description = tracing::field::Empty,
+                error.type = tracing::field::Empty,
                 peer.service = tracing::field::Empty,
                 chain.interface = self.interface,
                 chain.call = call,
@@ -77,11 +78,36 @@ impl Traced {
         if self.interface == MAPI_RS {
             span.record("peer.service", MAPI_RS_PEER_SERVICE);
         }
-        let result = future.instrument(span.clone()).await;
-        if result.is_err() {
-            span.record("otel.status_code", "ERROR");
+        in_span(span, future).await
+    }
+}
+
+/// A chain call's error, as its span describes it.
+impl SpanError for ChainGangError {
+    fn error_type(&self) -> &'static str {
+        match self {
+            ChainGangError::Timeout => "timeout",
+            ChainGangError::ReqwestError(_) | ChainGangError::IoError(_) => "transport",
+            ChainGangError::ResponseError(_) => "response",
+            ChainGangError::SerdeJSONParseError(_)
+            | ChainGangError::JSONParseError(_)
+            | ChainGangError::Utf8Error(_)
+            | ChainGangError::HexError(_)
+            | ChainGangError::BadData(_) => "bad_data",
+            ChainGangError::BadArgument(_) | ChainGangError::URLParseError(_) => "bad_argument",
+            _ => "other",
         }
-        result
+    }
+
+    fn description(&self) -> &'static str {
+        match self.error_type() {
+            "timeout" => "the chain call timed out",
+            "transport" => "the chain backend could not be reached",
+            "response" => "the chain backend answered with an error",
+            "bad_data" => "the chain backend's answer could not be read",
+            "bad_argument" => "the chain call was refused before it was sent",
+            _ => "the chain call failed",
+        }
     }
 }
 
@@ -170,6 +196,7 @@ mod tests {
         test_blockchain_interface, test_config, traced_spans, unique_dynamic_config_path,
         UnreadableBlockchain, TEST_ADDRESS,
     };
+    use tracing::Instrument as _;
 
     /// Each call is a client span named after it, carrying the interface, a
     /// child of the span it was made under; a failed one is marked an error.
@@ -220,10 +247,22 @@ mod tests {
 
         let failed = on("uaas");
         assert_eq!(failed.parent_span_id, parent.span_context.span_id());
+        // CS-700 review, comment 6: the kind of failure, not its message,
+        // which names the address.
+        assert_eq!(
+            failed.status,
+            Status::error("the chain call was refused before it was sent")
+        );
+        assert_eq!(
+            attribute(failed, "error.type").as_deref(),
+            Some("bad_argument")
+        );
         assert!(
-            matches!(failed.status, Status::Error { .. }),
-            "{:?}",
-            failed.status
+            !failed
+                .attributes
+                .iter()
+                .any(|kv| kv.value.as_str().contains(TEST_ADDRESS)),
+            "no address on the span"
         );
     }
 
@@ -297,5 +336,48 @@ mod tests {
         .await;
 
         assert!(spans.is_empty(), "{spans:?}");
+    }
+
+    fn attribute(span: &opentelemetry_sdk::trace::SpanData, key: &str) -> Option<String> {
+        span.attributes
+            .iter()
+            .find(|kv| kv.key.as_str() == key)
+            .map(|kv| kv.value.as_str().into_owned())
+    }
+
+    /// CS-700 review, comment 6: a call dropped before it finished -- here
+    /// by an outer deadline -- is marked an error, not left `Unset`.
+    #[tokio::test]
+    async fn sr_tele_015_a_cancelled_call_is_marked_an_error() {
+        use crate::test_support::GatedBlockchain;
+
+        let config = test_config(&unique_dynamic_config_path());
+        let gated = GatedBlockchain::new(&config).await;
+        let interface = Traced::new(gated.clone(), "woc");
+        gated.close();
+
+        let spans = traced_spans(async {
+            async {
+                let held = interface.get_utxo(TEST_ADDRESS);
+                tokio::time::timeout(std::time::Duration::from_millis(20), held)
+                    .await
+                    .expect_err("held at the gate");
+            }
+            .instrument(tracing::info_span!("request"))
+            .await;
+        })
+        .await;
+        gated.open();
+
+        let read = spans
+            .iter()
+            .find(|s| s.name == "chain get_utxo")
+            .unwrap_or_else(|| panic!("no chain get_utxo span: {spans:?}"));
+        assert!(
+            matches!(read.status, Status::Error { .. }),
+            "{:?}",
+            read.status
+        );
+        assert_eq!(attribute(read, "error.type").as_deref(), Some("cancelled"));
     }
 }
