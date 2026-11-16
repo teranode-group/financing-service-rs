@@ -238,6 +238,31 @@ impl Drop for Unfinished {
 /// the edge to its node. Never `mapi-lite` or `mapi_lite`, which name no
 /// deployed service and would add a node of their own.
 pub const MAPI_RS_PEER_SERVICE: &str = "mapi-rs";
+
+/// A client span for a call this service makes (CS-700): the chain calls and
+/// the broadcast to mapi-rs. Run the call with [`in_span`].
+///
+/// The one place the shape is set: [`SPAN_TARGET`], so the log output leaves
+/// it out; `otel.kind = "client"`; `otel.name` from `$name`, which may be a
+/// `tracing::field::display(format_args!(..))`; and the empty `error.type` and
+/// `otel.status_description` that [`in_span`] fills on failure. The caller
+/// adds its own attributes after the name, among them `peer.service` -- always
+/// a deployed `service.name`, such as [`MAPI_RS_PEER_SERVICE`] -- when the
+/// callee is a service of ours.
+macro_rules! client_span {
+    ($name:expr $(, $($fields:tt)*)?) => {
+        tracing::info_span!(
+            target: $crate::telemetry::SPAN_TARGET,
+            "client",
+            otel.name = $name,
+            otel.kind = "client",
+            otel.status_description = tracing::field::Empty,
+            error.type = tracing::field::Empty,
+            $($($fields)*)?
+        )
+    };
+}
+pub(crate) use client_span;
 const SERVICE_VERSION: &str = "service.version";
 const OTEL_RESOURCE_ATTRIBUTES: &str = "OTEL_RESOURCE_ATTRIBUTES";
 const OTEL_METRIC_EXPORT_INTERVAL: &str = "OTEL_METRIC_EXPORT_INTERVAL";
@@ -1249,12 +1274,7 @@ mod tests {
         tracing::subscriber::with_default(subscriber, || {
             let request = tracing::info_span!("fs_log_test_request", http.method = "POST");
             let _request = request.enter();
-            let broadcast = tracing::info_span!(
-                target: SPAN_TARGET,
-                "mapi-rs broadcast",
-                otel.name = "mapi-rs broadcast",
-                peer.service = MAPI_RS_PEER_SERVICE,
-            );
+            let broadcast = client_span!("mapi-rs broadcast", peer.service = MAPI_RS_PEER_SERVICE);
             let _broadcast = broadcast.enter();
             tracing::warn!("fs log test: mapi-lite answered 503");
         });

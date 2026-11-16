@@ -26,7 +26,7 @@
 use std::future::Future;
 use std::sync::Arc;
 
-use crate::telemetry::{in_span, SpanError, MAPI_RS_PEER_SERVICE, SPAN_TARGET};
+use crate::telemetry::{client_span, in_span, SpanError, MAPI_RS_PEER_SERVICE};
 use async_trait::async_trait;
 use chain_gang::interface::{Balance, BlockchainInterface, Utxo};
 use chain_gang::messages::{BlockHeader, Tx};
@@ -48,11 +48,10 @@ impl Traced {
         }
     }
 
-    /// `name` is the span name, `chain <call>`; it is passed whole, not
-    /// formatted, so it stays a `&'static str`.
+    /// Run `future`, the wrapped interface's `call`, in a client span named
+    /// `chain <call>`: the name is derived, so the two cannot drift apart.
     async fn traced<T>(
         &self,
-        name: &'static str,
         call: &'static str,
         future: impl Future<Output = Result<T, ChainGangError>>,
     ) -> Result<T, ChainGangError> {
@@ -63,19 +62,14 @@ impl Traced {
         let span = if tracing::Span::current().is_none() {
             tracing::Span::none()
         } else {
-            tracing::info_span!(
-                target: SPAN_TARGET,
-                "chain",
-                otel.name = name,
-                otel.kind = "client",
-                otel.status_description = tracing::field::Empty,
-                error.type = tracing::field::Empty,
+            client_span!(
+                tracing::field::display(format_args!("chain {call}")),
                 peer.service = tracing::field::Empty,
                 chain.interface = self.interface,
                 chain.call = call,
             )
         };
-        if self.interface == MAPI_RS {
+        if self.interface == MAPI_RS_PEER_SERVICE {
             span.record("peer.service", MAPI_RS_PEER_SERVICE);
         }
         in_span(span, future).await
@@ -111,10 +105,6 @@ impl SpanError for ChainGangError {
     }
 }
 
-/// `chain.interface` for the `mapi_lite` interface: the service it reads
-/// through, by its deployed name, as everywhere else in a trace.
-const MAPI_RS: &str = "mapi-rs";
-
 /// The interface types, as span attribute values from a fixed set, so a
 /// misconfigured one cannot carry anything arbitrary into a trace.
 fn interface_name(interface_type: &str) -> &'static str {
@@ -122,7 +112,9 @@ fn interface_name(interface_type: &str) -> &'static str {
         "woc" => "woc",
         "uaas" => "uaas",
         "rpc" => "rpc",
-        "mapi_lite" => MAPI_RS,
+        // The service it reads through, by its deployed name, as everywhere
+        // else in a trace.
+        "mapi_lite" => MAPI_RS_PEER_SERVICE,
         "test" => "test",
         _ => "other",
     }
@@ -136,41 +128,29 @@ impl BlockchainInterface for Traced {
     }
 
     async fn status(&self) -> Result<(), ChainGangError> {
-        self.traced("chain status", "status", self.inner.status())
-            .await
+        self.traced("status", self.inner.status()).await
     }
 
     async fn get_balance(&self, address: &str) -> Result<Balance, ChainGangError> {
-        self.traced(
-            "chain get_balance",
-            "get_balance",
-            self.inner.get_balance(address),
-        )
-        .await
+        self.traced("get_balance", self.inner.get_balance(address))
+            .await
     }
 
     async fn get_utxo(&self, address: &str) -> Result<Utxo, ChainGangError> {
-        self.traced("chain get_utxo", "get_utxo", self.inner.get_utxo(address))
-            .await
+        self.traced("get_utxo", self.inner.get_utxo(address)).await
     }
 
     async fn broadcast_tx(&self, tx: &Tx) -> Result<String, ChainGangError> {
-        self.traced(
-            "chain broadcast_tx",
-            "broadcast_tx",
-            self.inner.broadcast_tx(tx),
-        )
-        .await
+        self.traced("broadcast_tx", self.inner.broadcast_tx(tx))
+            .await
     }
 
     async fn get_tx(&self, txid: &str) -> Result<Tx, ChainGangError> {
-        self.traced("chain get_tx", "get_tx", self.inner.get_tx(txid))
-            .await
+        self.traced("get_tx", self.inner.get_tx(txid)).await
     }
 
     async fn get_latest_block_header(&self) -> Result<BlockHeader, ChainGangError> {
         self.traced(
-            "chain get_latest_block_header",
             "get_latest_block_header",
             self.inner.get_latest_block_header(),
         )
@@ -178,12 +158,8 @@ impl BlockchainInterface for Traced {
     }
 
     async fn get_block_headers(&self) -> Result<String, ChainGangError> {
-        self.traced(
-            "chain get_block_headers",
-            "get_block_headers",
-            self.inner.get_block_headers(),
-        )
-        .await
+        self.traced("get_block_headers", self.inner.get_block_headers())
+            .await
     }
 }
 
@@ -379,5 +355,55 @@ mod tests {
             read.status
         );
         assert_eq!(attribute(read, "error.type").as_deref(), Some("cancelled"));
+    }
+
+    /// CS-700 review, comment 9: every call's span is named `chain <call>`,
+    /// derived from the `chain.call` it carries, for all seven calls.
+    #[tokio::test]
+    async fn sr_tele_015_every_call_is_named_after_its_chain_call() {
+        let config = test_config(&unique_dynamic_config_path());
+        let interface = Traced::new(test_blockchain_interface(&config).await, "woc");
+
+        let spans = traced_spans(async {
+            async {
+                // Whether each succeeds does not matter here, only its span.
+                let _ = interface.status().await;
+                let _ = interface.get_balance(TEST_ADDRESS).await;
+                let _ = interface.get_utxo(TEST_ADDRESS).await;
+                let _ = interface.get_tx("00").await;
+                let _ = interface.get_latest_block_header().await;
+                let _ = interface.get_block_headers().await;
+                let tx = Tx {
+                    version: 1,
+                    inputs: vec![],
+                    outputs: vec![],
+                    lock_time: 0,
+                };
+                let _ = interface.broadcast_tx(&tx).await;
+            }
+            .instrument(tracing::info_span!("request"))
+            .await;
+        })
+        .await;
+
+        let mut calls = Vec::new();
+        for span in spans.iter().filter(|s| s.name != "request") {
+            let call = attribute(span, "chain.call").expect("chain.call");
+            assert_eq!(span.name, format!("chain {call}"));
+            calls.push(call);
+        }
+        calls.sort();
+        assert_eq!(
+            calls,
+            [
+                "broadcast_tx",
+                "get_balance",
+                "get_block_headers",
+                "get_latest_block_header",
+                "get_tx",
+                "get_utxo",
+                "status",
+            ]
+        );
     }
 }
