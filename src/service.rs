@@ -12,6 +12,7 @@ use chain_gang::{
 use chrono::prelude::DateTime;
 use chrono::Utc;
 use tokio::sync::{Mutex, RwLock};
+use tracing::Instrument as _;
 
 use crate::{
     address_watcher::AddressWatcher,
@@ -25,6 +26,7 @@ use crate::{
         BlockchainConnectionStatus, CodedError, ErrorCode, FundingResponseJson, OutpointResponse,
         StatusResponse, TxResponse,
     },
+    telemetry::SPAN_TARGET,
     util::tx_as_hexstr,
 };
 
@@ -1261,7 +1263,24 @@ impl Service {
         };
         let service = Arc::clone(service);
         let client_id = client_id.to_string();
-        tokio::spawn(async move {
+        // Under the request that prompted it (CS-700), so its chain reads
+        // show in the caller's trace, as they would had the request waited.
+        // The span may end after the request's, which a trace allows; the
+        // request's own duration is unchanged.
+        let parent = tracing::Span::current();
+        let span = if parent.is_none() {
+            tracing::Span::none()
+        } else {
+            tracing::info_span!(
+                target: SPAN_TARGET,
+                parent: &parent,
+                "chain refresh",
+                otel.name = "chain refresh",
+                otel.status_description = tracing::field::Empty,
+                error.type = tracing::field::Empty,
+            )
+        };
+        let refresh = async move {
             let _refreshing = refreshing;
             // A refresh that finished between the caller's check and taking
             // the lock has already done this one's work.
@@ -1279,9 +1298,16 @@ impl Service {
                 // Already recorded as a chain failure. The request this was
                 // started for has been funded from the cache, so there is
                 // nobody to return it to.
+                // Its chain reads say why; this says the refresh failed.
+                crate::telemetry::mark_error(
+                    &tracing::Span::current(),
+                    "refresh_failed",
+                    "the background chain refresh failed",
+                );
                 log::warn!("background refresh_client_chain_state failed: {e}");
             }
-        });
+        };
+        tokio::spawn(refresh.instrument(span));
     }
 
     /// Mark a client's cached chain state stale, so the next request refreshes
@@ -2944,6 +2970,56 @@ mod tests {
             "the stale cache should still have been refreshed, behind the write"
         );
         blockchain.open();
+    }
+
+    /// CS-700 review, comment 1: the refresh a write prompts runs behind it,
+    /// in a task of its own, but in the caller's trace -- a `chain refresh`
+    /// span under the request's, with its chain reads under that -- so the
+    /// trace of a write funded from an aged cache still shows the read it
+    /// prompted.
+    #[tokio::test]
+    async fn sr_tele_016_a_background_refresh_is_in_the_requests_trace() {
+        use crate::test_support::traced_spans;
+        use crate::traced_interface::Traced;
+
+        let mut config = test_config(&unique_dynamic_config_path());
+        // a zero window: the cache is stale for every request
+        config.service.utxo_refresh_period = 0;
+        let blockchain = Arc::new(Traced::new(
+            test_blockchain_interface(&config).await,
+            "test",
+        ));
+        let service = service_with(&config, blockchain, StubMapiBroadcaster::new(true)).await;
+
+        let spans = traced_spans(async {
+            fund_without_waiting(&service)
+                .instrument(tracing::info_span!("request"))
+                .await;
+            // Taken before the refresh is spawned and held until it ends.
+            let lock = service.chain_refresh_lock(TEST_CLIENT_ID);
+            let _done = lock.lock().await;
+        })
+        .await;
+
+        let find = |name: &str| {
+            spans
+                .iter()
+                .find(|s| s.name == name)
+                .unwrap_or_else(|| panic!("no {name} span: {spans:?}"))
+        };
+        let request = find("request");
+        let refresh = find("chain refresh");
+        assert_eq!(refresh.parent_span_id, request.span_context.span_id());
+        assert_eq!(
+            refresh.span_context.trace_id(),
+            request.span_context.trace_id()
+        );
+        let read = find("chain get_utxo");
+        assert_eq!(read.parent_span_id, refresh.span_context.span_id());
+        assert_eq!(
+            read.span_context.trace_id(),
+            request.span_context.trace_id()
+        );
     }
 
     /// Without mapi-lite the broadcast goes through the paced interface, so

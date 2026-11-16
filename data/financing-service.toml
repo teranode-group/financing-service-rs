@@ -48,7 +48,12 @@ network = "testnet"
 
 # The log level is RUST_LOG's (default "info"), as for Event and mapi-lite.
 
+# Traces (CS-700) have their own switch, traces_exporter ("otlp" or "none");
+# OTEL_TRACES_EXPORTER overrides it. enabled = true turns on traces and
+# metrics both. Sampling is the SDK's: OTEL_TRACES_SAMPLER (default every
+# trace), e.g. parentbased_traceidratio with OTEL_TRACES_SAMPLER_ARG=0.1.
 # [telemetry]
+# traces_exporter = "otlp"
 # enabled = true
 # service_name = "financing-service-rs"
 # otlp_endpoint = "http://localhost:4317"

@@ -1,4 +1,4 @@
-use std::{collections::BTreeMap, env, time::Duration};
+use std::{collections::BTreeMap, env, future::Future, time::Duration};
 
 use opentelemetry::{global, trace::TracerProvider as _, KeyValue};
 use opentelemetry_otlp::{MetricExporter, SpanExporter, WithExportConfig};
@@ -8,10 +8,14 @@ use opentelemetry_sdk::{
     resource::{Resource, SdkProvidedResourceDetector, TelemetryResourceDetector},
     trace::SdkTracerProvider,
 };
+use tracing::Instrument as _;
 use tracing_opentelemetry::OpenTelemetryLayer;
-use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
+use tracing_subscriber::{
+    filter::filter_fn, fmt::MakeWriter, layer::SubscriberExt, registry::LookupSpan,
+    util::SubscriberInitExt, EnvFilter, Layer,
+};
 
-use crate::config::TelemetryConfig;
+use crate::config::{TelemetryConfig, TelemetryExporter};
 
 /// Keeps the tracer and meter providers alive, and flushes spans and metrics
 /// on shutdown.
@@ -49,7 +53,11 @@ impl Drop for TelemetryGuard {
 pub fn init(config: &TelemetryConfig) -> Result<Option<TelemetryGuard>, String> {
     let filter = log_filter(env::var("RUST_LOG").ok().as_deref())?;
 
-    let tracer_provider = if config.is_enabled() {
+    let tracer_provider = if config.traces_enabled() {
+        // W3C trace context both ways (CS-700): tracing-actix-web extracts an
+        // incoming `traceparent` through it, so a request from Event joins
+        // Event's trace, and uls-client injects one into every request to
+        // mapi-lite.
         global::set_text_map_propagator(TraceContextPropagator::new());
 
         let exporter = SpanExporter::builder()
@@ -58,6 +66,9 @@ pub fn init(config: &TelemetryConfig) -> Result<Option<TelemetryGuard>, String> 
             .build()
             .map_err(|e| format!("failed to create OTLP trace exporter: {e}"))?;
 
+        // The sampler is the SDK's own, read from `OTEL_TRACES_SAMPLER` and
+        // `OTEL_TRACES_SAMPLER_ARG` (default `parentbased_always_on`, every
+        // trace): not set here, so a deployment chooses its rate.
         let provider = SdkTracerProvider::builder()
             .with_batch_exporter(exporter)
             .with_resource(resource(config))
@@ -74,7 +85,7 @@ pub fn init(config: &TelemetryConfig) -> Result<Option<TelemetryGuard>, String> 
 
     tracing_subscriber::registry()
         .with(filter)
-        .with(tracing_subscriber::fmt::layer())
+        .with(fmt_layer(std::io::stdout))
         .with(otel_layer)
         .try_init()
         .map_err(|e| format!("failed to initialise tracing subscriber: {e}"))?;
@@ -83,12 +94,9 @@ pub fn init(config: &TelemetryConfig) -> Result<Option<TelemetryGuard>, String> 
     for warning in config.ignored_resource_attribute_warnings() {
         log::warn!("{warning}");
     }
-    if tracer_provider.is_some() {
-        log::info!(
-            "OpenTelemetry enabled (service.name={}, otlp.endpoint={})",
-            config.effective_service_name(),
-            redact_endpoint(&config.effective_otlp_endpoint())
-        );
+    log::info!("{}", traces_startup_line(config));
+    if let Some(warning) = traces_sampler_warning(config) {
+        log::warn!("{warning}");
     }
 
     // After the subscriber, so the startup line is logged. Installed
@@ -137,9 +145,130 @@ fn resource(config: &TelemetryConfig) -> Resource {
 }
 
 const SERVICE_NAME: &str = "service.name";
+
+/// The target of this service's own trace spans (CS-700): the chain call
+/// spans, the background refresh's and the broadcast's. They exist for the
+/// trace, and the log output does not see them (see [`fmt_layer`]).
+///
+/// Inside the crate's own target, so a `RUST_LOG` such as
+/// `warn,financing_service=info` keeps them.
+pub const SPAN_TARGET: &str = "financing_service::otel";
+
+/// The log output, writing to `writer`.
+///
+/// It prints each enclosing span's name and fields before every log line.
+/// The spans under [`SPAN_TARGET`] are filtered out of it, so a warning
+/// logged during a broadcast reads as it did before CS-700 -- no
+/// `mapi-rs broadcast{otel.name=...}:` prefix -- with trace export on or
+/// off, and greps and alerts keyed on the message keep working.
+pub fn fmt_layer<S, W>(writer: W) -> impl Layer<S>
+where
+    S: tracing::Subscriber + for<'a> LookupSpan<'a>,
+    W: for<'w> MakeWriter<'w> + Send + Sync + 'static,
+{
+    tracing_subscriber::fmt::layer()
+        .with_writer(writer)
+        .with_filter(filter_fn(|metadata| {
+            !(metadata.is_span() && metadata.target() == SPAN_TARGET)
+        }))
+}
+
+/// How a failed call is described on its span (CS-700 review): `error.type`,
+/// a fixed name for the kind of failure, and the status description.
+///
+/// Neither is the error's own message, which can hold an address, a txid or
+/// a URL that carries one, and none of those belong in a trace.
+pub trait SpanError {
+    /// `error.type`: short, lower case, from a fixed set.
+    fn error_type(&self) -> &'static str;
+    /// The span's status description: what the failure means, in a sentence.
+    fn description(&self) -> &'static str;
+}
+
+/// `error.type` for a call dropped before it finished.
+pub const CANCELLED: &str = "cancelled";
+
+/// Run `future` in `span`, a span declaring `error.type` and
+/// `otel.status_description` as empty fields, and mark the span an error when
+/// the call fails: [`SpanError::error_type`] as `error.type`,
+/// [`SpanError::description`] as the status description.
+///
+/// A call dropped before it finishes -- its caller disconnected, or an outer
+/// deadline fired -- is marked an error too, as [`CANCELLED`]; otherwise its
+/// span would end `Unset`, which reads as success.
+pub async fn in_span<T, E: SpanError>(
+    span: tracing::Span,
+    future: impl Future<Output = Result<T, E>>,
+) -> Result<T, E> {
+    let mut unfinished = Unfinished(Some(span.clone()));
+    let result = future.instrument(span.clone()).await;
+    unfinished.0 = None;
+    if let Err(error) = &result {
+        mark_error(&span, error.error_type(), error.description());
+    }
+    result
+}
+
+/// Mark `span` an error, with `error_type` and `description` as in
+/// [`in_span`]. A disabled span is left alone.
+pub fn mark_error(span: &tracing::Span, error_type: &'static str, description: &'static str) {
+    span.record("error.type", error_type);
+    // tracing-opentelemetry sets the status to error with this description.
+    span.record("otel.status_description", description);
+}
+
+/// Marks its span cancelled when dropped still holding it: [`in_span`] takes
+/// it back once the call has finished.
+struct Unfinished(Option<tracing::Span>);
+
+impl Drop for Unfinished {
+    fn drop(&mut self) {
+        if let Some(span) = self.0.take() {
+            mark_error(
+                &span,
+                CANCELLED,
+                "dropped before it finished: the caller went away or a deadline fired",
+            );
+        }
+    }
+}
+
+/// `peer.service` on every span for a call to mapi-rs (mapi-lite): the
+/// `service.name` mapi-rs is deployed under, so Tempo's service graph draws
+/// the edge to its node. Never `mapi-lite` or `mapi_lite`, which name no
+/// deployed service and would add a node of their own.
+pub const MAPI_RS_PEER_SERVICE: &str = "mapi-rs";
+
+/// A client span for a call this service makes (CS-700): the chain calls and
+/// the broadcast to mapi-rs. Run the call with [`in_span`].
+///
+/// The one place the shape is set: [`SPAN_TARGET`], so the log output leaves
+/// it out; `otel.kind = "client"`; `otel.name` from `$name`, which may be a
+/// `tracing::field::display(format_args!(..))`; and the empty `error.type` and
+/// `otel.status_description` that [`in_span`] fills on failure. The caller
+/// adds its own attributes after the name, among them `peer.service` -- always
+/// a deployed `service.name`, such as [`MAPI_RS_PEER_SERVICE`] -- when the
+/// callee is a service of ours.
+macro_rules! client_span {
+    ($name:expr $(, $($fields:tt)*)?) => {
+        tracing::info_span!(
+            target: $crate::telemetry::SPAN_TARGET,
+            "client",
+            otel.name = $name,
+            otel.kind = "client",
+            otel.status_description = tracing::field::Empty,
+            error.type = tracing::field::Empty,
+            $($($fields)*)?
+        )
+    };
+}
+pub(crate) use client_span;
 const SERVICE_VERSION: &str = "service.version";
 const OTEL_RESOURCE_ATTRIBUTES: &str = "OTEL_RESOURCE_ATTRIBUTES";
 const OTEL_METRIC_EXPORT_INTERVAL: &str = "OTEL_METRIC_EXPORT_INTERVAL";
+const OTEL_TRACES_EXPORTER: &str = "OTEL_TRACES_EXPORTER";
+const OTEL_TRACES_SAMPLER: &str = "OTEL_TRACES_SAMPLER";
+const OTEL_TRACES_SAMPLER_ARG: &str = "OTEL_TRACES_SAMPLER_ARG";
 
 /// The SDK's metrics export interval when nothing sets one.
 pub const DEFAULT_METRIC_EXPORT_INTERVAL: Duration = Duration::from_secs(60);
@@ -148,6 +277,8 @@ pub const DEFAULT_METRIC_EXPORT_INTERVAL: Duration = Duration::from_secs(60);
 /// startup line.
 const FROM_TABLE_ATTRIBUTES: &str = "telemetry.resource_attributes";
 const FROM_TABLE_INTERVAL: &str = "telemetry.export_interval_sec";
+const FROM_TABLE_TRACES: &str = "telemetry.traces_exporter";
+const FROM_TABLE_ENABLED: &str = "telemetry.enabled";
 const FROM_DEFAULT: &str = "default";
 
 /// The OTLP metrics pipeline, or `None` when metrics export is off -- in which
@@ -177,6 +308,105 @@ pub fn build_meter_provider(config: &TelemetryConfig) -> Result<Option<SdkMeterP
             .with_resource(resource(config))
             .build(),
     ))
+}
+
+/// The one startup line saying whether spans are exported, what turned it on
+/// or off, where to and with which sampler (CS-700).
+pub fn traces_startup_line(config: &TelemetryConfig) -> String {
+    let (on, source) = config.traces_switch();
+    if on {
+        format!(
+            "OpenTelemetry trace export on from {source} (service.name={}, otlp.endpoint={}, \
+             sampler={})",
+            config.effective_service_name(),
+            redact_endpoint(&config.effective_otlp_endpoint()),
+            traces_sampler(
+                env::var(OTEL_TRACES_SAMPLER).ok().as_deref(),
+                env::var(OTEL_TRACES_SAMPLER_ARG).ok().as_deref()
+            )
+            .0
+        )
+    } else if source == FROM_DEFAULT {
+        "OpenTelemetry trace export off (enable with [telemetry] traces_exporter = \"otlp\" or \
+         OTEL_TRACES_EXPORTER=otlp)"
+            .to_string()
+    } else {
+        format!("OpenTelemetry trace export off: {source} does not list otlp")
+    }
+}
+
+/// The sampler the SDK builds from `OTEL_TRACES_SAMPLER` and
+/// `OTEL_TRACES_SAMPLER_ARG`, as the startup line names it, and a warning
+/// when what was asked for is not what the SDK will use.
+///
+/// Mirrors `opentelemetry_sdk` 0.32 (`trace::Config::default`): the name is
+/// matched exactly, case and spaces included; one it does not know falls back
+/// to `parentbased_always_on`, and a ratio sampler whose argument is missing
+/// or not a number falls back to a ratio of 1.0. Both keep every trace, so a
+/// line naming the asked-for sampler would say the rate is reduced while
+/// 100% is exported (CS-700 review). Values are cut short and quoted, as they
+/// are printed as given.
+fn traces_sampler(sampler: Option<&str>, arg: Option<&str>) -> (String, Option<String>) {
+    let shown = |value: &str| format!("{:?}", value.chars().take(64).collect::<String>());
+    let Some(sampler) = sampler else {
+        return ("parentbased_always_on (default)".to_string(), None);
+    };
+    match sampler {
+        "always_on" | "always_off" | "parentbased_always_on" | "parentbased_always_off" => {
+            (format!("{sampler} from {OTEL_TRACES_SAMPLER}"), None)
+        }
+        "traceidratio" | "parentbased_traceidratio" => {
+            match arg.and_then(|arg| arg.parse::<f64>().ok()) {
+                Some(ratio) => (
+                    format!(
+                        "{sampler} from {OTEL_TRACES_SAMPLER}, ratio={ratio} from \
+                         {OTEL_TRACES_SAMPLER_ARG}"
+                    ),
+                    None,
+                ),
+                None => {
+                    let arg = arg.map_or_else(|| "unset".to_string(), shown);
+                    (
+                        format!(
+                            "{sampler} from {OTEL_TRACES_SAMPLER}, ratio=1.0 because \
+                             {OTEL_TRACES_SAMPLER_ARG} is {arg}: every trace kept"
+                        ),
+                        Some(format!(
+                            "{OTEL_TRACES_SAMPLER_ARG} is {arg}, not a number: \
+                             {OTEL_TRACES_SAMPLER}={sampler} keeps every trace"
+                        )),
+                    )
+                }
+            }
+        }
+        unknown => {
+            let unknown = shown(unknown);
+            (
+                format!(
+                    "parentbased_always_on because {OTEL_TRACES_SAMPLER}={unknown} is not a \
+                     sampler: every trace kept"
+                ),
+                Some(format!(
+                    "{OTEL_TRACES_SAMPLER}={unknown} is not a sampler, so every trace is kept; \
+                     use always_on, always_off, traceidratio, parentbased_always_on, \
+                     parentbased_always_off or parentbased_traceidratio"
+                )),
+            )
+        }
+    }
+}
+
+/// The warning to log at startup when the sampler asked for is not the one
+/// the SDK will use. See [`traces_sampler`].
+fn traces_sampler_warning(config: &TelemetryConfig) -> Option<String> {
+    if !config.traces_enabled() {
+        return None;
+    }
+    traces_sampler(
+        env::var(OTEL_TRACES_SAMPLER).ok().as_deref(),
+        env::var(OTEL_TRACES_SAMPLER_ARG).ok().as_deref(),
+    )
+    .1
 }
 
 /// The one startup line saying whether metrics are exported, where to and how
@@ -255,14 +485,41 @@ pub fn log_filter(rust_log: Option<&str>) -> Result<EnvFilter, String> {
 }
 
 impl TelemetryConfig {
-    pub fn is_enabled(&self) -> bool {
-        if self.enabled {
-            return true;
+    /// Whether spans are exported over OTLP (CS-700). See
+    /// [`TelemetryConfig::traces_switch`].
+    pub fn traces_enabled(&self) -> bool {
+        self.traces_switch().0
+    }
+
+    /// Whether spans are exported, and the setting that decided it:
+    /// `OTEL_TRACES_EXPORTER` when it is set, else `traces_exporter = "otlp"`,
+    /// else `enabled = true`; off by default.
+    pub fn traces_switch(&self) -> (bool, &'static str) {
+        self.resolve_traces_switch(env::var(OTEL_TRACES_EXPORTER).ok().as_deref())
+    }
+
+    /// [`TelemetryConfig::traces_switch`] with `OTEL_TRACES_EXPORTER` given.
+    ///
+    /// The variable, set, decides alone -- `none` turns off what the table
+    /// turned on, as in mapi-lite (CS-698) -- and an empty one counts as
+    /// unset. It is a comma-separated list, as the spec allows (`otlp,console`):
+    /// spans are exported when any entry is `otlp`, matched ignoring case and
+    /// spaces, so `OTLP` works as before. The others are not exporters this
+    /// service has, and are ignored.
+    fn resolve_traces_switch(&self, variable: Option<&str>) -> (bool, &'static str) {
+        if let Some(value) = variable.map(str::trim).filter(|value| !value.is_empty()) {
+            let otlp = value
+                .split(',')
+                .any(|entry| entry.trim().eq_ignore_ascii_case("otlp"));
+            return (otlp, OTEL_TRACES_EXPORTER);
         }
-        matches!(
-            env::var("OTEL_TRACES_EXPORTER").as_deref(),
-            Ok("otlp") | Ok("OTLP")
-        )
+        if self.traces_exporter == TelemetryExporter::Otlp {
+            return (true, FROM_TABLE_TRACES);
+        }
+        if self.enabled {
+            return (true, FROM_TABLE_ENABLED);
+        }
+        (false, FROM_DEFAULT)
     }
 
     /// Whether metrics are exported over OTLP (CS-608): `enabled = true`, or
@@ -396,7 +653,7 @@ impl TelemetryConfig {
                     .to_string(),
             );
         }
-        if (self.is_enabled() || self.metrics_enabled())
+        if (self.traces_enabled() || self.metrics_enabled())
             && self.otlp_endpoint.as_deref().is_some_and(str::is_empty)
         {
             return Err("telemetry.otlp_endpoint cannot be empty when set".to_string());
@@ -426,7 +683,7 @@ mod tests {
         let _env = env_lock();
         unsafe { env::remove_var("OTEL_TRACES_EXPORTER") };
         let config = TelemetryConfig::default();
-        assert!(!config.is_enabled());
+        assert!(!config.traces_enabled());
     }
 
     #[test]
@@ -434,7 +691,7 @@ mod tests {
         let _env = env_lock();
         unsafe { env::set_var("OTEL_TRACES_EXPORTER", "otlp") };
         let config = TelemetryConfig::default();
-        assert!(config.is_enabled());
+        assert!(config.traces_enabled());
         unsafe { env::remove_var("OTEL_TRACES_EXPORTER") };
     }
 
@@ -513,7 +770,7 @@ mod tests {
         clear_metrics_env();
         unsafe { env::set_var("OTEL_TRACES_EXPORTER", "otlp") };
         let config = TelemetryConfig::default();
-        assert!(config.is_enabled());
+        assert!(config.traces_enabled());
         assert!(!config.metrics_enabled());
         unsafe { env::remove_var("OTEL_TRACES_EXPORTER") };
     }
@@ -525,7 +782,7 @@ mod tests {
         unsafe { env::set_var("OTEL_METRICS_EXPORTER", "otlp") };
         let config = TelemetryConfig::default();
         assert!(config.metrics_enabled());
-        assert!(!config.is_enabled(), "traces keep their own switch");
+        assert!(!config.traces_enabled(), "traces keep their own switch");
         clear_metrics_env();
     }
 
@@ -805,6 +1062,137 @@ mod tests {
         assert!(err.contains("telemetry.export_interval_sec"), "{err}");
     }
 
+    /// `traces_exporter = "otlp"` turns spans on, alone: not metrics.
+    /// `OTEL_TRACES_EXPORTER`, when set, decides over both table fields, so
+    /// `none` turns off what the table turned on; empty counts as unset.
+    #[test]
+    fn sr_tele_014_traces_exporter_and_otel_traces_exporter_decide_span_export() {
+        let off = TelemetryConfig::default();
+        let traces = TelemetryConfig {
+            traces_exporter: TelemetryExporter::Otlp,
+            ..Default::default()
+        };
+        let enabled = TelemetryConfig {
+            enabled: true,
+            ..Default::default()
+        };
+
+        assert_eq!(off.resolve_traces_switch(None), (false, FROM_DEFAULT));
+        assert_eq!(
+            traces.resolve_traces_switch(None),
+            (true, FROM_TABLE_TRACES)
+        );
+        assert_eq!(
+            enabled.resolve_traces_switch(None),
+            (true, FROM_TABLE_ENABLED)
+        );
+
+        for config in [&off, &traces, &enabled] {
+            assert_eq!(
+                config.resolve_traces_switch(Some("otlp")),
+                (true, OTEL_TRACES_EXPORTER)
+            );
+            assert_eq!(
+                config.resolve_traces_switch(Some(" OTLP ")),
+                (true, OTEL_TRACES_EXPORTER)
+            );
+            assert_eq!(
+                config.resolve_traces_switch(Some("none")),
+                (false, OTEL_TRACES_EXPORTER)
+            );
+            // CS-700 review, comment 4: a list, as the spec allows.
+            for list in ["otlp,console", "console, OTLP ", " otlp , none"] {
+                assert_eq!(
+                    config.resolve_traces_switch(Some(list)),
+                    (true, OTEL_TRACES_EXPORTER),
+                    "{list}"
+                );
+            }
+            for list in ["console", "console,none", "otlpx,console"] {
+                assert_eq!(
+                    config.resolve_traces_switch(Some(list)),
+                    (false, OTEL_TRACES_EXPORTER),
+                    "{list}"
+                );
+            }
+        }
+        assert_eq!(
+            traces.resolve_traces_switch(Some(" ")),
+            (true, FROM_TABLE_TRACES)
+        );
+    }
+
+    #[test]
+    fn sr_tele_014_traces_exporter_does_not_turn_on_metrics() {
+        let _env = env_lock();
+        clear_metrics_env();
+        let config = TelemetryConfig {
+            traces_exporter: TelemetryExporter::Otlp,
+            ..Default::default()
+        };
+        assert!(!config.metrics_enabled());
+    }
+
+    /// The traces startup line says what decided, where to with no
+    /// credential, and the sampler; off, how to turn it on.
+    #[test]
+    fn sr_tele_014_the_traces_startup_line_names_source_endpoint_and_sampler() {
+        let _env = env_lock();
+        clear_metrics_env();
+        for name in [
+            OTEL_TRACES_EXPORTER,
+            OTEL_TRACES_SAMPLER,
+            OTEL_TRACES_SAMPLER_ARG,
+        ] {
+            unsafe { env::remove_var(name) };
+        }
+        let line = traces_startup_line(&TelemetryConfig::default());
+        assert!(line.contains("trace export off"), "{line}");
+        assert!(line.contains("traces_exporter = \"otlp\""), "{line}");
+
+        let config = TelemetryConfig {
+            traces_exporter: TelemetryExporter::Otlp,
+            otlp_endpoint: Some("http://user:secret@collector:4317".to_string()),
+            ..Default::default()
+        };
+        let line = traces_startup_line(&config);
+        assert!(line.contains("on from telemetry.traces_exporter"), "{line}");
+        assert!(
+            line.contains("otlp.endpoint=http://collector:4317"),
+            "{line}"
+        );
+        assert!(!line.contains("secret"), "{line}");
+        assert!(
+            line.contains("sampler=parentbased_always_on (default)"),
+            "{line}"
+        );
+
+        unsafe { env::set_var(OTEL_TRACES_SAMPLER, "parentbased_traceidratio") };
+        unsafe { env::set_var(OTEL_TRACES_SAMPLER_ARG, "0.1") };
+        let line = traces_startup_line(&config);
+        assert!(
+            line.contains(
+                "sampler=parentbased_traceidratio from OTEL_TRACES_SAMPLER, ratio=0.1 from \
+                 OTEL_TRACES_SAMPLER_ARG"
+            ),
+            "{line}"
+        );
+
+        unsafe { env::set_var(OTEL_TRACES_EXPORTER, "none") };
+        let line = traces_startup_line(&config);
+        for name in [
+            OTEL_TRACES_EXPORTER,
+            OTEL_TRACES_SAMPLER,
+            OTEL_TRACES_SAMPLER_ARG,
+        ] {
+            unsafe { env::remove_var(name) };
+        }
+        assert!(
+            line.contains("trace export off: OTEL_TRACES_EXPORTER does not list otlp"),
+            "{line}"
+        );
+    }
+
     #[test]
     fn redact_endpoint_drops_credentials_and_query() {
         assert_eq!(
@@ -816,5 +1204,89 @@ mod tests {
             "https://host:4317/v1"
         );
         assert_eq!(redact_endpoint("host:4317"), "host:4317");
+    }
+
+    /// CS-700 review, comment 5: the startup line names the sampler the SDK
+    /// will use, not the one asked for, and a warning says when they differ.
+    #[test]
+    fn sr_tele_014_the_startup_line_names_the_sampler_in_use() {
+        let (line, warning) = traces_sampler(None, Some("0.1"));
+        assert_eq!(line, "parentbased_always_on (default)");
+        assert_eq!(warning, None);
+
+        let (line, warning) = traces_sampler(Some("parentbased_traceidratio"), Some("0.1"));
+        assert!(line.contains("ratio=0.1"), "{line}");
+        assert_eq!(warning, None);
+
+        let (line, warning) = traces_sampler(Some("always_off"), None);
+        assert_eq!(line, "always_off from OTEL_TRACES_SAMPLER");
+        assert_eq!(warning, None);
+
+        // A typo: the SDK falls back to keeping every trace.
+        for typo in [
+            "parentbased_traceidratios",
+            "PARENTBASED_TRACEIDRATIO",
+            " traceidratio",
+        ] {
+            let (line, warning) = traces_sampler(Some(typo), Some("0.1"));
+            assert!(line.starts_with("parentbased_always_on because"), "{line}");
+            assert!(line.contains("every trace kept"), "{line}");
+            assert!(!line.contains("0.1"), "{line}");
+            assert!(warning.expect("a warning").contains("is not a sampler"));
+        }
+
+        // A ratio that is missing or not a number: the SDK uses 1.0.
+        for arg in [None, Some("ten percent"), Some(" 0.1")] {
+            let (line, warning) = traces_sampler(Some("traceidratio"), arg);
+            assert!(line.contains("ratio=1.0 because"), "{line}");
+            assert!(line.contains("every trace kept"), "{line}");
+            assert!(warning.expect("a warning").contains("keeps every trace"));
+        }
+
+        // Printed as given, so cut short.
+        let (line, _) = traces_sampler(Some(&"x".repeat(500)), None);
+        assert!(line.len() < 200, "{line}");
+    }
+
+    /// CS-700 review, comment 3: the trace spans do not prefix log lines.
+    /// A warning logged during a broadcast reads as it did before, while an
+    /// ordinary span, such as the request's, still shows.
+    #[test]
+    fn sr_tele_016_trace_spans_stay_out_of_the_log_output() {
+        use std::io::Write;
+        use std::sync::{Arc, Mutex};
+
+        #[derive(Clone, Default)]
+        struct Buffer(Arc<Mutex<Vec<u8>>>);
+        impl Write for Buffer {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let buffer = Buffer::default();
+        let writer = buffer.clone();
+        let subscriber = tracing_subscriber::registry().with(fmt_layer(move || writer.clone()));
+        tracing::subscriber::with_default(subscriber, || {
+            let request = tracing::info_span!("fs_log_test_request", http.method = "POST");
+            let _request = request.enter();
+            let broadcast = client_span!("mapi-rs broadcast", peer.service = MAPI_RS_PEER_SERVICE);
+            let _broadcast = broadcast.enter();
+            tracing::warn!("fs log test: mapi-lite answered 503");
+        });
+
+        let output = String::from_utf8(buffer.0.lock().unwrap().clone()).unwrap();
+        assert!(
+            output.contains("fs log test: mapi-lite answered 503"),
+            "{output}"
+        );
+        assert!(output.contains("fs_log_test_request"), "{output}");
+        assert!(!output.contains("mapi-rs broadcast"), "{output}");
+        assert!(!output.contains("otel.name"), "{output}");
+        assert!(!output.contains("peer.service"), "{output}");
     }
 }

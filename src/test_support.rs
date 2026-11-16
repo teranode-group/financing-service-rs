@@ -1019,3 +1019,75 @@ fn capture_logger() -> &'static CaptureLogger {
         logger
     })
 }
+
+/// The spans `future` produced, run under a subscriber that traces through
+/// `tracing-opentelemetry` into memory, as this service's does into OTLP, with
+/// the W3C propagator installed as `telemetry::init` installs it (CS-700).
+///
+/// The subscriber is the process's global default, installed once, and not
+/// a thread's for the duration: `tracing` caches whether a callsite is enabled,
+/// and one first reached on another test's thread while a thread-local
+/// subscriber was being set could be cached as off, losing that span from the
+/// test at random. Spans are collected on the thread that ends them, so
+/// `future` has to run here: a `#[tokio::test]` or `#[actix_web::test]`
+/// runtime, which is single-threaded. Spans ended on another thread, as other
+/// tests' are, are not seen.
+pub async fn traced_spans(
+    future: impl std::future::Future<Output = ()>,
+) -> Vec<opentelemetry_sdk::trace::SpanData> {
+    static INSTALLED: std::sync::Once = std::sync::Once::new();
+    INSTALLED.call_once(|| {
+        use opentelemetry::trace::TracerProvider as _;
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        opentelemetry::global::set_text_map_propagator(
+            opentelemetry_sdk::propagation::TraceContextPropagator::new(),
+        );
+        let provider = opentelemetry_sdk::trace::SdkTracerProvider::builder()
+            .with_span_processor(ThreadSpans)
+            .build();
+        let subscriber = tracing_subscriber::registry().with(
+            tracing_opentelemetry::OpenTelemetryLayer::new(provider.tracer("financing-service-rs")),
+        );
+        tracing::subscriber::set_global_default(subscriber)
+            .expect("no other global subscriber in tests");
+    });
+
+    THREAD_SPANS.with(|spans| *spans.borrow_mut() = Some(Vec::new()));
+    future.await;
+    THREAD_SPANS.with(|spans| spans.borrow_mut().take().unwrap_or_default())
+}
+
+std::thread_local! {
+    /// The spans ended on this thread while [`traced_spans`] collects them.
+    static THREAD_SPANS: std::cell::RefCell<Option<Vec<opentelemetry_sdk::trace::SpanData>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Hands each ended span to the [`traced_spans`] collecting on the thread
+/// that ended it, if any; drops it otherwise.
+#[derive(Debug)]
+struct ThreadSpans;
+
+impl opentelemetry_sdk::trace::SpanProcessor for ThreadSpans {
+    fn on_start(&self, _span: &mut opentelemetry_sdk::trace::Span, _cx: &opentelemetry::Context) {}
+
+    fn on_end(&self, span: opentelemetry_sdk::trace::SpanData) {
+        THREAD_SPANS.with(|spans| {
+            if let Some(spans) = spans.borrow_mut().as_mut() {
+                spans.push(span);
+            }
+        });
+    }
+
+    fn force_flush(&self) -> opentelemetry_sdk::error::OTelSdkResult {
+        Ok(())
+    }
+
+    fn shutdown_with_timeout(
+        &self,
+        _timeout: std::time::Duration,
+    ) -> opentelemetry_sdk::error::OTelSdkResult {
+        Ok(())
+    }
+}

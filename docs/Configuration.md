@@ -259,14 +259,15 @@ Optional OpenTelemetry export via OTLP (gRPC): traces, and metrics (see [Metrics
 
 ```toml
 [telemetry]
-enabled = true
+traces_exporter = "otlp"
 service_name = "financing-service-rs"
 otlp_endpoint = "http://localhost:4317"
 export_interval_sec = 10
 resource_attributes = { "deployment.environment.name" = "local" }
 ```
 
-* `enabled` — export traces and metrics to an OTLP collector (default: `false`)
+* `traces_exporter` — span export: `"otlp"` or `"none"` (default: `"none"`), as mapi-lite and Event spell it. Traces only; it does not turn on metrics. `OTEL_TRACES_EXPORTER`, when set, overrides it
+* `enabled` — export traces and metrics to an OTLP collector (default: `false`). For traces, `OTEL_TRACES_EXPORTER` overrides it too
 * `service_name` — `service.name` resource attribute (default: `financing-service-rs`)
 * `otlp_endpoint` — OTLP gRPC endpoint (default: `http://localhost:4317`)
 * `export_interval_sec` — seconds between metrics exports, at least 1 (default: the SDK's 60). Metrics only: traces are batched by the SDK, set with `OTEL_BSP_*`. `FS__TELEMETRY__EXPORT_INTERVAL_SEC` overrides it as any `FS__` variable does
@@ -279,11 +280,31 @@ When enabled, the service:
 * Bridges existing `log` crate output through `tracing` to include `trace_id` in logs
 * Exports the [metrics](#metrics) periodically to the same collector
 
+### Traces across services (CS-700)
+
+With trace export on, a funding is one trace across Event, financing-service and mapi-lite:
+
+* **Incoming.** A request carrying a W3C `traceparent` header, such as `POST /fund` from Event, joins the caller's trace: the request span is a child of the caller's span. Without the header, the request starts a trace of its own.
+* **Chain reads.** Each blockchain interface call (WhatsOnChain, UaaS, the node, or mapi-lite's chain endpoints) is a client span of its own, named `chain <call>`: `chain get_utxo`, `chain get_balance`, `chain status`, `chain broadcast_tx` and so on. Each span carries `chain.interface` (`woc`, `uaas`, `rpc`, or `mapi-rs` for `interface_type = "mapi_lite"`) and `chain.call`, and never the address or txid it was asked about. A call through the `mapi_lite` interface also carries `peer.service = "mapi-rs"`, so Tempo's service graph draws the edge to the mapi-rs node. Under a request, these spans are children of the request span.
+* **Background refresh.** When a request is funded from a cache that has aged (with `[mapi_lite]`), the refresh it prompts runs behind it, after the response, but stays in the caller's trace: a `chain refresh` span under the request span, with its chain reads under that. It can end after the request span; the request's own duration is unchanged.
+* **Reads outside a request are not traced.** A chain call made under no span, such as the periodic sweep or the startup reads, creates no span. Otherwise each would start a one-span trace of its own every `utxo_refresh_period`, whether or not any request arrives. Their failures still show in the logs and the metrics.
+* **Broadcast to mapi-lite.** With `[mapi_lite]`, the broadcast is a client span, `mapi-rs broadcast`, with `peer.service = "mapi-rs"`, `http.request.method = "POST"` and `url.template = "/mapi/txs"`. Each `POST /mapi/txs` attempt carries that span's `traceparent`, so mapi-lite's spans join the trace. The chain reads through the `mapi_lite` interface carry it too.
+* **Names.** This service's spans go out under `service.name = "financing-service-rs"` unless `telemetry.service_name` or `OTEL_SERVICE_NAME` says otherwise. `peer.service` is always the callee's deployed `service.name` (`mapi-rs`), never `mapi-lite` or `mapi_lite`, which would add a node of their own to the service graph. Only telemetry uses these names: the `[mapi_lite]` section and `interface_type = "mapi_lite"` keep theirs.
+* **Errors.** A failed chain call or broadcast sets the span's status to error, with `error.type` naming the kind of failure and a status description saying what it means. For a chain call, `error.type` is `timeout`, `transport`, `response`, `bad_data`, `bad_argument` or `other`. For the broadcast, it is `rejected`, `upstream`, `indeterminate`, `untrusted` or `not_sent`. Neither carries the error's own message, which can hold an address, a txid or a URL. A call dropped before it finished, because the caller went away or an outer deadline fired, is marked an error too, with `error.type = "cancelled"`. A failed background refresh marks its `chain refresh` span `refresh_failed`.
+* **Logs are unchanged.** The log output prints each enclosing span before a log line, but these spans (target `financing_service::otel`) are left out of it, with trace export on or off. A warning logged during a broadcast reads as it did before. The HTTP request span still shows as before.
+
+The propagation to mapi-lite depends on matching versions: uls-client finds this service's span only while both use `tracing-opentelemetry` 0.33 and `opentelemetry` 0.32. With any other pair, no `traceparent` is sent and nothing reports an error; the test `cs_700_uls_client_sees_this_services_spans` fails instead. See [Dependencies.md](Dependencies.md).
+
+**Sampling.** The service does not set a sampler, so it uses the SDK's, read from the standard variables. The default is `parentbased_always_on`: every trace is kept, and a request that carries a `traceparent` follows the caller's sampling decision. In production, set `OTEL_TRACES_SAMPLER=parentbased_traceidratio` and `OTEL_TRACES_SAMPLER_ARG` to the fraction of new traces to keep (for example `0.1`). Requests from a sampled caller are still traced. The startup line names the sampler in use.
+
+Startup logs one line, `OpenTelemetry trace export on from <setting> (...)` or `... off`. It names the setting that decided (`OTEL_TRACES_EXPORTER`, `telemetry.traces_exporter` or `telemetry.enabled`), the endpoint without any credential or query string, and the sampler the SDK will use. The SDK matches the sampler name exactly, case included. A name it doesn't know falls back to `parentbased_always_on`, and a ratio sampler whose `OTEL_TRACES_SAMPLER_ARG` is missing or not a number falls back to a ratio of 1.0. Both keep every trace. The startup line then names the fallback, not the sampler asked for, and a warning says why.
+
 Standard OpenTelemetry environment variables are also supported:
 
 | Variable | Purpose |
 |----------|---------|
-| `OTEL_TRACES_EXPORTER=otlp` | Enable trace export when `telemetry.enabled` is `false` |
+| `OTEL_TRACES_EXPORTER` | When set, it alone decides trace export, overriding `telemetry.traces_exporter` and `telemetry.enabled`. It is a comma-separated list, as the spec allows: export is on when any entry is `otlp` (`otlp,console` is on), and off otherwise (`none`). Other exporters are ignored |
+| `OTEL_TRACES_SAMPLER`, `OTEL_TRACES_SAMPLER_ARG` | The trace sampler (default: `parentbased_always_on`, every trace) |
 | `OTEL_METRICS_EXPORTER=otlp` | Enable metrics export when `telemetry.enabled` is `false` |
 | `OTEL_SERVICE_NAME` | Overrides `telemetry.service_name` |
 | `OTEL_RESOURCE_ATTRIBUTES` | `key=value,...`; each key overrides the same key in `telemetry.resource_attributes`, and keys only the table sets are kept |
@@ -292,7 +313,7 @@ Standard OpenTelemetry environment variables are also supported:
 | `OTEL_EXPORTER_OTLP_METRICS_ENDPOINT` | Metrics-specific OTLP endpoint |
 | `OTEL_METRIC_EXPORT_INTERVAL` | Overrides `telemetry.export_interval_sec`, in milliseconds (SDK default: 60000) |
 
-Traces and metrics have separate switches: `OTEL_TRACES_EXPORTER=otlp` turns on traces only and `OTEL_METRICS_EXPORTER=otlp` metrics only; `enabled = true` turns on both.
+Traces and metrics have separate switches. `traces_exporter = "otlp"` and `OTEL_TRACES_EXPORTER=otlp` turn on traces only, and `OTEL_METRICS_EXPORTER=otlp` turns on metrics only. `enabled = true` turns on both.
 
 Example with the OpenTelemetry Collector:
 
@@ -300,7 +321,7 @@ Example with the OpenTelemetry Collector:
 docker run -p 4317:4317 otel/opentelemetry-collector:latest
 ```
 
-Then enable telemetry in config or set `OTEL_TRACES_EXPORTER=otlp` and `OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4317`.
+Then set `[telemetry] traces_exporter = "otlp"`, or `OTEL_TRACES_EXPORTER=otlp` and `OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4317`.
 
 ## Metrics
 
