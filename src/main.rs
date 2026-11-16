@@ -24,6 +24,7 @@ mod rest_api;
 mod secrets;
 mod service;
 mod telemetry;
+mod traced_interface;
 mod util;
 
 #[cfg(test)]

@@ -3512,4 +3512,70 @@ mod tests {
             max_fundable as i64
         );
     }
+
+    /// CS-700: a `POST /fund` carrying a W3C `traceparent` -- as one from
+    /// Event does -- is traced under the caller's trace, and its chain reads
+    /// and its broadcast are child spans of the request's.
+    #[actix_web::test]
+    async fn sr_tele_016_a_fund_request_joins_the_callers_trace_with_child_spans() {
+        use crate::test_support::traced_spans;
+        use crate::traced_interface::Traced;
+
+        const TRACE_ID: &str = "4bf92f3577b34da6a3ce929d0e0e4736";
+        const CALLER_SPAN_ID: &str = "00f067aa0ba902b7";
+
+        let mut config = test_config(&unique_dynamic_config_path());
+        // Read the chain on the request, rather than from a cache.
+        config.service.chain_state_max_age_seconds = Some(0);
+        let blockchain = Arc::new(Traced::new(
+            test_blockchain_interface(&config).await,
+            "test",
+        ));
+        let financing_service = Arc::new(Service::new_for_test(&config, blockchain).await);
+        let app_state = web::Data::new(AppState::new(financing_service));
+
+        let spans = traced_spans(async {
+            let app = test::init_service(
+                App::new()
+                    .wrap(tracing_actix_web::TracingLogger::default())
+                    .app_data(app_state)
+                    .service(get_funds),
+            )
+            .await;
+            let resp = test::call_service(
+                &app,
+                test::TestRequest::post()
+                    .uri("/fund")
+                    .insert_header(("traceparent", format!("00-{TRACE_ID}-{CALLER_SPAN_ID}-01")))
+                    .set_json(fund_body(TEST_CLIENT_ID, 123, 1, LOCKING_SCRIPT_HEX))
+                    .to_request(),
+            )
+            .await;
+            assert_eq!(resp.status(), StatusCode::OK);
+        })
+        .await;
+
+        let request = spans
+            .iter()
+            .find(|s| s.parent_span_id.to_string() == CALLER_SPAN_ID)
+            .unwrap_or_else(|| panic!("no span under the caller's: {spans:?}"));
+        assert_eq!(request.span_context.trace_id().to_string(), TRACE_ID);
+        assert_eq!(request.span_kind, opentelemetry::trace::SpanKind::Server);
+
+        let children = |name: &str| {
+            spans
+                .iter()
+                .filter(|s| s.name == name)
+                .inspect(|s| {
+                    assert_eq!(s.span_context.trace_id().to_string(), TRACE_ID, "{name}");
+                    assert_eq!(s.parent_span_id, request.span_context.span_id(), "{name}");
+                })
+                .count()
+        };
+        assert!(
+            children("chain get_utxo") >= 1,
+            "no chain read span: {spans:?}"
+        );
+        assert_eq!(children("chain broadcast_tx"), 1, "{spans:?}");
+    }
 }

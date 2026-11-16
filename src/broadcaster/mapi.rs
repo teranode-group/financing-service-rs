@@ -44,6 +44,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use chain_gang::messages::Tx;
 use chain_gang::util::Serializable;
+use tracing::Instrument as _;
 use uls_client::{Broadcast, BroadcastOptions, ClientError, MapiClient};
 use uls_core::wire::FeeAmount;
 
@@ -51,6 +52,7 @@ use super::{BroadcastError, TxBroadcaster, MAPI_LITE};
 use crate::config::{
     MapiLiteConfig, SubmitBudget, MAPI_LITE_PROBE_TIMEOUT, RETRY_BACKOFF_BASE, RETRY_BACKOFF_CAP,
 };
+use crate::telemetry::MAPI_RS_PEER_SERVICE;
 
 /// Hands transactions to a mapi-lite server.
 pub struct MapiBroadcaster {
@@ -338,39 +340,9 @@ impl MapiBroadcaster {
     }
 }
 
-impl From<ClientError> for BroadcastError {
-    /// Split a client error by what it says about the transaction, not by how
-    /// bad it looks.
-    ///
-    /// The question is only ever "might mapi-lite have taken this and relayed
-    /// it?". A connection that was refused took nothing. A request that was
-    /// sent and never answered may have taken everything.
-    fn from(error: ClientError) -> Self {
-        let detail = error.to_string();
-        // uls-client says which (CS-501): a timeout after sending, an answer
-        // that could not be read, or a mapi-lite `5xx` other than `503` may all
-        // have carried the transaction to a node -- mapi-lite answers `504`
-        // when a node may have received it and `503` only when none can have.
-        // A refused connection, a request that could not be built, a `4xx` or
-        // a `503` delivered nothing. Before uls-client said so, an exhausted
-        // retry run was a string and this had to guess "delivered nothing".
-        // A signature by a key that is not mapi-lite's counts as an answer that
-        // could not be read (CS-523): whatever really happened is unknown.
-        if error.may_have_been_delivered() {
-            BroadcastError::Indeterminate(detail)
-        } else {
-            BroadcastError::Upstream(detail)
-        }
-    }
-}
-
-#[async_trait]
-impl TxBroadcaster for MapiBroadcaster {
-    fn name(&self) -> &str {
-        MAPI_LITE
-    }
-
-    async fn broadcast_tx(&self, tx: &Tx) -> Result<String, BroadcastError> {
+impl MapiBroadcaster {
+    /// The broadcast [`TxBroadcaster::broadcast_tx`] traces.
+    async fn submit_tx(&self, tx: &Tx) -> Result<String, BroadcastError> {
         let mut raw = Vec::new();
         tx.write(&mut raw).map_err(|e| {
             BroadcastError::Upstream(format!("the funding transaction did not serialise: {e}"))
@@ -442,6 +414,65 @@ impl TxBroadcaster for MapiBroadcaster {
                 })
             }
         }
+    }
+}
+
+impl From<ClientError> for BroadcastError {
+    /// Split a client error by what it says about the transaction, not by how
+    /// bad it looks.
+    ///
+    /// The question is only ever "might mapi-lite have taken this and relayed
+    /// it?". A connection that was refused took nothing. A request that was
+    /// sent and never answered may have taken everything.
+    fn from(error: ClientError) -> Self {
+        let detail = error.to_string();
+        // uls-client says which (CS-501): a timeout after sending, an answer
+        // that could not be read, or a mapi-lite `5xx` other than `503` may all
+        // have carried the transaction to a node -- mapi-lite answers `504`
+        // when a node may have received it and `503` only when none can have.
+        // A refused connection, a request that could not be built, a `4xx` or
+        // a `503` delivered nothing. Before uls-client said so, an exhausted
+        // retry run was a string and this had to guess "delivered nothing".
+        // A signature by a key that is not mapi-lite's counts as an answer that
+        // could not be read (CS-523): whatever really happened is unknown.
+        if error.may_have_been_delivered() {
+            BroadcastError::Indeterminate(detail)
+        } else {
+            BroadcastError::Upstream(detail)
+        }
+    }
+}
+
+#[async_trait]
+impl TxBroadcaster for MapiBroadcaster {
+    fn name(&self) -> &str {
+        MAPI_LITE
+    }
+
+    /// In a client span of its own (CS-700), a child of the request's, so
+    /// the trace shows the time the broadcast took apart from the chain
+    /// reads. uls-client sends the span's `traceparent` with each attempt, so
+    /// mapi-lite's spans for `POST /mapi/txs` join the same trace. A failed
+    /// broadcast, an unknown outcome among them, is marked an error.
+    ///
+    /// The span is named after the callee's deployed `service.name`,
+    /// `mapi-rs`, and carries it as `peer.service`, so Tempo's service graph
+    /// draws the edge to the mapi-rs node (not to a `mapi_lite` one).
+    async fn broadcast_tx(&self, tx: &Tx) -> Result<String, BroadcastError> {
+        let span = tracing::info_span!(
+            "mapi-rs broadcast",
+            otel.name = "mapi-rs broadcast",
+            otel.kind = "client",
+            otel.status_code = tracing::field::Empty,
+            peer.service = MAPI_RS_PEER_SERVICE,
+            http.request.method = "POST",
+            url.template = "/mapi/txs",
+        );
+        let result = self.submit_tx(tx).instrument(span.clone()).await;
+        if result.is_err() {
+            span.record("otel.status_code", "ERROR");
+        }
+        result
     }
 
     /// Asks mapi-lite's `GET /ready` (CS-505).
@@ -1879,5 +1910,145 @@ mod tests {
         let broadcaster = broadcaster(&server);
         broadcaster.fee_satoshis_per_kb().await;
         broadcaster.fee_satoshis_per_kb().await;
+    }
+
+    /// CS-700: uls-client finds the caller's span through
+    /// `tracing-opentelemetry`, by the layer's type, so it sees this
+    /// service's spans only while both are on the same `tracing-opentelemetry`
+    /// (0.33) and `opentelemetry` (0.32). Otherwise no `traceparent` goes to
+    /// mapi-lite, and nothing fails. This is what fails instead, the day a
+    /// dependency bump moves one side.
+    #[tokio::test]
+    async fn cs_700_uls_client_sees_this_services_spans() {
+        use opentelemetry::trace::TraceContextExt as _;
+        use tracing_opentelemetry::OpenTelemetrySpanExt as _;
+
+        let client = MapiClient::new("http://127.0.0.1:9");
+        crate::test_support::traced_spans(async {
+            let span = tracing::info_span!("request");
+            let _entered = span.enter();
+            let context = span.context();
+            let span_context = context.span().span_context().clone();
+            let headers = client.trace_headers();
+            let traceparent = headers.get("traceparent").unwrap_or_else(|| {
+                panic!(
+                    "uls-client sends no traceparent under this service's span: its \
+                     tracing-opentelemetry/opentelemetry are not the versions this service \
+                     uses ({headers:?})"
+                )
+            });
+            assert_eq!(
+                traceparent,
+                &format!(
+                    "00-{}-{}-01",
+                    span_context.trace_id(),
+                    span_context.span_id()
+                )
+            );
+        })
+        .await;
+    }
+
+    /// CS-700: the broadcast is a client span of its own under the caller's,
+    /// and the request to mapi-lite carries that span's `traceparent`, so
+    /// mapi-lite's spans join the trace.
+    #[tokio::test]
+    async fn sr_tele_016_the_broadcast_is_a_child_span_and_sends_its_traceparent() {
+        let server = MockServer::start().await;
+        let tx = sample_tx();
+        let expected = tx.hash().encode();
+        Mock::given(method("POST"))
+            .and(path("/mapi/txs"))
+            .respond_with(ok(txs_payload(success(&expected, ""))))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let broadcaster = broadcaster(&server);
+
+        let spans = crate::test_support::traced_spans(async {
+            broadcaster
+                .broadcast_tx(&tx)
+                .instrument(tracing::info_span!("request"))
+                .await
+                .expect("accepted");
+        })
+        .await;
+
+        let request = spans.iter().find(|s| s.name == "request").expect("parent");
+        let broadcast = spans
+            .iter()
+            .find(|s| s.name == "mapi-rs broadcast")
+            .unwrap_or_else(|| panic!("no broadcast span: {spans:?}"));
+        assert_eq!(broadcast.parent_span_id, request.span_context.span_id());
+        assert_eq!(
+            broadcast.span_context.trace_id(),
+            request.span_context.trace_id()
+        );
+        assert_eq!(broadcast.span_kind, opentelemetry::trace::SpanKind::Client);
+        assert_eq!(broadcast.status, opentelemetry::trace::Status::Unset);
+        let attribute = |key: &str| {
+            broadcast
+                .attributes
+                .iter()
+                .find(|kv| kv.key.as_str() == key)
+                .map(|kv| kv.value.as_str().into_owned())
+        };
+        assert_eq!(attribute("peer.service").as_deref(), Some("mapi-rs"));
+        assert_eq!(attribute("http.request.method").as_deref(), Some("POST"));
+        assert_eq!(attribute("url.template").as_deref(), Some("/mapi/txs"));
+        for kv in &broadcast.attributes {
+            let value = kv.value.as_str();
+            assert!(
+                !value.contains("mapi_lite") && !value.contains("mapi-lite"),
+                "{kv:?}"
+            );
+        }
+
+        let requests = server.received_requests().await.expect("requests recorded");
+        let traceparent = requests[0]
+            .headers
+            .get("traceparent")
+            .expect("the broadcast carries a traceparent")
+            .to_str()
+            .unwrap()
+            .to_string();
+        assert_eq!(
+            traceparent,
+            format!(
+                "00-{}-{}-01",
+                broadcast.span_context.trace_id(),
+                broadcast.span_context.span_id()
+            )
+        );
+    }
+
+    /// A broadcast that fails is marked an error on its span.
+    #[tokio::test]
+    async fn sr_tele_016_a_failed_broadcast_marks_its_span_an_error() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/mapi/txs"))
+            .respond_with(ResponseTemplate::new(401))
+            .mount(&server)
+            .await;
+        let broadcaster = broadcaster(&server);
+
+        let spans = crate::test_support::traced_spans(async {
+            broadcaster
+                .broadcast_tx(&sample_tx())
+                .await
+                .expect_err("refused");
+        })
+        .await;
+
+        let broadcast = spans
+            .iter()
+            .find(|s| s.name == "mapi-rs broadcast")
+            .unwrap_or_else(|| panic!("no broadcast span: {spans:?}"));
+        assert!(
+            matches!(broadcast.status, opentelemetry::trace::Status::Error { .. }),
+            "{:?}",
+            broadcast.status
+        );
     }
 }

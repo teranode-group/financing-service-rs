@@ -35,7 +35,7 @@ The FS is designed to be as simple as possible, in that light it:
 * FS supports optional per-client API key authentication and an optional admin key for `POST /client`. Clients without an `api_key` rely on network isolation (firewalls, private networks, reverse proxies). See [Configuration](docs/Configuration.md) and [Supported endpoints](docs/SupportedEndpoints.md).
 * FS supports secret references (`env:VAR`), environment variable overrides, and `wif_env` / `api_key_env` when adding clients at runtime. See [Configuration](docs/Configuration.md#secret-management).
 * FS supports optional per-IP HTTP rate limiting (disabled by default). See [Configuration](docs/Configuration.md#rate-limiting).
-* FS supports optional OpenTelemetry trace export via OTLP (disabled by default). Each HTTP request creates a span; traces include resource metadata and request fields but not secrets or request bodies. See [Configuration](docs/Configuration.md#telemetry).
+* FS supports optional OpenTelemetry trace export via OTLP (disabled by default; `[telemetry] traces_exporter = "otlp"` or `OTEL_TRACES_EXPORTER=otlp`). Each HTTP request creates a span; traces include resource metadata and request fields but not secrets or request bodies. A request carrying a W3C `traceparent`, such as `POST /fund` from Event, joins the caller's trace, chain reads and the broadcast are child spans, and the broadcast passes the trace on to mapi-lite. See [Configuration](docs/Configuration.md#telemetry).
 * FS can also push metrics over OTLP (disabled by default; `OTEL_METRICS_EXPORTER=otlp`): requests by route and status, request duration, readiness, `/fund` outcomes, and each client's balance and chain-state age. See [Metrics](docs/Configuration.md#metrics).
 
 ## Use cases

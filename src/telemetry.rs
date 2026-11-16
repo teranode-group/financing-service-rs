@@ -11,7 +11,7 @@ use opentelemetry_sdk::{
 use tracing_opentelemetry::OpenTelemetryLayer;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 
-use crate::config::TelemetryConfig;
+use crate::config::{TelemetryConfig, TelemetryExporter};
 
 /// Keeps the tracer and meter providers alive, and flushes spans and metrics
 /// on shutdown.
@@ -49,7 +49,11 @@ impl Drop for TelemetryGuard {
 pub fn init(config: &TelemetryConfig) -> Result<Option<TelemetryGuard>, String> {
     let filter = log_filter(env::var("RUST_LOG").ok().as_deref())?;
 
-    let tracer_provider = if config.is_enabled() {
+    let tracer_provider = if config.traces_enabled() {
+        // W3C trace context both ways (CS-700): tracing-actix-web extracts an
+        // incoming `traceparent` through it, so a request from Event joins
+        // Event's trace, and uls-client injects one into every request to
+        // mapi-lite.
         global::set_text_map_propagator(TraceContextPropagator::new());
 
         let exporter = SpanExporter::builder()
@@ -58,6 +62,9 @@ pub fn init(config: &TelemetryConfig) -> Result<Option<TelemetryGuard>, String> 
             .build()
             .map_err(|e| format!("failed to create OTLP trace exporter: {e}"))?;
 
+        // The sampler is the SDK's own, read from `OTEL_TRACES_SAMPLER` and
+        // `OTEL_TRACES_SAMPLER_ARG` (default `parentbased_always_on`, every
+        // trace): not set here, so a deployment chooses its rate.
         let provider = SdkTracerProvider::builder()
             .with_batch_exporter(exporter)
             .with_resource(resource(config))
@@ -83,13 +90,7 @@ pub fn init(config: &TelemetryConfig) -> Result<Option<TelemetryGuard>, String> 
     for warning in config.ignored_resource_attribute_warnings() {
         log::warn!("{warning}");
     }
-    if tracer_provider.is_some() {
-        log::info!(
-            "OpenTelemetry enabled (service.name={}, otlp.endpoint={})",
-            config.effective_service_name(),
-            redact_endpoint(&config.effective_otlp_endpoint())
-        );
-    }
+    log::info!("{}", traces_startup_line(config));
 
     // After the subscriber, so the startup line is logged. Installed
     // globally: `global::meter` hands out the no-op meter until it is, which
@@ -137,9 +138,18 @@ fn resource(config: &TelemetryConfig) -> Resource {
 }
 
 const SERVICE_NAME: &str = "service.name";
+
+/// `peer.service` on every span for a call to mapi-rs (mapi-lite): the
+/// `service.name` mapi-rs is deployed under, so Tempo's service graph draws
+/// the edge to its node. Never `mapi-lite` or `mapi_lite`, which name no
+/// deployed service and would add a node of their own.
+pub const MAPI_RS_PEER_SERVICE: &str = "mapi-rs";
 const SERVICE_VERSION: &str = "service.version";
 const OTEL_RESOURCE_ATTRIBUTES: &str = "OTEL_RESOURCE_ATTRIBUTES";
 const OTEL_METRIC_EXPORT_INTERVAL: &str = "OTEL_METRIC_EXPORT_INTERVAL";
+const OTEL_TRACES_EXPORTER: &str = "OTEL_TRACES_EXPORTER";
+const OTEL_TRACES_SAMPLER: &str = "OTEL_TRACES_SAMPLER";
+const OTEL_TRACES_SAMPLER_ARG: &str = "OTEL_TRACES_SAMPLER_ARG";
 
 /// The SDK's metrics export interval when nothing sets one.
 pub const DEFAULT_METRIC_EXPORT_INTERVAL: Duration = Duration::from_secs(60);
@@ -148,6 +158,8 @@ pub const DEFAULT_METRIC_EXPORT_INTERVAL: Duration = Duration::from_secs(60);
 /// startup line.
 const FROM_TABLE_ATTRIBUTES: &str = "telemetry.resource_attributes";
 const FROM_TABLE_INTERVAL: &str = "telemetry.export_interval_sec";
+const FROM_TABLE_TRACES: &str = "telemetry.traces_exporter";
+const FROM_TABLE_ENABLED: &str = "telemetry.enabled";
 const FROM_DEFAULT: &str = "default";
 
 /// The OTLP metrics pipeline, or `None` when metrics export is off -- in which
@@ -177,6 +189,49 @@ pub fn build_meter_provider(config: &TelemetryConfig) -> Result<Option<SdkMeterP
             .with_resource(resource(config))
             .build(),
     ))
+}
+
+/// The one startup line saying whether spans are exported, what turned it on
+/// or off, where to and with which sampler (CS-700).
+pub fn traces_startup_line(config: &TelemetryConfig) -> String {
+    let (on, source) = config.traces_switch();
+    if on {
+        format!(
+            "OpenTelemetry trace export on from {source} (service.name={}, otlp.endpoint={}, \
+             sampler={})",
+            config.effective_service_name(),
+            redact_endpoint(&config.effective_otlp_endpoint()),
+            traces_sampler(
+                env::var(OTEL_TRACES_SAMPLER).ok().as_deref(),
+                env::var(OTEL_TRACES_SAMPLER_ARG).ok().as_deref()
+            )
+        )
+    } else if source == FROM_DEFAULT {
+        "OpenTelemetry trace export off (enable with [telemetry] traces_exporter = \"otlp\" or \
+         OTEL_TRACES_EXPORTER=otlp)"
+            .to_string()
+    } else {
+        format!("OpenTelemetry trace export off: {source} is not otlp")
+    }
+}
+
+/// The sampler the SDK builds from `OTEL_TRACES_SAMPLER` and
+/// `OTEL_TRACES_SAMPLER_ARG`, as the startup line names it. Each value is
+/// cut short, as it is printed as given.
+fn traces_sampler(sampler: Option<&str>, arg: Option<&str>) -> String {
+    let set = |value: Option<&str>| {
+        value
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(|value| value.chars().take(64).collect::<String>())
+    };
+    match (set(sampler), set(arg)) {
+        (None, _) => "parentbased_always_on (default)".to_string(),
+        (Some(sampler), None) => format!("{sampler} from {OTEL_TRACES_SAMPLER}"),
+        (Some(sampler), Some(arg)) => {
+            format!("{sampler} from {OTEL_TRACES_SAMPLER}, {OTEL_TRACES_SAMPLER_ARG}={arg}")
+        }
+    }
 }
 
 /// The one startup line saying whether metrics are exported, where to and how
@@ -255,14 +310,35 @@ pub fn log_filter(rust_log: Option<&str>) -> Result<EnvFilter, String> {
 }
 
 impl TelemetryConfig {
-    pub fn is_enabled(&self) -> bool {
-        if self.enabled {
-            return true;
+    /// Whether spans are exported over OTLP (CS-700). See
+    /// [`TelemetryConfig::traces_switch`].
+    pub fn traces_enabled(&self) -> bool {
+        self.traces_switch().0
+    }
+
+    /// Whether spans are exported, and the setting that decided it:
+    /// `OTEL_TRACES_EXPORTER` when it is set, else `traces_exporter = "otlp"`,
+    /// else `enabled = true`; off by default.
+    pub fn traces_switch(&self) -> (bool, &'static str) {
+        self.resolve_traces_switch(env::var(OTEL_TRACES_EXPORTER).ok().as_deref())
+    }
+
+    /// [`TelemetryConfig::traces_switch`] with `OTEL_TRACES_EXPORTER` given.
+    ///
+    /// The variable, set, decides alone -- `none` turns off what the table
+    /// turned on, as in mapi-lite (CS-698) -- and an empty one counts as
+    /// unset. Its value is matched ignoring case, so `OTLP` works as before.
+    fn resolve_traces_switch(&self, variable: Option<&str>) -> (bool, &'static str) {
+        if let Some(value) = variable.map(str::trim).filter(|value| !value.is_empty()) {
+            return (value.eq_ignore_ascii_case("otlp"), OTEL_TRACES_EXPORTER);
         }
-        matches!(
-            env::var("OTEL_TRACES_EXPORTER").as_deref(),
-            Ok("otlp") | Ok("OTLP")
-        )
+        if self.traces_exporter == TelemetryExporter::Otlp {
+            return (true, FROM_TABLE_TRACES);
+        }
+        if self.enabled {
+            return (true, FROM_TABLE_ENABLED);
+        }
+        (false, FROM_DEFAULT)
     }
 
     /// Whether metrics are exported over OTLP (CS-608): `enabled = true`, or
@@ -396,7 +472,7 @@ impl TelemetryConfig {
                     .to_string(),
             );
         }
-        if (self.is_enabled() || self.metrics_enabled())
+        if (self.traces_enabled() || self.metrics_enabled())
             && self.otlp_endpoint.as_deref().is_some_and(str::is_empty)
         {
             return Err("telemetry.otlp_endpoint cannot be empty when set".to_string());
@@ -426,7 +502,7 @@ mod tests {
         let _env = env_lock();
         unsafe { env::remove_var("OTEL_TRACES_EXPORTER") };
         let config = TelemetryConfig::default();
-        assert!(!config.is_enabled());
+        assert!(!config.traces_enabled());
     }
 
     #[test]
@@ -434,7 +510,7 @@ mod tests {
         let _env = env_lock();
         unsafe { env::set_var("OTEL_TRACES_EXPORTER", "otlp") };
         let config = TelemetryConfig::default();
-        assert!(config.is_enabled());
+        assert!(config.traces_enabled());
         unsafe { env::remove_var("OTEL_TRACES_EXPORTER") };
     }
 
@@ -513,7 +589,7 @@ mod tests {
         clear_metrics_env();
         unsafe { env::set_var("OTEL_TRACES_EXPORTER", "otlp") };
         let config = TelemetryConfig::default();
-        assert!(config.is_enabled());
+        assert!(config.traces_enabled());
         assert!(!config.metrics_enabled());
         unsafe { env::remove_var("OTEL_TRACES_EXPORTER") };
     }
@@ -525,7 +601,7 @@ mod tests {
         unsafe { env::set_var("OTEL_METRICS_EXPORTER", "otlp") };
         let config = TelemetryConfig::default();
         assert!(config.metrics_enabled());
-        assert!(!config.is_enabled(), "traces keep their own switch");
+        assert!(!config.traces_enabled(), "traces keep their own switch");
         clear_metrics_env();
     }
 
@@ -803,6 +879,122 @@ mod tests {
         };
         let err = config.validate().unwrap_err();
         assert!(err.contains("telemetry.export_interval_sec"), "{err}");
+    }
+
+    /// `traces_exporter = "otlp"` turns spans on, alone: not metrics.
+    /// `OTEL_TRACES_EXPORTER`, when set, decides over both table fields, so
+    /// `none` turns off what the table turned on; empty counts as unset.
+    #[test]
+    fn sr_tele_014_traces_exporter_and_otel_traces_exporter_decide_span_export() {
+        let off = TelemetryConfig::default();
+        let traces = TelemetryConfig {
+            traces_exporter: TelemetryExporter::Otlp,
+            ..Default::default()
+        };
+        let enabled = TelemetryConfig {
+            enabled: true,
+            ..Default::default()
+        };
+
+        assert_eq!(off.resolve_traces_switch(None), (false, FROM_DEFAULT));
+        assert_eq!(
+            traces.resolve_traces_switch(None),
+            (true, FROM_TABLE_TRACES)
+        );
+        assert_eq!(
+            enabled.resolve_traces_switch(None),
+            (true, FROM_TABLE_ENABLED)
+        );
+
+        for config in [&off, &traces, &enabled] {
+            assert_eq!(
+                config.resolve_traces_switch(Some("otlp")),
+                (true, OTEL_TRACES_EXPORTER)
+            );
+            assert_eq!(
+                config.resolve_traces_switch(Some(" OTLP ")),
+                (true, OTEL_TRACES_EXPORTER)
+            );
+            assert_eq!(
+                config.resolve_traces_switch(Some("none")),
+                (false, OTEL_TRACES_EXPORTER)
+            );
+        }
+        assert_eq!(
+            traces.resolve_traces_switch(Some(" ")),
+            (true, FROM_TABLE_TRACES)
+        );
+    }
+
+    #[test]
+    fn sr_tele_014_traces_exporter_does_not_turn_on_metrics() {
+        let _env = env_lock();
+        clear_metrics_env();
+        let config = TelemetryConfig {
+            traces_exporter: TelemetryExporter::Otlp,
+            ..Default::default()
+        };
+        assert!(!config.metrics_enabled());
+    }
+
+    /// The traces startup line says what decided, where to with no
+    /// credential, and the sampler; off, how to turn it on.
+    #[test]
+    fn sr_tele_014_the_traces_startup_line_names_source_endpoint_and_sampler() {
+        let _env = env_lock();
+        clear_metrics_env();
+        for name in [
+            OTEL_TRACES_EXPORTER,
+            OTEL_TRACES_SAMPLER,
+            OTEL_TRACES_SAMPLER_ARG,
+        ] {
+            unsafe { env::remove_var(name) };
+        }
+        let line = traces_startup_line(&TelemetryConfig::default());
+        assert!(line.contains("trace export off"), "{line}");
+        assert!(line.contains("traces_exporter = \"otlp\""), "{line}");
+
+        let config = TelemetryConfig {
+            traces_exporter: TelemetryExporter::Otlp,
+            otlp_endpoint: Some("http://user:secret@collector:4317".to_string()),
+            ..Default::default()
+        };
+        let line = traces_startup_line(&config);
+        assert!(line.contains("on from telemetry.traces_exporter"), "{line}");
+        assert!(
+            line.contains("otlp.endpoint=http://collector:4317"),
+            "{line}"
+        );
+        assert!(!line.contains("secret"), "{line}");
+        assert!(
+            line.contains("sampler=parentbased_always_on (default)"),
+            "{line}"
+        );
+
+        unsafe { env::set_var(OTEL_TRACES_SAMPLER, "parentbased_traceidratio") };
+        unsafe { env::set_var(OTEL_TRACES_SAMPLER_ARG, "0.1") };
+        let line = traces_startup_line(&config);
+        assert!(
+            line.contains(
+                "sampler=parentbased_traceidratio from OTEL_TRACES_SAMPLER, \
+                 OTEL_TRACES_SAMPLER_ARG=0.1"
+            ),
+            "{line}"
+        );
+
+        unsafe { env::set_var(OTEL_TRACES_EXPORTER, "none") };
+        let line = traces_startup_line(&config);
+        for name in [
+            OTEL_TRACES_EXPORTER,
+            OTEL_TRACES_SAMPLER,
+            OTEL_TRACES_SAMPLER_ARG,
+        ] {
+            unsafe { env::remove_var(name) };
+        }
+        assert!(
+            line.contains("trace export off: OTEL_TRACES_EXPORTER is not otlp"),
+            "{line}"
+        );
     }
 
     #[test]
