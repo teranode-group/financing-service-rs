@@ -9,7 +9,10 @@ use opentelemetry_sdk::{
     trace::SdkTracerProvider,
 };
 use tracing_opentelemetry::OpenTelemetryLayer;
-use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
+use tracing_subscriber::{
+    filter::filter_fn, fmt::MakeWriter, layer::SubscriberExt, registry::LookupSpan,
+    util::SubscriberInitExt, EnvFilter, Layer,
+};
 
 use crate::config::{TelemetryConfig, TelemetryExporter};
 
@@ -81,7 +84,7 @@ pub fn init(config: &TelemetryConfig) -> Result<Option<TelemetryGuard>, String> 
 
     tracing_subscriber::registry()
         .with(filter)
-        .with(tracing_subscriber::fmt::layer())
+        .with(fmt_layer(std::io::stdout))
         .with(otel_layer)
         .try_init()
         .map_err(|e| format!("failed to initialise tracing subscriber: {e}"))?;
@@ -138,6 +141,33 @@ fn resource(config: &TelemetryConfig) -> Resource {
 }
 
 const SERVICE_NAME: &str = "service.name";
+
+/// The target of this service's own trace spans (CS-700): the chain call
+/// spans, the background refresh's and the broadcast's. They exist for the
+/// trace, and the log output does not see them (see [`fmt_layer`]).
+///
+/// Inside the crate's own target, so a `RUST_LOG` such as
+/// `warn,financing_service=info` keeps them.
+pub const SPAN_TARGET: &str = "financing_service::otel";
+
+/// The log output, writing to `writer`.
+///
+/// It prints each enclosing span's name and fields before every log line.
+/// The spans under [`SPAN_TARGET`] are filtered out of it, so a warning
+/// logged during a broadcast reads as it did before CS-700 -- no
+/// `mapi-rs broadcast{otel.name=...}:` prefix -- with trace export on or
+/// off, and greps and alerts keyed on the message keep working.
+pub fn fmt_layer<S, W>(writer: W) -> impl Layer<S>
+where
+    S: tracing::Subscriber + for<'a> LookupSpan<'a>,
+    W: for<'w> MakeWriter<'w> + Send + Sync + 'static,
+{
+    tracing_subscriber::fmt::layer()
+        .with_writer(writer)
+        .with_filter(filter_fn(|metadata| {
+            !(metadata.is_span() && metadata.target() == SPAN_TARGET)
+        }))
+}
 
 /// `peer.service` on every span for a call to mapi-rs (mapi-lite): the
 /// `service.name` mapi-rs is deployed under, so Tempo's service graph draws
@@ -1008,5 +1038,52 @@ mod tests {
             "https://host:4317/v1"
         );
         assert_eq!(redact_endpoint("host:4317"), "host:4317");
+    }
+
+    /// CS-700 review, comment 3: the trace spans do not prefix log lines.
+    /// A warning logged during a broadcast reads as it did before, while an
+    /// ordinary span, such as the request's, still shows.
+    #[test]
+    fn sr_tele_016_trace_spans_stay_out_of_the_log_output() {
+        use std::io::Write;
+        use std::sync::{Arc, Mutex};
+
+        #[derive(Clone, Default)]
+        struct Buffer(Arc<Mutex<Vec<u8>>>);
+        impl Write for Buffer {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let buffer = Buffer::default();
+        let writer = buffer.clone();
+        let subscriber = tracing_subscriber::registry().with(fmt_layer(move || writer.clone()));
+        tracing::subscriber::with_default(subscriber, || {
+            let request = tracing::info_span!("fs_log_test_request", http.method = "POST");
+            let _request = request.enter();
+            let broadcast = tracing::info_span!(
+                target: SPAN_TARGET,
+                "mapi-rs broadcast",
+                otel.name = "mapi-rs broadcast",
+                peer.service = MAPI_RS_PEER_SERVICE,
+            );
+            let _broadcast = broadcast.enter();
+            tracing::warn!("fs log test: mapi-lite answered 503");
+        });
+
+        let output = String::from_utf8(buffer.0.lock().unwrap().clone()).unwrap();
+        assert!(
+            output.contains("fs log test: mapi-lite answered 503"),
+            "{output}"
+        );
+        assert!(output.contains("fs_log_test_request"), "{output}");
+        assert!(!output.contains("mapi-rs broadcast"), "{output}");
+        assert!(!output.contains("otel.name"), "{output}");
+        assert!(!output.contains("peer.service"), "{output}");
     }
 }

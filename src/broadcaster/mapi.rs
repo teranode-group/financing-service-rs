@@ -52,7 +52,7 @@ use super::{BroadcastError, TxBroadcaster, MAPI_LITE};
 use crate::config::{
     MapiLiteConfig, SubmitBudget, MAPI_LITE_PROBE_TIMEOUT, RETRY_BACKOFF_BASE, RETRY_BACKOFF_CAP,
 };
-use crate::telemetry::MAPI_RS_PEER_SERVICE;
+use crate::telemetry::{MAPI_RS_PEER_SERVICE, SPAN_TARGET};
 
 /// Hands transactions to a mapi-lite server.
 pub struct MapiBroadcaster {
@@ -460,6 +460,7 @@ impl TxBroadcaster for MapiBroadcaster {
     /// draws the edge to the mapi-rs node (not to a `mapi_lite` one).
     async fn broadcast_tx(&self, tx: &Tx) -> Result<String, BroadcastError> {
         let span = tracing::info_span!(
+            target: SPAN_TARGET,
             "mapi-rs broadcast",
             otel.name = "mapi-rs broadcast",
             otel.kind = "client",

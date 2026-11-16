@@ -6,8 +6,9 @@
 //! interface outermost and runs each call inside a client span named after
 //! it, so the time a call spends waiting for its pacing slot or running into
 //! its deadline is inside the span too. Under a request the span is a child of
-//! the request's; in the background refresh and the sweep it starts a trace of
-//! its own.
+//! the request's, and so is the background refresh a request prompts. A call
+//! made under no span -- the periodic sweep, the startup reads -- is not
+//! traced: each would be a one-span trace of its own, kept around the clock.
 //!
 //! The span is named `chain <call>` (`chain get_utxo`, `chain broadcast_tx`,
 //! ...) and carries the interface and the call, never the address or txid it
@@ -30,7 +31,7 @@ use chain_gang::network::Network;
 use chain_gang::util::ChainGangError;
 use tracing::Instrument as _;
 
-use crate::telemetry::MAPI_RS_PEER_SERVICE;
+use crate::telemetry::{MAPI_RS_PEER_SERVICE, SPAN_TARGET};
 
 /// Wraps a blockchain interface and traces each call.
 pub struct Traced {
@@ -55,15 +56,24 @@ impl Traced {
         call: &'static str,
         future: impl Future<Output = Result<T, ChainGangError>>,
     ) -> Result<T, ChainGangError> {
-        let span = tracing::info_span!(
-            "chain",
-            otel.name = name,
-            otel.kind = "client",
-            otel.status_code = tracing::field::Empty,
-            peer.service = tracing::field::Empty,
-            chain.interface = self.interface,
-            chain.call = call,
-        );
+        // Only under a span: a request's, or the background refresh one
+        // prompted. The periodic sweep and the startup reads run under none,
+        // and would otherwise start a one-span trace per call, around the
+        // clock, crowding the request traces out (CS-700 review).
+        let span = if tracing::Span::current().is_none() {
+            tracing::Span::none()
+        } else {
+            tracing::info_span!(
+                target: SPAN_TARGET,
+                "chain",
+                otel.name = name,
+                otel.kind = "client",
+                otel.status_code = tracing::field::Empty,
+                peer.service = tracing::field::Empty,
+                chain.interface = self.interface,
+                chain.call = call,
+            )
+        };
         if self.interface == MAPI_RS {
             span.record("peer.service", MAPI_RS_PEER_SERVICE);
         }
@@ -229,8 +239,12 @@ mod tests {
         let via_woc = Traced::new(test_blockchain_interface(&config).await, "woc");
 
         let spans = traced_spans(async {
-            via_mapi.get_utxo(TEST_ADDRESS).await.expect("read");
-            via_woc.status().await.expect("status");
+            async {
+                via_mapi.get_utxo(TEST_ADDRESS).await.expect("read");
+                via_woc.status().await.expect("status");
+            }
+            .instrument(tracing::info_span!("request"))
+            .await;
         })
         .await;
 
@@ -267,5 +281,21 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// CS-700 review, comment 2: a call made under no span -- the periodic
+    /// sweep, the startup reads -- is not traced, so it does not start a
+    /// one-span trace of its own every refresh period.
+    #[tokio::test]
+    async fn sr_tele_015_a_call_under_no_span_is_not_traced() {
+        let config = test_config(&unique_dynamic_config_path());
+        let interface = Traced::new(test_blockchain_interface(&config).await, "woc");
+
+        let spans = traced_spans(async {
+            interface.get_utxo(TEST_ADDRESS).await.expect("read");
+        })
+        .await;
+
+        assert!(spans.is_empty(), "{spans:?}");
     }
 }
