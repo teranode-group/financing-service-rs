@@ -41,17 +41,29 @@ impl TxBroadcaster for WocBroadcaster {
         // transport failure in their error type, so most things are upstream.
         // Not one that may have reached the network, though (CS-502, CS-718):
         // reporting it as failed would release inputs it spent (CS-501).
-        self.inner.broadcast_tx(tx).await.map_err(|e| {
-            // Refused before it was sent, its slot too far away (CS-736).
-            if crate::outbound_rate_limit::never_sent(&e) {
-                BroadcastError::NotSent(e.to_string())
-            } else if broadcast_may_have_been_delivered(&e) {
-                BroadcastError::Indeterminate(e.to_string())
-            } else {
-                BroadcastError::Upstream(e.to_string())
-            }
-        })?;
-        Ok(tx.hash().encode())
+        let txid = tx.hash().encode();
+        let Err(e) = self.inner.broadcast_tx(tx).await else {
+            return Ok(txid);
+        };
+        // Refused before it was sent, its slot too far away (CS-736).
+        let error = if crate::outbound_rate_limit::never_sent(&e) {
+            BroadcastError::NotSent(e.to_string())
+        } else if broadcast_may_have_been_delivered(&e) {
+            BroadcastError::Indeterminate(e.to_string())
+        } else {
+            BroadcastError::Upstream(e.to_string())
+        };
+        // The node already has this very transaction, so it is in the
+        // mempool or a block: a success, as mapi-lite answers it (#172
+        // review). Only from a reason this interface can read.
+        if self.reads_node_reason(&error) && error.already_known() {
+            log::info!(
+                "{}: the node already has {txid}, so it is broadcast: {error}",
+                self.name
+            );
+            return Ok(txid);
+        }
+        Err(error)
     }
 
     async fn health_check(&self) -> Result<(), BroadcastError> {
@@ -448,19 +460,71 @@ mod tests {
     }
 
     /// #172 review: a refusal saying the node already has the transaction
-    /// (`257: txn-already-known`) means its inputs are spent, by this very
-    /// transaction, so it is read as a conflict: own change it claimed is not
-    /// offered again, where the next request would be refused for it.
+    /// means this very transaction is in its mempool or a block, so the
+    /// broadcast succeeded, as mapi-lite answers it. Answered as a failure,
+    /// the request's idempotency key and funding-limit hold were freed, and a
+    /// retry paid the client a second time.
     #[tokio::test]
-    async fn an_already_known_transaction_spent_its_inputs() {
+    async fn an_already_known_transaction_is_broadcast() {
+        let tx = sample_tx();
+        // Through `uaas` (and `woc`): the node's reason in the body.
         let (_s, broadcaster) = uaas_answering(
             wiremock::ResponseTemplate::new(400).set_body_string("257: txn-already-known"),
         )
         .await;
+        assert_eq!(
+            broadcaster.broadcast_tx(&tx).await.expect("already known"),
+            tx.hash().encode()
+        );
+
+        // Through `rpc`, in each form SV Node words it.
+        fn known() -> ChainGangError {
+            ChainGangError::ResponseError(
+                "sendrawtransaction failed with code -26: 257: txn-already-known".to_string(),
+            )
+        }
+        fn in_chain() -> ChainGangError {
+            ChainGangError::ResponseError(
+                "sendrawtransaction failed with code -27: transaction already in block chain"
+                    .to_string(),
+            )
+        }
+        for error in [known as fn() -> ChainGangError, in_chain] {
+            let blockchain = Arc::new(ConflictingBlockchain {
+                inner: tokio::sync::Mutex::new(chain_gang::interface::TestInterface::new()),
+                error,
+            });
+            let broadcaster = WocBroadcaster::new(blockchain, "rpc");
+            assert_eq!(
+                broadcaster.broadcast_tx(&tx).await.expect("already known"),
+                tx.hash().encode(),
+                "{}",
+                error()
+            );
+        }
+    }
+
+    /// Only a reason the broadcaster can read makes a refusal a success: the
+    /// words with no reject code through `uaas`, or a gateway's 5xx carrying
+    /// them (CS-718), still fail, and the own change stays held.
+    #[tokio::test]
+    async fn an_already_known_refusal_that_cannot_be_read_still_fails() {
+        let (_s, broadcaster) = uaas_answering(
+            wiremock::ResponseTemplate::new(400).set_body_string("txn-already-known"),
+        )
+        .await;
         let error = broadcaster.broadcast_tx(&sample_tx()).await.unwrap_err();
-        assert!(broadcaster.reads_node_reason(&error), "{error}");
-        assert!(error.inputs_conflicted(), "{error}");
-        assert!(!error.inputs_missing(), "{error}");
+        assert!(!broadcaster.reads_node_reason(&error), "{error}");
+
+        let (_s, broadcaster) = uaas_answering(
+            wiremock::ResponseTemplate::new(502).set_body_string("257: txn-already-known"),
+        )
+        .await;
+        let error = broadcaster.broadcast_tx(&sample_tx()).await.unwrap_err();
+        assert!(
+            matches!(error, BroadcastError::Indeterminate(_)),
+            "{error:?}"
+        );
     }
 
     // --- CS-718: what a failed HTTP broadcast says about delivery ---------

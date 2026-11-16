@@ -107,11 +107,7 @@ impl BroadcastError {
     }
 
     /// Whether the node refused the transaction because an input is already
-    /// spent: by another transaction (CS-691), or by this one, which the node
-    /// already has (`257: txn-already-known`, `txn-already-in-mempool`,
-    /// "already in block chain"). Either way its inputs, own change included,
-    /// are spent, and offering that change again would have the next request
-    /// refused as a conflict (#172 review).
+    /// spent by another transaction (CS-691).
     ///
     /// mapi-lite says so in structure: a refusal naming the transactions it
     /// conflicted with is a conflict whatever its description says (CS-692).
@@ -134,9 +130,22 @@ impl BroadcastError {
         let Some(description) = self.node_reason() else {
             return false;
         };
-        description.contains("txn-mempool-conflict")
-            || description.contains("double-spend")
-            || description.contains("txn-already-known")
+        description.contains("txn-mempool-conflict") || description.contains("double-spend")
+    }
+
+    /// Whether the node refused the transaction because it already has it:
+    /// `257: txn-already-known`, `txn-already-in-mempool`, or `rpc`'s
+    /// "already in the mempool" and "already in block chain". The node keys
+    /// that by txid, so it is this very transaction, in the mempool or a
+    /// block: what the broadcast was for. [`woc::WocBroadcaster`] answers it
+    /// as a success, as mapi-lite does (#172 review), where a failure freed
+    /// the request's idempotency key and funding-limit hold, and a retry paid
+    /// the client again.
+    pub fn already_known(&self) -> bool {
+        let Some(description) = self.node_reason() else {
+            return false;
+        };
+        description.contains("txn-already-known")
             || description.contains("txn-already-in-mempool")
             || description.contains("already in the mempool")
             || description.contains("already in block chain")
@@ -304,7 +313,7 @@ mod tests {
             "Invalid response: response.status() = 400 Bad Request: 16: missing-inputs"
         )
         .inputs_missing());
-        // The node already has it: its inputs are spent by this transaction
+        // The node already has it: not a conflict, but the transaction itself
         // (#172 review).
         for already in [
             "Invalid response: response.status() = 400 Bad Request: 257: txn-already-known",
@@ -312,8 +321,14 @@ mod tests {
             "sendrawtransaction failed with code -27: Transaction already in the mempool",
             "sendrawtransaction failed with code -27: transaction already in block chain",
         ] {
-            assert!(upstream(already).inputs_conflicted(), "{already}");
+            assert!(upstream(already).already_known(), "{already}");
+            assert!(!upstream(already).inputs_conflicted(), "{already}");
         }
+        assert!(!upstream(
+            "Invalid response: response.status() = 400 Bad Request: 258: txn-mempool-conflict"
+        )
+        .already_known());
+        assert!(!BroadcastError::Indeterminate("txn-already-known".to_string()).already_known());
         assert!(!upstream("http status 503").inputs_conflicted());
         assert!(!upstream("http status 503").inputs_missing());
         // An outcome that may never have reached the node says nothing.
