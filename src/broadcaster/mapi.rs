@@ -457,7 +457,7 @@ impl TxBroadcaster for MapiBroadcaster {
     /// for the log line; the `/ready` body this service returns stays generic.
     /// mapi-lite passes the node's reject reason through, and names the
     /// transactions a refusal conflicted with (CS-691).
-    fn reads_node_reasons(&self) -> bool {
+    fn reads_node_reason(&self, _error: &BroadcastError) -> bool {
         true
     }
 

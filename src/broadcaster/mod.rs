@@ -82,11 +82,10 @@ impl BroadcastError {
     /// (`sendrawtransaction failed with code -26: 258: txn-mempool-conflict`),
     /// and from chain-gang 0.13.2 the `woc` and `uaas` interfaces put the
     /// refusal's body after its status (`response.status() = 400 Bad Request:
-    /// 258: txn-mempool-conflict`, CS-701). Only the `test` interface leaves
-    /// nothing to read, and [`TxBroadcaster::reads_node_reasons`] says so. An
-    /// indeterminate or
-    /// untrusted outcome is never read, since it says nothing definite about
-    /// the inputs.
+    /// 258: txn-mempool-conflict`, CS-701). Whether a given refusal carries a
+    /// reason is [`TxBroadcaster::reads_node_reason`]'s to say. An
+    /// indeterminate or untrusted outcome is never read, since it says nothing
+    /// definite about the inputs.
     fn node_reason(&self) -> Option<String> {
         match self {
             BroadcastError::Rejected { description, .. } => Some(description.to_ascii_lowercase()),
@@ -108,17 +107,21 @@ impl BroadcastError {
     }
 
     /// Whether the node refused the transaction because an input is already
-    /// spent by another transaction (CS-691).
+    /// spent: by another transaction (CS-691), or by this one, which the node
+    /// already has (`257: txn-already-known`, `txn-already-in-mempool`,
+    /// "already in block chain"). Either way its inputs, own change included,
+    /// are spent, and offering that change again would have the next request
+    /// refused as a conflict (#172 review).
     ///
     /// mapi-lite says so in structure: a refusal naming the transactions it
     /// conflicted with is a conflict whatever its description says (CS-692).
     /// Without that -- through the blockchain interface, or a mapi-lite
     /// refusal naming none -- it is read off the node's reason
     /// ([`Self::node_reason`]): SV Node's `258 txn-mempool-conflict`, or a
-    /// double-spend. A broadcaster that cannot read the reason makes the
-    /// service treat any refusal as one that may have been a conflict
-    /// ([`TxBroadcaster::reads_node_reasons`]); `woc` and `uaas` can, from
-    /// chain-gang 0.13.2 (CS-701).
+    /// double-spend. A refusal whose reason the broadcaster cannot read makes
+    /// the service treat it as one that may have been a conflict
+    /// ([`TxBroadcaster::reads_node_reason`]); through `woc` and `uaas` the
+    /// reason can be read from chain-gang 0.13.2 (CS-701).
     pub fn inputs_conflicted(&self) -> bool {
         if let BroadcastError::Rejected {
             conflicted_with, ..
@@ -131,7 +134,12 @@ impl BroadcastError {
         let Some(description) = self.node_reason() else {
             return false;
         };
-        description.contains("txn-mempool-conflict") || description.contains("double-spend")
+        description.contains("txn-mempool-conflict")
+            || description.contains("double-spend")
+            || description.contains("txn-already-known")
+            || description.contains("txn-already-in-mempool")
+            || description.contains("already in the mempool")
+            || description.contains("already in block chain")
     }
 
     /// Whether the upstream refused the transaction because an input does not
@@ -194,14 +202,18 @@ pub trait TxBroadcaster: Send + Sync {
     /// total.
     async fn health_check(&self) -> Result<(), BroadcastError>;
 
-    /// Whether a refusal from this broadcaster carries the node's own reason
-    /// (CS-691), so [`BroadcastError::inputs_conflicted`] and
+    /// Whether `error`, a refusal from this broadcaster, carries the node's
+    /// own reason (CS-691), so [`BroadcastError::inputs_conflicted`] and
     /// [`BroadcastError::inputs_missing`] can be read off it. mapi-lite's
-    /// does. Of chain-gang's interfaces, `rpc` keeps the node's message, and
-    /// `woc` and `uaas` the refusal's body after its status (chain-gang
-    /// 0.13.2, CS-701). Without it, the service treats a refusal as one that
-    /// may have been a conflict. `false` unless a broadcaster says otherwise.
-    fn reads_node_reasons(&self) -> bool {
+    /// refusals do. Of chain-gang's interfaces, `rpc` keeps the node's
+    /// message, and `woc` and `uaas` the refusal's body after its status
+    /// (chain-gang 0.13.2, CS-701) -- when there is one: a refusal with an
+    /// empty body, or one that names no reject code, says nothing, so it is
+    /// decided per refusal (#172 review). Without a reason, the service treats
+    /// a refusal as one that may have been a conflict. `false` unless a
+    /// broadcaster says otherwise.
+    fn reads_node_reason(&self, error: &BroadcastError) -> bool {
+        let _ = error;
         false
     }
 
@@ -292,6 +304,16 @@ mod tests {
             "Invalid response: response.status() = 400 Bad Request: 16: missing-inputs"
         )
         .inputs_missing());
+        // The node already has it: its inputs are spent by this transaction
+        // (#172 review).
+        for already in [
+            "Invalid response: response.status() = 400 Bad Request: 257: txn-already-known",
+            "Invalid response: sendrawtransaction failed with code -26: 257: txn-already-known",
+            "sendrawtransaction failed with code -27: Transaction already in the mempool",
+            "sendrawtransaction failed with code -27: transaction already in block chain",
+        ] {
+            assert!(upstream(already).inputs_conflicted(), "{already}");
+        }
         assert!(!upstream("http status 503").inputs_conflicted());
         assert!(!upstream("http status 503").inputs_missing());
         // An outcome that may never have reached the node says nothing.
