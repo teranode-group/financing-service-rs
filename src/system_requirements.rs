@@ -306,7 +306,10 @@ mod tests {
     }
 
     /// CS-739: `docker stop` waits the shutdown grace out (CS-719) before it
-    /// kills the container, where Docker's own 10s cut a funding off.
+    /// kills the container, where Docker's own 10s cut a funding off. At the
+    /// default timeouts, whichever way the service broadcasts: through
+    /// mapi-lite, through the interface, or through an interface it paces
+    /// itself, the longest (CS-736).
     #[test]
     fn cs_739_run_sh_lets_a_funding_finish_before_docker_kills_it() {
         let run = instructions("run.sh").join("\n");
@@ -317,16 +320,22 @@ mod tests {
             .and_then(|rest| rest.split('}').next())
             .and_then(|n| n.parse().ok())
             .expect("FS_STOP_TIMEOUT has a numeric default");
-        let config = crate::config::Config {
+        let through_mapi_lite = crate::config::Config {
             mapi_lite: Some(crate::config::MapiLiteConfig::for_base_url("http://mapi")),
             ..Default::default()
         };
-        let grace = config.shutdown_grace().expect("bounded at the defaults");
-        assert!(
-            default > grace.as_secs(),
-            "run.sh stops after {default}s, before the {}s grace",
-            grace.as_secs()
-        );
+        let through_the_interface = crate::config::Config::default();
+        let mut paced_here = crate::config::Config::default();
+        paced_here.blockchain_interface.max_requests_per_second = Some(2);
+        assert!(paced_here.blockchain_interface.paced_here());
+        for config in [through_mapi_lite, through_the_interface, paced_here] {
+            let grace = config.shutdown_grace().expect("bounded at the defaults");
+            assert!(
+                default > grace.as_secs(),
+                "run.sh stops after {default}s, before the {}s grace",
+                grace.as_secs()
+            );
+        }
     }
 
     #[test]
