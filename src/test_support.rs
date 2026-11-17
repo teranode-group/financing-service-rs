@@ -568,7 +568,8 @@ impl TxBroadcaster for FailingBroadcaster {
 pub struct ScriptedBroadcaster {
     answers: std::sync::Mutex<std::collections::VecDeque<Option<BroadcastError>>>,
     sent: std::sync::Mutex<Vec<Tx>>,
-    /// [`TxBroadcaster::reads_node_reasons`]: as mapi-lite, or as `woc`.
+    /// [`TxBroadcaster::reads_node_reason`], for every refusal: as mapi-lite,
+    /// or as the `test` interface.
     reads_reasons: bool,
 }
 
@@ -602,7 +603,7 @@ impl TxBroadcaster for ScriptedBroadcaster {
         "scripted"
     }
 
-    fn reads_node_reasons(&self) -> bool {
+    fn reads_node_reason(&self, _error: &BroadcastError) -> bool {
         self.reads_reasons
     }
 

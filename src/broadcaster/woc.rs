@@ -41,17 +41,29 @@ impl TxBroadcaster for WocBroadcaster {
         // transport failure in their error type, so most things are upstream.
         // Not one that may have reached the network, though (CS-502, CS-718):
         // reporting it as failed would release inputs it spent (CS-501).
-        self.inner.broadcast_tx(tx).await.map_err(|e| {
-            // Refused before it was sent, its slot too far away (CS-736).
-            if crate::outbound_rate_limit::never_sent(&e) {
-                BroadcastError::NotSent(e.to_string())
-            } else if broadcast_may_have_been_delivered(&e) {
-                BroadcastError::Indeterminate(e.to_string())
-            } else {
-                BroadcastError::Upstream(e.to_string())
-            }
-        })?;
-        Ok(tx.hash().encode())
+        let txid = tx.hash().encode();
+        let Err(e) = self.inner.broadcast_tx(tx).await else {
+            return Ok(txid);
+        };
+        // Refused before it was sent, its slot too far away (CS-736).
+        let error = if crate::outbound_rate_limit::never_sent(&e) {
+            BroadcastError::NotSent(e.to_string())
+        } else if broadcast_may_have_been_delivered(&e) {
+            BroadcastError::Indeterminate(e.to_string())
+        } else {
+            BroadcastError::Upstream(e.to_string())
+        };
+        // The node already has this very transaction, so it is in the
+        // mempool or a block: a success, as mapi-lite answers it (#172
+        // review). Only from a reason this interface can read.
+        if self.reads_node_reason(&error) && error.already_known() {
+            log::info!(
+                "{}: the node already has {txid}, so it is broadcast: {error}",
+                self.name
+            );
+            return Ok(txid);
+        }
+        Err(error)
     }
 
     async fn health_check(&self) -> Result<(), BroadcastError> {
@@ -61,11 +73,62 @@ impl TxBroadcaster for WocBroadcaster {
             .map_err(|e| BroadcastError::Upstream(e.to_string()))
     }
 
-    /// Only `rpc` keeps the node's reject reason in its error; chain-gang
-    /// 0.13.1's `woc` and `uaas` keep only the HTTP status (CS-691).
-    fn reads_node_reasons(&self) -> bool {
-        self.name == "rpc"
+    /// `rpc` keeps the node's reject reason in its error. From chain-gang
+    /// 0.13.2 `woc` and `uaas` keep the refusal's body, where WhatsOnChain and
+    /// UaaS put the node's reason (CS-701), but only a body that names a reject
+    /// code (`258: txn-mempool-conflict`) is read: an empty one, or an error
+    /// page, says nothing, and the refusal is treated as one that may have been
+    /// a conflict, as before 0.13.2 (#172 review). The `test` interface keeps
+    /// none.
+    fn reads_node_reason(&self, error: &BroadcastError) -> bool {
+        match self.name.as_str() {
+            "rpc" => true,
+            "woc" | "uaas" => error
+                .node_reason()
+                .is_some_and(|text| refusal_names_a_reject_code(&text)),
+            _ => false,
+        }
     }
+}
+
+/// SV Node's reject codes: the P2P ones in `consensus/validation.h`
+/// (`REJECT_MALFORMED` to `REJECT_RATE_EXCEEDED`) and the internal ones in
+/// `validation.h` (`REJECT_HIGHFEE` to `REJECT_MEMPOOL_FULL`). The node words
+/// a refusal `<code>: <reason>`.
+const NODE_REJECT_CODES: [u32; 15] = [
+    1, 16, 17, 18, 19, 64, 65, 66, 67, 68, 69, 256, 257, 258, 259,
+];
+
+/// Whether chain-gang's `response.status() = <status>: <body>` has a body
+/// naming a node's reject code: one of [`NODE_REJECT_CODES`] followed by
+/// `: `, as in `258: txn-mempool-conflict` or WhatsOnChain's `unexpected
+/// response code 500: 16: missing-inputs`. Any other number is not the
+/// node's: a body echoing the HTTP status (`400: Bad Request`, aiohttp's
+/// default) names no reason (#172 review). The status (`400 Bad Request`)
+/// never holds `: `, so the body is what follows the first one.
+fn refusal_names_a_reject_code(text: &str) -> bool {
+    let Some((_, status_and_body)) = text.split_once("response.status() = ") else {
+        return false;
+    };
+    let Some((_, mut rest)) = status_and_body.split_once(": ") else {
+        return false;
+    };
+    while let Some(start) = rest.find(|c: char| c.is_ascii_digit()) {
+        let digits = &rest[start..];
+        let len = digits
+            .find(|c: char| !c.is_ascii_digit())
+            .unwrap_or(digits.len());
+        let (number, after) = digits.split_at(len);
+        if after.starts_with(": ")
+            && number
+                .parse()
+                .is_ok_and(|code: u32| NODE_REJECT_CODES.contains(&code))
+        {
+            return true;
+        }
+        rest = after;
+    }
+    false
 }
 
 /// Whether a failed broadcast may still have reached the network (CS-718).
@@ -77,11 +140,12 @@ impl TxBroadcaster for WocBroadcaster {
 ///   which for `woc` and `uaas` means a 200: they read the body only then.
 ///   For `rpc` it can be any status, and reading the node's verdict is what
 ///   failed.
-/// * **A 5xx other than 503.** chain-gang 0.13.1 turns every status but 200
-///   into `ResponseError("response.status() = 502 Bad Gateway")`, keeping
-///   only the status. A gateway's 502 or 504 can follow WhatsOnChain relaying
-///   the transaction, and a 500 can be WhatsOnChain failing after it. A 503
-///   is a server turning the request away, and a 4xx is it refusing it.
+/// * **A 5xx other than 503.** chain-gang turns every status but 200 into
+///   `ResponseError("response.status() = 502 Bad Gateway")`, followed from
+///   0.13.2 by the body (CS-701). A gateway's 502 or 504 can follow
+///   WhatsOnChain relaying the transaction, and a 500 can be WhatsOnChain
+///   failing after it. A 503 is a server turning the request away, and a 4xx
+///   is it refusing it.
 /// * **An answer that is not one.** `rpc` reads the node's body for every
 ///   status; one it cannot parse is a node, or something in front of it, that
 ///   may have taken the transaction first, unless its status says the request
@@ -199,8 +263,8 @@ mod tests {
 
     /// A node behind the blockchain interface that refuses every broadcast
     /// as a mempool conflict, with the error the interface really returns:
-    /// `rpc` keeps the node's message, and `woc` (and `uaas`) only the HTTP
-    /// status, the body dropped (chain-gang 0.13.1, `woc_interface.rs`).
+    /// `rpc` keeps the node's message, and `woc` (and `uaas`) the HTTP status
+    /// followed by the body (chain-gang 0.13.2, `woc_interface.rs`).
     struct ConflictingBlockchain {
         inner: tokio::sync::Mutex<chain_gang::interface::TestInterface>,
         error: fn() -> chain_gang::util::ChainGangError,
@@ -261,39 +325,206 @@ mod tests {
             },
         });
         let broadcaster = WocBroadcaster::new(blockchain, "rpc");
-        assert!(broadcaster.reads_node_reasons());
         let error = broadcaster
             .broadcast_tx(&sample_tx())
             .await
             .expect_err("refused");
+        assert!(broadcaster.reads_node_reason(&error));
         assert!(error.inputs_conflicted(), "classified as: {error}");
         assert!(!error.inputs_missing(), "classified as: {error}");
     }
 
-    /// Through `woc` (and `uaas`) the same refusal arrives as the HTTP status
-    /// alone: nothing says it was a conflict, and the broadcaster says it
-    /// cannot read node reasons, so the service treats it as one that may
-    /// have been (#160 review).
+    /// Through `woc` (and `uaas`) the same refusal arrives with the node's
+    /// reason after the HTTP status (chain-gang 0.13.2), so it is read as a
+    /// conflict, as through `rpc` (CS-701). Before 0.13.2 the status came
+    /// alone, and the service had to treat any refusal as one that may have
+    /// been (#160 review).
     #[tokio::test]
-    async fn cs_691_a_conflict_through_woc_cannot_be_read() {
+    async fn cs_701_a_conflict_through_woc_is_a_conflict() {
         let blockchain = Arc::new(ConflictingBlockchain {
             inner: tokio::sync::Mutex::new(chain_gang::interface::TestInterface::new()),
-            // chain-gang 0.13.1's `woc_interface.rs` on a non-200 answer.
+            // chain-gang 0.13.2's `woc_interface.rs` on a non-200 answer.
             error: || {
                 chain_gang::util::ChainGangError::ResponseError(
-                    "response.status() = 400 Bad Request".to_string(),
+                    "response.status() = 400 Bad Request: 258: txn-mempool-conflict".to_string(),
                 )
             },
         });
         for name in ["woc", "uaas"] {
             let broadcaster = WocBroadcaster::new(blockchain.clone(), name);
-            assert!(!broadcaster.reads_node_reasons(), "{name}");
             let error = broadcaster
                 .broadcast_tx(&sample_tx())
                 .await
                 .expect_err("refused");
-            assert!(!error.inputs_conflicted(), "classified as: {error}");
+            assert!(broadcaster.reads_node_reason(&error), "{name}");
+            assert!(error.inputs_conflicted(), "{name} classified as: {error}");
+            assert!(!error.inputs_missing(), "{name} classified as: {error}");
         }
+        // Only the `test` interface has no reason to read.
+        let test = WocBroadcaster::new(blockchain, "test");
+        let error = test.broadcast_tx(&sample_tx()).await.expect_err("refused");
+        assert!(!test.reads_node_reason(&error));
+    }
+
+    /// CS-701: a refusal from a real UaaS endpoint, through chain-gang, reaches
+    /// the service with the node's reason in its text: a conflict and a
+    /// missing input are each read as such. A 502 carrying the same words is
+    /// still an unknown outcome (CS-718), which is never read.
+    #[tokio::test]
+    async fn cs_701_a_refusal_reaches_the_service_with_the_nodes_reason() {
+        let (_s, broadcaster) = uaas_answering(
+            wiremock::ResponseTemplate::new(400).set_body_string("258: txn-mempool-conflict"),
+        )
+        .await;
+        let conflict = broadcaster.broadcast_tx(&sample_tx()).await.unwrap_err();
+        assert!(
+            matches!(conflict, BroadcastError::Upstream(_)),
+            "{conflict:?}"
+        );
+        assert!(
+            conflict.to_string().contains("txn-mempool-conflict"),
+            "{conflict}"
+        );
+        assert!(
+            conflict.inputs_conflicted() && !conflict.inputs_missing(),
+            "{conflict}"
+        );
+
+        let (_s, broadcaster) = uaas_answering(
+            wiremock::ResponseTemplate::new(400).set_body_string("16: missing-inputs"),
+        )
+        .await;
+        let missing = broadcaster.broadcast_tx(&sample_tx()).await.unwrap_err();
+        assert!(
+            missing.inputs_missing() && !missing.inputs_conflicted(),
+            "{missing}"
+        );
+
+        let (_s, broadcaster) = uaas_answering(
+            wiremock::ResponseTemplate::new(502).set_body_string("258: txn-mempool-conflict"),
+        )
+        .await;
+        let gateway = broadcaster.broadcast_tx(&sample_tx()).await.unwrap_err();
+        assert!(
+            matches!(gateway, BroadcastError::Indeterminate(_)),
+            "{gateway:?}"
+        );
+        assert!(!gateway.inputs_conflicted(), "{gateway}");
+    }
+
+    /// #172 review: through `woc` and `uaas`, whether a refusal can be read
+    /// is decided per refusal. One whose body names a reject code is read;
+    /// one with an empty body, or an error page naming none, says nothing, so
+    /// the service treats it as one that may have been a conflict and holds
+    /// the own change it claimed, as before chain-gang 0.13.2. A body echoing
+    /// the HTTP status (`400: Bad Request`) names no reject code either.
+    #[tokio::test]
+    async fn cs_701_a_refusal_with_no_reject_code_is_not_read() {
+        for (body, read) in [
+            ("258: txn-mempool-conflict", true),
+            ("unexpected response code 500: 16: missing-inputs", true),
+            ("", false),
+            ("<html><body>Bad request</body></html>", false),
+            ("400: Bad Request", false),
+            ("404: Not Found", false),
+            ("Error 400: Bad Request", false),
+        ] {
+            let (_s, broadcaster) =
+                uaas_answering(wiremock::ResponseTemplate::new(400).set_body_string(body)).await;
+            let error = broadcaster.broadcast_tx(&sample_tx()).await.unwrap_err();
+            assert!(matches!(error, BroadcastError::Upstream(_)), "{error:?}");
+            assert_eq!(
+                broadcaster.reads_node_reason(&error),
+                read,
+                "{body:?}: {error}"
+            );
+        }
+    }
+
+    /// #172 review: only SV Node's own reject codes are read; a number next
+    /// to one, or an HTTP status, is not.
+    #[test]
+    fn only_the_nodes_reject_codes_are_read() {
+        let refusal = |body: &str| format!("response.status() = 400 Bad Request: {body}");
+        for code in NODE_REJECT_CODES {
+            let body = format!("{code}: reason");
+            assert!(refusal_names_a_reject_code(&refusal(&body)), "{body}");
+        }
+        for code in [0, 2, 15, 20, 63, 70, 255, 260, 400, 404, 500, 503] {
+            let body = format!("{code}: reason");
+            assert!(!refusal_names_a_reject_code(&refusal(&body)), "{body}");
+        }
+        assert!(!refusal_names_a_reject_code(&refusal(
+            "99999999999999999999999: reason"
+        )));
+    }
+
+    /// #172 review: a refusal saying the node already has the transaction
+    /// means this very transaction is in its mempool or a block, so the
+    /// broadcast succeeded, as mapi-lite answers it. Answered as a failure,
+    /// the request's idempotency key and funding-limit hold were freed, and a
+    /// retry paid the client a second time.
+    #[tokio::test]
+    async fn an_already_known_transaction_is_broadcast() {
+        let tx = sample_tx();
+        // Through `uaas` (and `woc`): the node's reason in the body.
+        let (_s, broadcaster) = uaas_answering(
+            wiremock::ResponseTemplate::new(400).set_body_string("257: txn-already-known"),
+        )
+        .await;
+        assert_eq!(
+            broadcaster.broadcast_tx(&tx).await.expect("already known"),
+            tx.hash().encode()
+        );
+
+        // Through `rpc`, in each form SV Node words it.
+        fn known() -> ChainGangError {
+            ChainGangError::ResponseError(
+                "sendrawtransaction failed with code -26: 257: txn-already-known".to_string(),
+            )
+        }
+        fn in_chain() -> ChainGangError {
+            ChainGangError::ResponseError(
+                "sendrawtransaction failed with code -27: transaction already in block chain"
+                    .to_string(),
+            )
+        }
+        for error in [known as fn() -> ChainGangError, in_chain] {
+            let blockchain = Arc::new(ConflictingBlockchain {
+                inner: tokio::sync::Mutex::new(chain_gang::interface::TestInterface::new()),
+                error,
+            });
+            let broadcaster = WocBroadcaster::new(blockchain, "rpc");
+            assert_eq!(
+                broadcaster.broadcast_tx(&tx).await.expect("already known"),
+                tx.hash().encode(),
+                "{}",
+                error()
+            );
+        }
+    }
+
+    /// Only a reason the broadcaster can read makes a refusal a success: the
+    /// words with no reject code through `uaas`, or a gateway's 5xx carrying
+    /// them (CS-718), still fail, and the own change stays held.
+    #[tokio::test]
+    async fn an_already_known_refusal_that_cannot_be_read_still_fails() {
+        let (_s, broadcaster) = uaas_answering(
+            wiremock::ResponseTemplate::new(400).set_body_string("txn-already-known"),
+        )
+        .await;
+        let error = broadcaster.broadcast_tx(&sample_tx()).await.unwrap_err();
+        assert!(!broadcaster.reads_node_reason(&error), "{error}");
+
+        let (_s, broadcaster) = uaas_answering(
+            wiremock::ResponseTemplate::new(502).set_body_string("257: txn-already-known"),
+        )
+        .await;
+        let error = broadcaster.broadcast_tx(&sample_tx()).await.unwrap_err();
+        assert!(
+            matches!(error, BroadcastError::Indeterminate(_)),
+            "{error:?}"
+        );
     }
 
     // --- CS-718: what a failed HTTP broadcast says about delivery ---------

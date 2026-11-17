@@ -2112,7 +2112,7 @@ impl Service {
                 inputs_missing: e.inputs_missing(),
                 inputs_conflicted: e.inputs_conflicted(),
                 // A transaction that never left has no reason to read (CS-736).
-                reason_unread: e.was_sent() && !broadcaster.reads_node_reasons(),
+                reason_unread: e.was_sent() && !broadcaster.reads_node_reason(&e),
             });
         }
         log::info!(
@@ -2200,11 +2200,11 @@ pub struct FundingBroadcastError {
     pub error: CodedError,
     /// The node refused it because an input does not exist (CS-506).
     pub inputs_missing: bool,
-    /// The node refused it because an input is spent by another transaction
-    /// (CS-691).
+    /// The node refused it because an input is already spent: by another
+    /// transaction (CS-691), or by this one, which it already has.
     pub inputs_conflicted: bool,
     /// The broadcaster cannot read the node's reason for a refusal
-    /// ([`TxBroadcaster::reads_node_reasons`]), so it may have been a
+    /// ([`TxBroadcaster::reads_node_reason`]), so it may have been a
     /// conflict that nothing here can see.
     pub reason_unread: bool,
 }
