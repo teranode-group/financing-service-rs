@@ -387,7 +387,7 @@ The ten-minute window is backed by the chain itself, from chain-gang 0.11.5. Wha
 
 One window remains: the moment between a broadcast succeeding and the commit reaching disk. A process killed in that moment keeps the inputs reserved, but not the change the transaction created, until the chain lists it.
 
-**Deployments give it that long** (CS-739). `run.sh` passes `--stop-timeout 150` to `docker run`, or `FS_STOP_TIMEOUT`, so `docker stop` waits the grace out rather than killing the process after Docker's 10s. uls-rs's compose sets `stop_grace_period` from the timeouts it renders. Elsewhere set it yourself, at least `fund_worst_case_seconds` plus 5s. A rolling deploy can therefore take up to that long per instance.
+**Deployments give it that long** (CS-739). `run.sh` passes `--stop-timeout 160` to `docker run`, or `FS_STOP_TIMEOUT`, so `docker stop` waits the grace out rather than killing the process after Docker's 10s. uls-rs's compose sets `stop_grace_period` from the timeouts it renders. Elsewhere set it yourself, at least `fund_worst_case_seconds` plus 5s. A rolling deploy can therefore take up to that long per instance.
 
 ### How often the service reads the chain
 
@@ -443,7 +443,7 @@ The right values depend on what your clients fund. Event, for example, asks for 
 
 Event's UTXO cache (teranode-event-rs, CS-493) can hold funding outpoints for its client ahead of need, so that a write needs no `POST /fund` of its own. It is off unless the Event operator sets `[utxo_cache] enabled`. Nothing in FS's configuration turns it on or off, but three settings here have to be sized for it. Event's side is in its own `docs/RUNNING.md`, under "The UTXO cache".
 
-**What Event reads, and what it refuses without.** The cache reads `dust_threshold` and `fee_satoshis_per_kb` from [`GET /client/{client_id}/balance`](SupportedEndpoints.md#client-balance) (CS-684) every `dust_refresh_seconds`, 60 by default: one balance read a minute per Event instance. It decides with them which outpoint fits a write and whether a consolidation is worth broadcasting. **With the cache on, Event will not start against an FS whose balance answer lacks either field**: any FS without CS-684, which is still unreleased after 6.1.0. The release that ships it is the first an Event with its cache on can use.
+**What Event reads, and what it refuses without.** The cache reads `dust_threshold` and `fee_satoshis_per_kb` from [`GET /client/{client_id}/balance`](SupportedEndpoints.md#client-balance) (CS-684) every `dust_refresh_seconds`, 60 by default: one balance read a minute per Event instance. It decides with them which outpoint fits a write and whether a consolidation is worth broadcasting. **With the cache on, Event will not start against an FS whose balance answer lacks either field**: any FS before 6.2.0, the first release with CS-684 and so the first an Event with its cache on can use.
 
 **How it asks.** A preallocation is **one `POST /fund` of up to Event's `max_batch` outpoints** (default 200, at most FS's 1000). Each outpoint has its own script in `locking_scripts`, all in one transaction, with a random `idempotency_key`. Each outpoint is worth the top of a band one `dust_threshold` wide: `(⌊R ÷ D⌋ + 1) × D − 1`, where R is what one write needs and D is `dust_threshold`. That is at most R + D − 1, so with writes of a few hundred satoshis at the default 100 sat/KB, about 300 each. A write the cache cannot fund is funded by its own one-outpoint `POST /fund`, as without the cache.
 
