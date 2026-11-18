@@ -420,6 +420,8 @@ curl -H "Authorization: Bearer your-client-api-key" \
 {
     "confirmed": 99904,
     "unconfirmed": 95162,
+    "in_flight": 0,
+    "uncertain": 0,
     "max_fundable": 98904,
     "dust_threshold": 38,
     "fee_satoshis_per_kb": 100
@@ -431,6 +433,8 @@ curl -H "Authorization: Bearer your-client-api-key" \
 If such a parent never makes it — a conflict, an eviction or a reorg drops it — the node refuses the next spend of its change as missing inputs. That request fails (`broadcast_failed` or `broadcast_rejected`, as the upstream judged it retryable or not), and the service forgets the change (and any change built on it) instead of offering it again, so the request after it funds from another input (CS-506).
 
 Both figures are **derived from the unspent set**, not asked for separately. A separate balance query can disagree with the UTXOs it is meant to describe — WhatsOnChain's `/address/{address}/balance` is deprecated and was reporting `unconfirmed: 0` for addresses whose unspent set plainly held unconfirmed outputs — and when they disagree, the unspent set is the one that decides what can be funded. Deriving means `confirmed`, `unconfirmed` and `max_fundable` always describe the same set of coins, and that the balance reflects a funding transaction the moment it spends from them rather than at the next refresh.
+
+`in_flight` and `uncertain` are **change that pending fundings bring back, reported beside the balance and not part of it** (CS-746). A funding takes its whole input out of `confirmed` and `unconfirmed` while its transaction is sent, so on their own they read low by every input in flight -- by half the wallet, under load, when one coin holds half of it. `in_flight` is the change of fundings still broadcasting, and settles within a broadcast. `uncertain` is the change of fundings whose outcome is unknown (`broadcast_outcome_unknown`), for as long as their inputs stay held -- up to ten minutes -- and goes to 0 once the chain lists the change, which then appears in `unconfirmed`, or the hold runs out and the input comes back. Neither can be funded from, since the transaction may not have created the change. Both are the least that comes back -- the change if the transaction lands, the whole input if it does not -- so `confirmed + unconfirmed + in_flight + uncertain` is what the wallet holds, and it does not dip under load. A funding whose change went to the fee adds nothing to either.
 
 `max_fundable` is **the most a single `POST /fund` can ask for right now**, assuming one standard P2PKH outpoint. Use it rather than deriving a figure from the balance.
 

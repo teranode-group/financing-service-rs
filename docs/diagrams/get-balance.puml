@@ -19,7 +19,7 @@ alt Failure case
 end
 
 FS -> FS: check_balance\n(client_id)
-FS --> A: response\n{confirmed, unconfirmed, max_fundable}
+FS --> A: response\n{confirmed, unconfirmed, in_flight, uncertain,\nmax_fundable, dust_threshold, fee_satoshis_per_kb}
 deactivate FS
 ...
 

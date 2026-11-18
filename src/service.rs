@@ -18,7 +18,7 @@ use crate::{
     address_watcher::AddressWatcher,
     blockchain_factory::{blockchain_factory, Backend},
     broadcaster::{factory::broadcaster_factory, BroadcastError, TxBroadcaster, MAPI_LITE},
-    client::{Client, FundRequest, FundingSpendPlan, InflightState},
+    client::{BalanceReport, Client, FundRequest, FundingSpendPlan, InflightState},
     config::{ClientConfig, Config},
     dynamic_config::DynamicConfig,
     idempotency::{IdempotencyStore, RecordKey},
@@ -121,7 +121,7 @@ pub struct PreparedFunding {
 /// [`Service::get_balance_and_max_fundable`]).
 #[derive(Debug, Clone)]
 pub struct BalanceFigures {
-    pub balance: Balance,
+    pub balance: BalanceReport,
     pub max_fundable: i64,
     pub dust_threshold: i64,
     pub fee_satoshis_per_kb: u64,
@@ -1614,11 +1614,15 @@ impl Service {
         let mut samples = Vec::with_capacity(handles.len());
         for (client_id, client) in handles {
             let client = client.read().await;
-            let balance = client.get_balance();
+            // The same call `GET /balance` makes, so the two cannot disagree
+            // about the same state (CS-746).
+            let report = client.balance_report();
             samples.push(crate::metrics::ClientSample {
                 client_id,
-                confirmed: balance.confirmed,
-                unconfirmed: balance.unconfirmed,
+                confirmed: report.balance.confirmed,
+                unconfirmed: report.balance.unconfirmed,
+                in_flight: report.in_flight,
+                uncertain: report.uncertain,
                 chain_read_at: client
                     .chain_read_age()
                     .and_then(|age| Instant::now().checked_sub(age)),
@@ -1678,7 +1682,7 @@ impl Service {
         let client = self.client_handle(client_id).await?;
         let client = client.read().await;
         Some(BalanceFigures {
-            balance: client.get_balance(),
+            balance: client.balance_report(),
             max_fundable: client.max_fundable_p2pkh(),
             dust_threshold: client.dust_threshold(),
             fee_satoshis_per_kb: client.fee_satoshis_per_kb(),
@@ -1693,6 +1697,17 @@ impl Service {
                 .await
                 .get_address(),
         )
+    }
+
+    /// Run `f` on a client under its write lock, so a test outside this module
+    /// can put it in a given state.
+    #[cfg(test)]
+    pub async fn with_client<R>(
+        &self,
+        client_id: &str,
+        f: impl FnOnce(&mut Client) -> R,
+    ) -> Option<R> {
+        Some(f(&mut *self.client_handle(client_id).await?.write().await))
     }
 
     #[cfg(test)]

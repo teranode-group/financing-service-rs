@@ -801,8 +801,10 @@ pub async fn balance(
 
     match data.service.get_balance_and_max_fundable(&client_id).await {
         Some(figures) => json_ok(&BalanceResponse {
-            confirmed: figures.balance.confirmed,
-            unconfirmed: figures.balance.unconfirmed,
+            confirmed: figures.balance.balance.confirmed,
+            unconfirmed: figures.balance.balance.unconfirmed,
+            in_flight: figures.balance.in_flight,
+            uncertain: figures.balance.uncertain,
             max_fundable: figures.max_fundable,
             dust_threshold: figures.dust_threshold,
             fee_satoshis_per_kb: figures.fee_satoshis_per_kb,
@@ -3427,6 +3429,26 @@ mod tests {
              max_fundable={max_fundable} confirmed={confirmed}"
         );
         assert!(max_fundable >= 0);
+    }
+
+    /// The change pending fundings bring back is reported beside the balance,
+    /// and with nothing pending it is nothing (CS-746). What it is under load
+    /// is `client::tests::cs_746_*` and `sr_tele_009_*`, against the figures
+    /// this endpoint maps.
+    #[actix_web::test]
+    async fn cs_746_balance_reports_in_flight_and_uncertain_change() {
+        let app = build_app().await;
+        let resp = test::call_service(
+            &app,
+            test::TestRequest::get()
+                .uri(&format!("/client/{TEST_CLIENT_ID}/balance"))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body: Value = test::read_body_json(resp).await;
+        assert_eq!(body["in_flight"].as_i64(), Some(0), "{body}");
+        assert_eq!(body["uncertain"].as_i64(), Some(0), "{body}");
     }
 
     /// And the number has to be usable, not decorative: funding exactly the
