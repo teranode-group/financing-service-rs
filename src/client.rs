@@ -56,6 +56,34 @@ fn outpoint_key(entry: &UtxoEntry) -> OutPointKey {
     (entry.tx_hash.clone(), entry.tx_pos)
 }
 
+/// Whether the change of an unknown outcome still stands for something the
+/// balance leaves out (CS-746), given every outpoint in the cache.
+///
+/// It settles one of three ways:
+/// - its change is in the cache: the chain listed it, so the transaction
+///   landed, and counting it here too would count it twice;
+/// - an input is back in the cache, listed and no longer reserved: the
+///   transaction did not land, and the input is counted instead;
+/// - the reservation window has passed, after which nothing is believed.
+///
+/// Until then it stands, including once its inputs are neither listed nor
+/// reserved. That is the transaction landing, and the read can stop listing
+/// the inputs a refresh before it lists the change -- the reverse of the
+/// partial view SR-FUND-033 describes -- so letting go there would leave
+/// neither in the balance for that refresh. The cost is a conflict: inputs
+/// spent by another transaction look the same, and its change, which will
+/// never be listed, is counted until the window passes. Only someone holding
+/// the key can cause that.
+fn uncertain_change_stands(
+    uncertain: &UncertainChange,
+    cached: &std::collections::HashSet<OutPointKey>,
+    now: Instant,
+) -> bool {
+    now.duration_since(uncertain.since) < UNCERTAIN_SPEND_RESERVATION
+        && !cached.contains(&outpoint_key(&uncertain.entry))
+        && !uncertain.inputs.iter().any(|key| cached.contains(key))
+}
+
 /// The balance an unspent set adds up to, split the way chain-gang defines it:
 /// a negative height means unconfirmed.
 ///
@@ -99,6 +127,42 @@ struct PendingChange {
 struct SpentChange {
     outpoints: Vec<OutPointKey>,
     since: Instant,
+}
+
+/// The change of a funding transaction whose outcome is unknown, and the
+/// inputs it spent (CS-746).
+///
+/// Only reported, never spent: the output exists only if the transaction
+/// landed, which is why [`Client::commit_uncertain_funding_spend`] keeps it out
+/// of the cache. Counted until the chain lists the change, an input is back in
+/// the cache, or the window passes: see [`uncertain_change_stands`].
+#[derive(Clone, Debug)]
+struct UncertainChange {
+    entry: UtxoEntry,
+    inputs: Vec<OutPointKey>,
+    since: Instant,
+}
+
+/// A client's balance, with what its pending fundings are certain to bring
+/// back (CS-746).
+///
+/// `balance` is what can be spent now, and what every funding decision is made
+/// from. A funding takes its whole input out of it while its transaction is
+/// sent, so on its own it reads low by every input in flight -- by half the
+/// wallet, when one coin holds half of it. `in_flight` and `uncertain` are the
+/// lower bound on what comes back: a transaction that lands returns its
+/// change, and one that does not returns its whole input, which is more.
+/// Summed, the four figures do not dip for fundings in flight or of unknown
+/// outcome. They do for inputs quarantined after a missing-input or conflict
+/// refusal (CS-720), which are in none of them until the quarantine ends.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct BalanceReport {
+    pub balance: Balance,
+    /// Change of fundings still broadcasting. Settles within a broadcast.
+    pub in_flight: i64,
+    /// Change of fundings whose outcome is unknown, until the chain lists it
+    /// or their inputs come back -- up to [`UNCERTAIN_SPEND_RESERVATION`].
+    pub uncertain: i64,
 }
 
 /// A reservation, in a form that survives a restart (CS-465).
@@ -146,6 +210,21 @@ pub struct PersistedPendingChange {
     pub since_unix: u64,
 }
 
+/// The change of a transaction whose outcome is unknown, in a form that
+/// survives a restart (CS-746).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PersistedUncertainChange {
+    /// The transaction whose outcome is unknown.
+    pub txid: String,
+    pub tx_hash: String,
+    pub tx_pos: u32,
+    pub value: i64,
+    pub height: i32,
+    /// The inputs it spent, which are reserved as long as it is counted.
+    pub inputs: Vec<PersistedOutpoint>,
+    pub since_unix: u64,
+}
+
 /// What a client has broadcast that the chain may not have caught up with:
 /// the inputs its transactions spent and the change they created.
 ///
@@ -166,6 +245,9 @@ pub struct InflightState {
     pub handed_out: Vec<PersistedHandedOut>,
     #[serde(default)]
     pub spent_change: Vec<PersistedSpentChange>,
+    /// Absent from a file an earlier version wrote, so read as empty.
+    #[serde(default)]
+    pub uncertain_change: Vec<PersistedUncertainChange>,
 }
 
 impl InflightState {
@@ -174,6 +256,7 @@ impl InflightState {
             && self.pending_change.is_empty()
             && self.handed_out.is_empty()
             && self.spent_change.is_empty()
+            && self.uncertain_change.is_empty()
     }
 }
 
@@ -357,6 +440,14 @@ pub struct Client {
     /// instead when the chain lists an output of the spending transaction or
     /// of anything built on it, which it cannot do without having seen it.
     spent_change: HashMap<String, SpentChange>,
+    /// The change of each funding whose outcome is unknown, by txid (CS-746).
+    ///
+    /// Kept apart from `in_flight_change` because the two mean different
+    /// things to a caller: a request refused behind a broadcast only has to
+    /// wait a moment, one refused behind an unknown outcome may wait the whole
+    /// reservation window, so [`Self::funding_balance_error`] counts only the
+    /// first (CS-475). Both count towards [`Self::balance_report`].
+    uncertain_change: HashMap<String, UncertainChange>,
 }
 
 /// Why a key whose WIF says `key` cannot be a wallet on `network`
@@ -413,6 +504,7 @@ impl Client {
             handed_out: HashMap::new(),
             in_flight_change: HashMap::new(),
             spent_change: HashMap::new(),
+            uncertain_change: HashMap::new(),
             fee_satoshis_per_kb: DEFAULT_SATOSHIS_PER_KB,
         })
     }
@@ -522,6 +614,34 @@ impl Client {
         }
         self.restore_pending_change();
         self.unspent.sort_by_key(|x| x.value);
+        self.forget_settled_uncertain_change(now);
+    }
+
+    /// Every outpoint in the cache, for [`uncertain_change_stands`].
+    fn cached_outpoints(&self) -> std::collections::HashSet<OutPointKey> {
+        self.unspent.iter().map(outpoint_key).collect()
+    }
+
+    /// Let go of the change of unknown outcomes that has settled (CS-746).
+    /// Run once the refresh has rebuilt the cache, which is what
+    /// [`uncertain_change_stands`] judges by.
+    fn forget_settled_uncertain_change(&mut self, now: Instant) {
+        if self.uncertain_change.is_empty() {
+            return;
+        }
+        let cached = self.cached_outpoints();
+        self.uncertain_change
+            .retain(|_, uncertain| uncertain_change_stands(uncertain, &cached, now));
+    }
+
+    /// The change of claims still broadcasting, as long as a claim can be
+    /// believed to settle: one never settled -- its request dropped
+    /// mid-flight -- stops counting when its reservation would have expired.
+    fn unexpired_in_flight_change(&self, now: Instant) -> impl Iterator<Item = &UtxoEntry> {
+        self.in_flight_change
+            .values()
+            .filter(move |claim| now.duration_since(claim.since) < UNCERTAIN_SPEND_RESERVATION)
+            .map(|claim| &claim.entry)
     }
 
     /// Forget change that has been pending too long to still be believed.
@@ -700,11 +820,40 @@ impl Client {
             .collect();
         spent_change.sort_by(|a, b| a.txid.cmp(&b.txid));
 
+        // Kept so a restart does not put back the reserved inputs of an
+        // unknown outcome with nothing counted for them (CS-746).
+        let mut uncertain_change: Vec<PersistedUncertainChange> = self
+            .uncertain_change
+            .iter()
+            .map(|(txid, uncertain)| {
+                let mut inputs: Vec<PersistedOutpoint> = uncertain
+                    .inputs
+                    .iter()
+                    .map(|(tx_hash, tx_pos)| PersistedOutpoint {
+                        tx_hash: tx_hash.clone(),
+                        tx_pos: *tx_pos,
+                    })
+                    .collect();
+                inputs.sort_by(|a, b| (&a.tx_hash, a.tx_pos).cmp(&(&b.tx_hash, b.tx_pos)));
+                PersistedUncertainChange {
+                    txid: txid.clone(),
+                    tx_hash: uncertain.entry.tx_hash.clone(),
+                    tx_pos: uncertain.entry.tx_pos,
+                    value: uncertain.entry.value,
+                    height: uncertain.entry.height,
+                    inputs,
+                    since_unix: to_unix(uncertain.since, now, now_unix),
+                }
+            })
+            .collect();
+        uncertain_change.sort_by(|a, b| a.txid.cmp(&b.txid));
+
         InflightState {
             reserved,
             pending_change,
             handed_out,
             spent_change,
+            uncertain_change,
         }
     }
 
@@ -750,6 +899,29 @@ impl Client {
                     .collect();
                 self.spent_change
                     .insert(spent.txid, SpentChange { outpoints, since });
+            }
+        }
+        for uncertain in state.uncertain_change {
+            if let Some(since) = from_unix(uncertain.since_unix, now, now_unix) {
+                let entry = UtxoEntry {
+                    height: uncertain.height,
+                    tx_pos: uncertain.tx_pos,
+                    tx_hash: uncertain.tx_hash,
+                    value: uncertain.value,
+                };
+                let inputs = uncertain
+                    .inputs
+                    .into_iter()
+                    .map(|outpoint| (outpoint.tx_hash, outpoint.tx_pos))
+                    .collect();
+                self.uncertain_change.insert(
+                    uncertain.txid,
+                    UncertainChange {
+                        entry,
+                        inputs,
+                        since,
+                    },
+                );
             }
         }
     }
@@ -852,6 +1024,37 @@ impl Client {
     /// broadcast is already out of `unspent`, so it is out of this too.
     pub fn get_balance(&self) -> Balance {
         balance_from_unspent(&self.unspent)
+    }
+
+    /// The balance, with the change pending fundings will bring back
+    /// (CS-746). What `GET /balance` and the `fs_client_balance` gauge both
+    /// report, read in one call so the figures belong to the same state.
+    ///
+    /// The balance is unchanged by this: the change is reported beside it,
+    /// never spent, since a transaction still in flight or of unknown outcome
+    /// may not have created it.
+    pub fn balance_report(&self) -> BalanceReport {
+        let now = Instant::now();
+        let in_flight = self
+            .unexpired_in_flight_change(now)
+            .map(|entry| entry.value)
+            .sum();
+        // The same test the refresh prunes by, so the two cannot disagree.
+        let uncertain = if self.uncertain_change.is_empty() {
+            0
+        } else {
+            let cached = self.cached_outpoints();
+            self.uncertain_change
+                .values()
+                .filter(|uncertain| uncertain_change_stands(uncertain, &cached, now))
+                .map(|uncertain| uncertain.entry.value)
+                .sum()
+        };
+        BalanceReport {
+            balance: self.get_balance(),
+            in_flight,
+            uncertain,
+        }
     }
 
     /// The confirmed UTXO with the lowest height in this wallet, as the chain
@@ -1255,12 +1458,9 @@ impl Client {
     pub fn funding_balance_error(&self, fund_request: &FundRequest) -> Option<CodedError> {
         let error = self.funding_balance_error_now(fund_request)?;
 
-        let now = Instant::now();
         let returning: Vec<UtxoEntry> = self
-            .in_flight_change
-            .values()
-            .filter(|claim| now.duration_since(claim.since) < UNCERTAIN_SPEND_RESERVATION)
-            .map(|claim| claim.entry.clone())
+            .unexpired_in_flight_change(Instant::now())
+            .cloned()
             .collect();
         if returning.is_empty() {
             return Some(error);
@@ -1778,6 +1978,12 @@ impl Client {
             self.pending_change.remove(&key);
             self.reserved.remove(&key);
             self.unspent.retain(|utxo| outpoint_key(utxo) != key);
+            // A transaction of unknown outcome that spent it cannot exist
+            // either, so neither can its change (CS-746). Its inputs are now
+            // neither listed nor reserved, which would otherwise read as the
+            // transaction having landed.
+            self.uncertain_change
+                .retain(|_, uncertain| !uncertain.inputs.contains(&key));
             log::warn!(
                 "forgetting own change {}:{}: the node refused a spend of it as missing inputs, \
                  so the transaction that created it is not on the network",
@@ -1834,6 +2040,19 @@ impl Client {
         self.forget_expired_handed_out();
         self.record_spent_change(&plan.txid, &plan.spent_outpoints, now);
         self.handed_out.insert(plan.txid.clone(), now);
+        // Reported beside the balance until the chain lists it or the inputs
+        // are let go (CS-746): the inputs are withheld either way, and this
+        // is the least that comes back for them.
+        if let Some(change) = &plan.change_entry {
+            self.uncertain_change.insert(
+                plan.txid.clone(),
+                UncertainChange {
+                    entry: change.clone(),
+                    inputs: plan.spent_outpoints.iter().map(outpoint_key).collect(),
+                    since: now,
+                },
+            );
+        }
         for entry in plan.spent_outpoints {
             log::warn!(
                 "reserving outpoint {}:{} for up to {}s: its funding transaction was handed to \
@@ -3057,6 +3276,227 @@ mod tests {
         };
         let refused = client.funding_balance_error(&request).expect("refused");
         assert_eq!(refused.code, ErrorCode::FundsInFlight, "{refused:?}");
+    }
+
+    // ---- CS-746: what pending fundings bring back, beside the balance ----
+
+    fn change_of(plan: &FundingSpendPlan) -> i64 {
+        plan.change_entry.as_ref().expect("a change output").value
+    }
+
+    fn spendable(report: &BalanceReport) -> i64 {
+        report.balance.confirmed + report.balance.unconfirmed
+    }
+
+    fn held(report: &BalanceReport) -> i64 {
+        spendable(report) + report.in_flight + report.uncertain
+    }
+
+    /// The ticket's case. A claim takes its whole input out of the balance;
+    /// its change is reported beside it until the commit puts the change in
+    /// the cache, and at no point is the sum below what the wallet holds once
+    /// it settles.
+    #[test]
+    fn cs_746_a_claim_s_change_is_in_flight_until_it_is_committed() {
+        let mut client = client_holding_at_rate(vec![cs_422_utxo(1, 0, 5_000)], 100);
+        let plan = claim_one(&mut client, 10);
+        let change = change_of(&plan);
+
+        let during = client.balance_report();
+        assert_eq!(spendable(&during), 0, "the whole input is claimed");
+        assert_eq!(during.in_flight, change);
+        assert_eq!(during.uncertain, 0);
+
+        client.commit_funding_spend(plan).expect("commits");
+        let after = client.balance_report();
+        assert_eq!(after.in_flight, 0);
+        assert_eq!(after.balance.unconfirmed, change, "the change is spendable");
+        assert!(held(&during) >= held(&after), "{during:?} vs {after:?}");
+    }
+
+    /// A plain refusal gives the input back at once, and nothing is left in
+    /// flight.
+    #[test]
+    fn cs_746_a_refused_claim_returns_its_input_and_nothing_is_in_flight() {
+        let mut client = client_holding_at_rate(vec![cs_422_utxo(1, 0, 5_000)], 100);
+        let plan = claim_one(&mut client, 10);
+        client.release_claim(&plan, false);
+        let report = client.balance_report();
+        assert_eq!(report.in_flight, 0);
+        assert_eq!(spendable(&report), 5_000);
+    }
+
+    /// A conflict leaves nothing in flight, and the input is not counted
+    /// while it is quarantined: it was spent elsewhere, or is not trusted
+    /// (CS-720).
+    #[test]
+    fn cs_746_a_conflicted_input_is_neither_spendable_nor_in_flight() {
+        let mut client = client_holding_at_rate(vec![cs_422_utxo(1, 0, 5_000)], 100);
+        let plan = claim_one(&mut client, 10);
+        client.release_claim(&plan, true);
+        client.quarantine_refused_inputs(&plan, true);
+        let report = client.balance_report();
+        assert_eq!(report.in_flight, 0);
+        assert_eq!(report.uncertain, 0);
+        assert_eq!(spendable(&report), 0);
+    }
+
+    /// An unknown outcome moves the change from in flight to uncertain, and
+    /// there it stays while the chain has not caught up -- here, an index
+    /// still listing the input and not the change.
+    #[test]
+    fn cs_746_an_unknown_outcome_s_change_is_uncertain() {
+        let listed = vec![cs_422_utxo(1, 0, 5_000)];
+        let mut client = client_holding_at_rate(listed.clone(), 100);
+        let plan = claim_one(&mut client, 10);
+        let change = change_of(&plan);
+        client.commit_uncertain_funding_spend(plan);
+
+        let report = client.balance_report();
+        assert_eq!(report.in_flight, 0);
+        assert_eq!(report.uncertain, change);
+        assert_eq!(spendable(&report), 0, "the change is not spendable");
+
+        client.apply_chain_state(listed);
+        let lagging = client.balance_report();
+        assert_eq!(lagging.uncertain, change, "{lagging:?}");
+        assert_eq!(spendable(&lagging), 0, "the input is still held");
+    }
+
+    /// Once the chain lists the change, it is in the cache and no longer
+    /// uncertain -- counted once, not in both. Here the index has seen the
+    /// change but still lists the input too, so the input stays reserved and
+    /// only the listing says the change is no longer uncertain.
+    #[test]
+    fn cs_746_uncertain_change_the_chain_lists_is_counted_once() {
+        let input = cs_422_utxo(1, 0, 5_000);
+        let mut client = client_holding_at_rate(vec![input.clone()], 100);
+        let plan = claim_one(&mut client, 10);
+        let change_entry = plan.change_entry.clone().expect("a change output");
+        client.commit_uncertain_funding_spend(plan);
+
+        client.apply_chain_state(vec![input, change_entry.clone()]);
+        let report = client.balance_report();
+        assert_eq!(client.reserved_outpoint_count(), 1, "the input is held");
+        assert_eq!(report.uncertain, 0, "{report:?}");
+        assert_eq!(spendable(&report), change_entry.value);
+    }
+
+    /// The PR #183 review's case. The transaction landed, and the read has
+    /// stopped listing its input a refresh before it lists the change: the
+    /// input's reservation goes, and the change still counts, so neither is
+    /// missing from the sum for that refresh. Once the change is listed it is
+    /// counted there instead.
+    #[test]
+    fn cs_746_uncertain_change_counts_until_the_chain_lists_it() {
+        let mut client = client_holding_at_rate(vec![cs_422_utxo(1, 0, 5_000)], 100);
+        let plan = claim_one(&mut client, 10);
+        let change_entry = plan.change_entry.clone().expect("a change output");
+        client.commit_uncertain_funding_spend(plan);
+
+        client.apply_chain_state(Vec::new());
+        let between = client.balance_report();
+        assert_eq!(client.reserved_outpoint_count(), 0, "the input is spent");
+        assert_eq!(between.uncertain, change_entry.value, "{between:?}");
+
+        client.apply_chain_state(vec![change_entry.clone()]);
+        let listed = client.balance_report();
+        assert_eq!(listed.uncertain, 0, "{listed:?}");
+        assert_eq!(spendable(&listed), change_entry.value);
+        assert_eq!(held(&between), held(&listed));
+    }
+
+    /// An unknown outcome that spent the service's own change cannot exist
+    /// once that change is forgotten as never having been on the network
+    /// (CS-506), so neither can its change. Its input is then neither listed
+    /// nor reserved, which would otherwise read as the transaction landing.
+    #[test]
+    fn cs_746_uncertain_change_built_on_forgotten_own_change_goes_with_it() {
+        let mut client = client_holding_at_rate(vec![cs_422_utxo(1, 0, 5_000)], 100);
+        let first = claim_one(&mut client, 10);
+        client.commit_funding_spend(first).expect("commits");
+        let on_own_change = claim_one(&mut client, 10);
+        client.commit_uncertain_funding_spend(on_own_change.clone());
+        assert!(client.balance_report().uncertain > 0);
+
+        assert_eq!(client.forget_refused_own_change(&on_own_change), 1);
+        assert_eq!(client.balance_report().uncertain, 0);
+        assert!(client.uncertain_change.is_empty());
+    }
+
+    /// A transaction that never landed: once the reservation runs out, the
+    /// input is back in the cache and nothing is uncertain any more.
+    #[test]
+    fn cs_746_uncertain_change_goes_when_the_reservation_runs_out() {
+        let listed = vec![cs_422_utxo(1, 0, 5_000)];
+        let mut client = client_holding_at_rate(listed.clone(), 100);
+        let plan = claim_one(&mut client, 10);
+        client.commit_uncertain_funding_spend(plan);
+        client.backdate_reservations(UNCERTAIN_SPEND_RESERVATION + Duration::from_secs(1));
+
+        client.apply_chain_state(listed);
+        let report = client.balance_report();
+        assert_eq!(report.uncertain, 0, "{report:?}");
+        assert_eq!(spendable(&report), 5_000, "the input is spendable again");
+        assert!(client.uncertain_change.is_empty(), "and forgotten");
+    }
+
+    /// A restart keeps the uncertain change with the reservation it stands in
+    /// for, rather than putting the input back with nothing counted for it.
+    #[test]
+    fn cs_746_uncertain_change_survives_a_restart() {
+        let listed = vec![cs_422_utxo(1, 0, 5_000)];
+        let mut client = client_holding_at_rate(listed.clone(), 100);
+        let plan = claim_one(&mut client, 10);
+        let change = change_of(&plan);
+        client.commit_uncertain_funding_spend(plan);
+        let written = client.inflight_state();
+        assert_eq!(written.uncertain_change.len(), 1);
+
+        let mut restarted = client_holding_at_rate(Vec::new(), 100);
+        restarted.restore_inflight_state(written);
+        restarted.apply_chain_state(listed);
+        let report = restarted.balance_report();
+        assert_eq!(report.uncertain, change, "{report:?}");
+        assert_eq!(spendable(&report), 0, "the input is still held");
+    }
+
+    /// A plan whose change went to the fee brings nothing back if it lands,
+    /// so it adds nothing to either figure.
+    #[test]
+    fn cs_746_a_plan_with_no_change_adds_nothing() {
+        // 10 and the fee leave less of 60 than the 38 dust threshold
+        let mut client = client_holding_at_rate(vec![cs_422_utxo(1, 0, 60)], 100);
+        let plan = claim_one(&mut client, 10);
+        assert!(plan.change_entry.is_none(), "the change went to the fee");
+        assert_eq!(client.balance_report().in_flight, 0);
+        client.commit_uncertain_funding_spend(plan);
+        assert_eq!(client.balance_report().uncertain, 0);
+    }
+
+    /// Past the reservation window neither figure counts a claim: one never
+    /// settled, or an outcome never resolved, is no longer believed.
+    #[test]
+    fn cs_746_nothing_older_than_the_window_is_counted() {
+        let mut client = client_holding_at_rate(
+            vec![cs_422_utxo(1, 0, 5_000), cs_422_utxo(2, 0, 5_000)],
+            100,
+        );
+        claim_one(&mut client, 10);
+        let uncertain = claim_one(&mut client, 10);
+        client.commit_uncertain_funding_spend(uncertain);
+        let report = client.balance_report();
+        assert!(report.in_flight > 0 && report.uncertain > 0, "{report:?}");
+
+        let old = UNCERTAIN_SPEND_RESERVATION + Duration::from_secs(1);
+        for claim in client.in_flight_change.values_mut() {
+            claim.since -= old;
+        }
+        for uncertain in client.uncertain_change.values_mut() {
+            uncertain.since -= old;
+        }
+        let report = client.balance_report();
+        assert_eq!((report.in_flight, report.uncertain), (0, 0), "{report:?}");
     }
 
     // ---- CS-426: the same outpoint handed out more than once ----

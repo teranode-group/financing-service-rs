@@ -801,8 +801,10 @@ pub async fn balance(
 
     match data.service.get_balance_and_max_fundable(&client_id).await {
         Some(figures) => json_ok(&BalanceResponse {
-            confirmed: figures.balance.confirmed,
-            unconfirmed: figures.balance.unconfirmed,
+            confirmed: figures.report.balance.confirmed,
+            unconfirmed: figures.report.balance.unconfirmed,
+            in_flight: figures.report.in_flight,
+            uncertain: figures.report.uncertain,
             max_fundable: figures.max_fundable,
             dust_threshold: figures.dust_threshold,
             fee_satoshis_per_kb: figures.fee_satoshis_per_kb,
@@ -834,9 +836,10 @@ mod tests {
         },
         service::Service,
         test_support::{
-            test_blockchain_interface, test_config, test_config_with_keys,
-            unique_dynamic_config_path, CountingBlockchain, StubMapiBroadcaster,
-            LOCKING_SCRIPT_HEX, OTHER_TEST_WIF, TEST_ADDRESS, TEST_CLIENT_ID, TEST_WIF,
+            one_in_flight_and_one_uncertain, test_blockchain_interface, test_config,
+            test_config_with_keys, unique_dynamic_config_path, CountingBlockchain,
+            StubMapiBroadcaster, LOCKING_SCRIPT_HEX, OTHER_TEST_WIF, TEST_ADDRESS, TEST_CLIENT_ID,
+            TEST_WIF,
         },
     };
 
@@ -3427,6 +3430,60 @@ mod tests {
              max_fundable={max_fundable} confirmed={confirmed}"
         );
         assert!(max_fundable >= 0);
+    }
+
+    /// The change pending fundings bring back is reported beside the balance
+    /// (CS-746): nothing with nothing pending, and with one funding
+    /// broadcasting and one of unknown outcome, each figure in its own field.
+    /// The two changes differ, so a mapping that swapped them would fail.
+    #[actix_web::test]
+    async fn cs_746_balance_reports_in_flight_and_uncertain_change() {
+        let (app, service) =
+            build_app_with_service(test_config(&unique_dynamic_config_path())).await;
+        let get_balance = || {
+            test::TestRequest::get()
+                .uri(&format!("/client/{TEST_CLIENT_ID}/balance"))
+                .to_request()
+        };
+
+        let resp = test::call_service(&app, get_balance()).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body: Value = test::read_body_json(resp).await;
+        assert_eq!(body["in_flight"].as_i64(), Some(0), "{body}");
+        assert_eq!(body["uncertain"].as_i64(), Some(0), "{body}");
+
+        let pending = one_in_flight_and_one_uncertain(&service, TEST_CLIENT_ID).await;
+        let resp = test::call_service(&app, get_balance()).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body: Value = test::read_body_json(resp).await;
+        assert_eq!(
+            body["in_flight"].as_i64(),
+            Some(pending.in_flight),
+            "{body}"
+        );
+        assert_eq!(
+            body["uncertain"].as_i64(),
+            Some(pending.uncertain),
+            "{body}"
+        );
+        // The handler may refresh the chain state before answering, which
+        // changes the spendable figures: compare those with what it answered
+        // from.
+        let expected = service
+            .get_balance_and_max_fundable(TEST_CLIENT_ID)
+            .await
+            .unwrap()
+            .report;
+        assert_eq!(
+            body["confirmed"].as_i64(),
+            Some(expected.balance.confirmed),
+            "{body}"
+        );
+        assert_eq!(
+            body["unconfirmed"].as_i64(),
+            Some(expected.balance.unconfirmed),
+            "{body}"
+        );
     }
 
     /// And the number has to be usable, not decorative: funding exactly the

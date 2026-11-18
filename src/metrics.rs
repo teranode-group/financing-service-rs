@@ -198,6 +198,9 @@ pub struct ClientSample {
     pub client_id: String,
     pub confirmed: i64,
     pub unconfirmed: i64,
+    /// See [`crate::client::BalanceReport`] (CS-746).
+    pub in_flight: i64,
+    pub uncertain: i64,
     /// When the client's unspent set was last read from the chain -- the
     /// moment `GET /ready` measures against. Kept as a moment rather than an
     /// age so the gauge is current when it is exported, not when sampled.
@@ -232,7 +235,11 @@ pub fn register_gauges(meter: &Meter, samples: SharedSamples) -> Gauges {
         _client_balance: meter
             .i64_observable_gauge("fs_client_balance")
             .with_unit("sat")
-            .with_description("Each client's balance in satoshis, from the service's cache")
+            .with_description(
+                "Each client's balance in satoshis, from the service's cache: spendable \
+                 (confirmed, unconfirmed) and change pending fundings bring back (in_flight, \
+                 uncertain). Sum the kinds for what the wallet holds",
+            )
             .with_callback(move |observer| {
                 let Ok(samples) = balances.lock() else { return };
                 for client in &samples.clients {
@@ -243,8 +250,13 @@ pub fn register_gauges(meter: &Meter, samples: SharedSamples) -> Gauges {
                     );
                     observer.observe(
                         client.unconfirmed,
-                        &[id, KeyValue::new("kind", "unconfirmed")],
+                        &[id.clone(), KeyValue::new("kind", "unconfirmed")],
                     );
+                    observer.observe(
+                        client.in_flight,
+                        &[id.clone(), KeyValue::new("kind", "in_flight")],
+                    );
+                    observer.observe(client.uncertain, &[id, KeyValue::new("kind", "uncertain")]);
                 }
             })
             .build(),
@@ -438,8 +450,8 @@ mod tests {
             status,
         },
         test_support::{
-            test_blockchain_interface, test_config, unique_dynamic_config_path,
-            StubMapiBroadcaster, LOCKING_SCRIPT_HEX, TEST_CLIENT_ID,
+            one_in_flight_and_one_uncertain, test_blockchain_interface, test_config,
+            unique_dynamic_config_path, StubMapiBroadcaster, LOCKING_SCRIPT_HEX, TEST_CLIENT_ID,
         },
     };
 
@@ -663,6 +675,27 @@ mod tests {
         };
         assert_eq!(of("confirmed"), Some(expected.confirmed as f64));
         assert_eq!(of("unconfirmed"), Some(expected.unconfirmed as f64));
+        assert_eq!(of("in_flight"), Some(0.0));
+        assert_eq!(of("uncertain"), Some(0.0));
+
+        // One funding still broadcasting and one of unknown outcome: the
+        // gauge reports what `GET /balance` does for the same state (CS-746).
+        let figures = one_in_flight_and_one_uncertain(&service, TEST_CLIENT_ID).await;
+
+        sample(&service, &samples).await;
+        let (_, balances) = meter.points("fs_client_balance");
+        let of = |kind: &str| {
+            balances
+                .iter()
+                .find(|p| {
+                    p.attr("client_id") == Some(TEST_CLIENT_ID) && p.attr("kind") == Some(kind)
+                })
+                .map(|p| p.value)
+        };
+        assert_eq!(of("confirmed"), Some(figures.balance.confirmed as f64));
+        assert_eq!(of("unconfirmed"), Some(figures.balance.unconfirmed as f64));
+        assert_eq!(of("in_flight"), Some(figures.in_flight as f64));
+        assert_eq!(of("uncertain"), Some(figures.uncertain as f64));
 
         let (unit, ages) = meter.points("fs_client_chain_state_age");
         assert_eq!(unit, "s");

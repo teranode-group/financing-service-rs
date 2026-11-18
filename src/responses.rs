@@ -391,6 +391,19 @@ pub struct AddressResponse {
 pub struct BalanceResponse {
     pub confirmed: i64,
     pub unconfirmed: i64,
+    /// Change of fundings still being broadcast, which comes back once they
+    /// complete (CS-746). Not spendable yet, so not in `confirmed` or
+    /// `unconfirmed`: a funding takes its whole input out of those while it is
+    /// sent, and this is the least that returns for it.
+    pub in_flight: i64,
+    /// Change of fundings whose broadcast outcome is unknown, until the chain
+    /// lists it or their inputs come back -- up to ten minutes (CS-746). The
+    /// least that returns for them too: their change if they landed, their
+    /// whole inputs if not. `confirmed + unconfirmed + in_flight + uncertain`
+    /// does not dip for fundings in flight or of unknown outcome. It does for
+    /// inputs quarantined after a missing-input or conflict refusal (CS-720),
+    /// which are in none of the four until the quarantine ends.
+    pub uncertain: i64,
     /// The most a single `POST /fund` could ask for right now.
     ///
     /// Not `confirmed + unconfirmed`: fees come out of the same UTXOs, and

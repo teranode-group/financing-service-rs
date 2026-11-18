@@ -108,6 +108,59 @@ pub fn test_config_with_keys(
     }
 }
 
+/// Put `client_id` in the state CS-746 reports on: one funding still
+/// broadcasting and one of unknown outcome, from coins of different sizes so
+/// the two changes differ and a test can tell `in_flight` from `uncertain`.
+/// Returns what [`crate::service::Service::get_balance_and_max_fundable`]
+/// then reports.
+pub async fn one_in_flight_and_one_uncertain(
+    service: &crate::service::Service,
+    client_id: &str,
+) -> crate::client::BalanceReport {
+    let coins = [(1u8, 50_000), (2u8, 80_000)]
+        .into_iter()
+        .map(|(seed, value)| UtxoEntry {
+            height: 1,
+            tx_pos: 0,
+            tx_hash: format!("{seed:064x}"),
+            value,
+        })
+        .collect();
+    service
+        .set_test_chain_state(client_id, coins)
+        .await
+        .unwrap();
+    service
+        .with_client(client_id, |client| {
+            let request = crate::client::FundRequest {
+                client_id: client_id.to_string(),
+                satoshi: 1_000,
+                no_of_outpoints: 1,
+                multiple_tx: false,
+                locking_scripts: vec![hex::decode(LOCKING_SCRIPT_HEX).unwrap()],
+            };
+            // The smallest suitable coin first: 50 000 broadcasting, then
+            // 80 000 of unknown outcome.
+            let (_, broadcasting) = client.plan_funding_tx(&request).unwrap();
+            client.claim_inputs(&broadcasting);
+            let (_, unknown) = client.plan_funding_tx(&request).unwrap();
+            client.claim_inputs(&unknown);
+            client.commit_uncertain_funding_spend(unknown);
+        })
+        .await
+        .unwrap();
+    let report = service
+        .get_balance_and_max_fundable(client_id)
+        .await
+        .unwrap()
+        .report;
+    assert!(
+        report.in_flight > 0 && report.uncertain > 0 && report.in_flight != report.uncertain,
+        "{report:?}"
+    );
+    report
+}
+
 pub fn test_utxo() -> Vec<UtxoEntry> {
     vec![
         UtxoEntry {
