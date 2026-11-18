@@ -121,7 +121,7 @@ pub struct PreparedFunding {
 /// [`Service::get_balance_and_max_fundable`]).
 #[derive(Debug, Clone)]
 pub struct BalanceFigures {
-    pub balance: BalanceReport,
+    pub report: BalanceReport,
     pub max_fundable: i64,
     pub dust_threshold: i64,
     pub fee_satoshis_per_kb: u64,
@@ -1682,7 +1682,7 @@ impl Service {
         let client = self.client_handle(client_id).await?;
         let client = client.read().await;
         Some(BalanceFigures {
-            balance: client.balance_report(),
+            report: client.balance_report(),
             max_fundable: client.max_fundable_p2pkh(),
             dust_threshold: client.dust_threshold(),
             fee_satoshis_per_kb: client.fee_satoshis_per_kb(),

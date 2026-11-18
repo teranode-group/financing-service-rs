@@ -450,8 +450,8 @@ mod tests {
             status,
         },
         test_support::{
-            test_blockchain_interface, test_config, unique_dynamic_config_path,
-            StubMapiBroadcaster, LOCKING_SCRIPT_HEX, TEST_CLIENT_ID,
+            one_in_flight_and_one_uncertain, test_blockchain_interface, test_config,
+            unique_dynamic_config_path, StubMapiBroadcaster, LOCKING_SCRIPT_HEX, TEST_CLIENT_ID,
         },
     };
 
@@ -680,46 +680,7 @@ mod tests {
 
         // One funding still broadcasting and one of unknown outcome: the
         // gauge reports what `GET /balance` does for the same state (CS-746).
-        service
-            .set_test_chain_state(
-                TEST_CLIENT_ID,
-                (1..=2u8)
-                    .map(|seed| chain_gang::interface::UtxoEntry {
-                        height: 1,
-                        tx_pos: 0,
-                        tx_hash: format!("{seed:064x}"),
-                        value: 50_000,
-                    })
-                    .collect(),
-            )
-            .await
-            .unwrap();
-        service
-            .with_client(TEST_CLIENT_ID, |client| {
-                let request = crate::client::FundRequest {
-                    client_id: TEST_CLIENT_ID.to_string(),
-                    satoshi: 1_000,
-                    no_of_outpoints: 1,
-                    multiple_tx: false,
-                    locking_scripts: vec![hex::decode(LOCKING_SCRIPT_HEX).unwrap()],
-                };
-                let (_, broadcasting) = client.plan_funding_tx(&request).unwrap();
-                client.claim_inputs(&broadcasting);
-                let (_, unknown) = client.plan_funding_tx(&request).unwrap();
-                client.claim_inputs(&unknown);
-                client.commit_uncertain_funding_spend(unknown);
-            })
-            .await
-            .unwrap();
-        let figures = service
-            .get_balance_and_max_fundable(TEST_CLIENT_ID)
-            .await
-            .unwrap()
-            .balance;
-        assert!(
-            figures.in_flight > 0 && figures.uncertain > 0,
-            "{figures:?}"
-        );
+        let figures = one_in_flight_and_one_uncertain(&service, TEST_CLIENT_ID).await;
 
         sample(&service, &samples).await;
         let (_, balances) = meter.points("fs_client_balance");

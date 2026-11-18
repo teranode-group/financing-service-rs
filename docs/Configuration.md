@@ -348,7 +348,7 @@ The gauges are read from a snapshot a background task takes every 15 s while exp
 
 1. Not ready: `ready{check="overall"} == 0` for 2m.
 2. Outcome unknown, so funds may be spent without the caller knowing: `increase(fs_fund_requests_total{code="broadcast_outcome_unknown"}[5m]) > 0`. Across the stack, also Event's `increase(event_funding_outputs_stranded_total[5m]) > 0` and its `*outcome_unknown` outcomes.
-3. A client running dry: `sum by (client_id) (fs_client_balance_sat) < <threshold>` (per client; pick the threshold from its spend rate). Sum every `kind` (CS-746): `kind="confirmed"` alone falls during any steady load, both because a funding takes its whole input out while it is sent and because funding turns confirmed coins into unconfirmed change until the next block.
+3. A client running dry: `sum by (client_id) (fs_client_balance_sat) < <threshold>` (per client; pick the threshold from its spend rate). Sum every `kind` (CS-746): `kind="confirmed"` alone falls during any steady load, both because a funding takes its whole input out while it is sent and because funding turns confirmed coins into unconfirmed change until the next block. The sum still dips, for up to ten minutes, by an input held back after a missing-input or conflict refusal (CS-720), so require the condition for longer than that (e.g. `for: 15m`).
 4. mapi-lite (exported by mapi-lite): `mapi_nodes_live < <min_live_nodes>` or `mapi_block_ingest_lag > 3`.
 5. Errors or latency, for 5m: `sum(rate(http_requests_total{status_class="5xx"}[5m])) / sum(rate(http_requests_total[5m])) > 0.01`, or `histogram_quantile(0.95, sum by (le, route) (rate(http_request_duration_seconds_bucket[5m]))) > <target>`.
 
