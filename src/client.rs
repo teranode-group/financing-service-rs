@@ -64,7 +64,8 @@ fn outpoint_key(entry: &UtxoEntry) -> OutPointKey {
 ///   landed, and counting it here too would count it twice;
 /// - an input is back in the cache, listed and no longer reserved: the
 ///   transaction did not land, and the input is counted instead;
-/// - the reservation window has passed, after which nothing is believed.
+/// - the reservation window has passed and no input is still reserved, after
+///   which nothing is believed.
 ///
 /// Until then it stands, including once its inputs are neither listed nor
 /// reserved. That is the transaction landing, and the read can stop listing
@@ -74,12 +75,22 @@ fn outpoint_key(entry: &UtxoEntry) -> OutPointKey {
 /// spent by another transaction look the same, and its change, which will
 /// never be listed, is counted until the window passes. Only someone holding
 /// the key can cause that.
+///
+/// The window alone does not end it while an input is still reserved
+/// (CS-750). A reservation is released by the next refresh after it expires,
+/// not when it expires, so between the two the input is in neither the cache
+/// nor this figure: the sum fell by the whole input until that refresh.
 fn uncertain_change_stands(
     uncertain: &UncertainChange,
     cached: &std::collections::HashSet<OutPointKey>,
+    reserved: &HashMap<OutPointKey, Instant>,
     now: Instant,
 ) -> bool {
-    now.duration_since(uncertain.since) < UNCERTAIN_SPEND_RESERVATION
+    (now.duration_since(uncertain.since) < UNCERTAIN_SPEND_RESERVATION
+        || uncertain
+            .inputs
+            .iter()
+            .any(|key| reserved.contains_key(key)))
         && !cached.contains(&outpoint_key(&uncertain.entry))
         && !uncertain.inputs.iter().any(|key| cached.contains(key))
 }
@@ -630,17 +641,30 @@ impl Client {
             return;
         }
         let cached = self.cached_outpoints();
+        let reserved = &self.reserved;
         self.uncertain_change
-            .retain(|_, uncertain| uncertain_change_stands(uncertain, &cached, now));
+            .retain(|_, uncertain| uncertain_change_stands(uncertain, &cached, reserved, now));
     }
 
     /// The change of claims still broadcasting, as long as a claim can be
     /// believed to settle: one never settled -- its request dropped
     /// mid-flight -- stops counting when its reservation would have expired.
-    fn unexpired_in_flight_change(&self, now: Instant) -> impl Iterator<Item = &UtxoEntry> {
+    ///
+    /// Change already in `cached` is left out (CS-750). The node can accept a
+    /// transaction before the service hears that it did, and a refresh in
+    /// between lists its change (CS-691); counted here as well, it was counted
+    /// twice -- in the balance, and as change still to come.
+    fn unexpired_in_flight_change<'a>(
+        &'a self,
+        cached: &'a std::collections::HashSet<OutPointKey>,
+        now: Instant,
+    ) -> impl Iterator<Item = &'a UtxoEntry> {
         self.in_flight_change
             .values()
-            .filter(move |claim| now.duration_since(claim.since) < UNCERTAIN_SPEND_RESERVATION)
+            .filter(move |claim| {
+                now.duration_since(claim.since) < UNCERTAIN_SPEND_RESERVATION
+                    && !cached.contains(&outpoint_key(&claim.entry))
+            })
             .map(|claim| &claim.entry)
     }
 
@@ -1035,21 +1059,25 @@ impl Client {
     /// may not have created it.
     pub fn balance_report(&self) -> BalanceReport {
         let now = Instant::now();
+        if self.in_flight_change.is_empty() && self.uncertain_change.is_empty() {
+            return BalanceReport {
+                balance: self.get_balance(),
+                in_flight: 0,
+                uncertain: 0,
+            };
+        }
+        let cached = self.cached_outpoints();
         let in_flight = self
-            .unexpired_in_flight_change(now)
+            .unexpired_in_flight_change(&cached, now)
             .map(|entry| entry.value)
             .sum();
         // The same test the refresh prunes by, so the two cannot disagree.
-        let uncertain = if self.uncertain_change.is_empty() {
-            0
-        } else {
-            let cached = self.cached_outpoints();
-            self.uncertain_change
-                .values()
-                .filter(|uncertain| uncertain_change_stands(uncertain, &cached, now))
-                .map(|uncertain| uncertain.entry.value)
-                .sum()
-        };
+        let uncertain = self
+            .uncertain_change
+            .values()
+            .filter(|uncertain| uncertain_change_stands(uncertain, &cached, &self.reserved, now))
+            .map(|uncertain| uncertain.entry.value)
+            .sum();
         BalanceReport {
             balance: self.get_balance(),
             in_flight,
@@ -1458,8 +1486,11 @@ impl Client {
     pub fn funding_balance_error(&self, fund_request: &FundRequest) -> Option<CodedError> {
         let error = self.funding_balance_error_now(fund_request)?;
 
+        // Change a refresh already put in the cache is judged there, not
+        // again as change to come (CS-750).
+        let cached = self.cached_outpoints();
         let returning: Vec<UtxoEntry> = self
-            .unexpired_in_flight_change(Instant::now())
+            .unexpired_in_flight_change(&cached, Instant::now())
             .cloned()
             .collect();
         if returning.is_empty() {
@@ -3475,13 +3506,13 @@ mod tests {
     }
 
     /// Past the reservation window neither figure counts a claim: one never
-    /// settled, or an outcome never resolved, is no longer believed.
+    /// settled, or an outcome never resolved, is no longer believed. An
+    /// unknown outcome's change goes once the refresh after the window has
+    /// released its input, not before (CS-750).
     #[test]
     fn cs_746_nothing_older_than_the_window_is_counted() {
-        let mut client = client_holding_at_rate(
-            vec![cs_422_utxo(1, 0, 5_000), cs_422_utxo(2, 0, 5_000)],
-            100,
-        );
+        let listed = vec![cs_422_utxo(1, 0, 5_000), cs_422_utxo(2, 0, 5_000)];
+        let mut client = client_holding_at_rate(listed.clone(), 100);
         claim_one(&mut client, 10);
         let uncertain = claim_one(&mut client, 10);
         client.commit_uncertain_funding_spend(uncertain);
@@ -3495,8 +3526,88 @@ mod tests {
         for uncertain in client.uncertain_change.values_mut() {
             uncertain.since -= old;
         }
+        client.backdate_reservations(old);
+        client.apply_chain_state(listed);
         let report = client.balance_report();
         assert_eq!((report.in_flight, report.uncertain), (0, 0), "{report:?}");
+    }
+
+    // ---- CS-750: the two short glitches the CS-746 evidence run found ----
+
+    /// The evidence run at 826 s. An unknown outcome that never landed passes
+    /// its window, but no refresh has run since, so its input is still
+    /// reserved and out of the cache: the change still counts, and the sum
+    /// does not drop by the input. The next refresh releases the reservation,
+    /// the input is spendable again, and only then does the change stop
+    /// counting.
+    #[test]
+    fn cs_750_uncertain_change_counts_until_the_refresh_returns_its_input() {
+        let listed = vec![cs_422_utxo(1, 0, 5_000)];
+        let mut client = client_holding_at_rate(listed.clone(), 100);
+        let plan = claim_one(&mut client, 10);
+        let change = change_of(&plan);
+        client.commit_uncertain_funding_spend(plan);
+
+        let old = UNCERTAIN_SPEND_RESERVATION + Duration::from_secs(1);
+        client.backdate_reservations(old);
+        for uncertain in client.uncertain_change.values_mut() {
+            uncertain.since -= old;
+        }
+        let lapsed = client.balance_report();
+        assert_eq!(client.reserved_outpoint_count(), 1, "no refresh yet");
+        assert_eq!(lapsed.uncertain, change, "{lapsed:?}");
+        assert_eq!(spendable(&lapsed), 0);
+
+        client.apply_chain_state(listed);
+        let returned = client.balance_report();
+        assert_eq!(returned.uncertain, 0, "{returned:?}");
+        assert_eq!(spendable(&returned), 5_000, "the input is back");
+        assert!(client.uncertain_change.is_empty(), "and forgotten");
+        assert!(
+            held(&lapsed) <= held(&returned),
+            "{lapsed:?} vs {returned:?}"
+        );
+    }
+
+    /// The evidence run at 191.6 s. The node accepts a claim's transaction
+    /// before the service hears that it did, and a refresh in between lists
+    /// its change (CS-691). The change is then in the balance, so it is no
+    /// longer counted as in flight too: the sum counts it once.
+    #[test]
+    fn cs_750_in_flight_change_the_chain_lists_is_counted_once() {
+        let input = cs_422_utxo(1, 0, 5_000);
+        let mut client = client_holding_at_rate(vec![input.clone()], 100);
+        let plan = claim_one(&mut client, 10);
+        let change_entry = plan.change_entry.clone().expect("a change output");
+        let during = client.balance_report();
+        assert_eq!(during.in_flight, change_entry.value);
+
+        client.apply_chain_state(vec![input, change_entry.clone()]);
+        let listed = client.balance_report();
+        assert_eq!(listed.in_flight, 0, "{listed:?}");
+        assert_eq!(spendable(&listed), change_entry.value);
+        assert_eq!(held(&listed), held(&during), "counted once");
+    }
+
+    /// The same double count, where it decides an answer. A request the
+    /// listed change cannot cover was told its funds were in flight, because
+    /// that change was added to the cache a second time as change still to
+    /// come; the wallet is short, and says so.
+    #[test]
+    fn cs_750_change_already_listed_does_not_lift_a_refusal_twice() {
+        let input = cs_422_utxo(1, 0, 5_000);
+        let mut client = client_holding_at_rate(vec![input.clone()], 100);
+        let plan = claim_one(&mut client, 10);
+        let change_entry = plan.change_entry.clone().expect("a change output");
+        client.apply_chain_state(vec![input, change_entry.clone()]);
+
+        // More than the listed change can pay, less than twice it.
+        let asked = (change_entry.value + 500) as u64;
+        assert!((asked as i64) < 2 * change_entry.value);
+        let refused = client
+            .funding_balance_error(&cs_422_request(asked))
+            .expect("refused");
+        assert_eq!(refused.code, ErrorCode::InsufficientBalance, "{refused:?}");
     }
 
     // ---- CS-426: the same outpoint handed out more than once ----
