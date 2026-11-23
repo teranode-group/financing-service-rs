@@ -394,10 +394,12 @@ pub struct BalanceResponse {
     /// Change of fundings still being broadcast, which comes back once they
     /// complete (CS-746). Not spendable yet, so not in `confirmed` or
     /// `unconfirmed`: a funding takes its whole input out of those while it is
-    /// sent, and this is the least that returns for it.
+    /// sent, and this is the least that returns for it. Change the chain has
+    /// already listed is in `unconfirmed` instead, never in both (CS-750).
     pub in_flight: i64,
     /// Change of fundings whose broadcast outcome is unknown, until the chain
-    /// lists it or their inputs come back -- up to ten minutes (CS-746). The
+    /// lists it or their inputs come back -- up to ten minutes, and past them
+    /// until the refresh that gives the inputs back (CS-746, CS-750). The
     /// least that returns for them too: their change if they landed, their
     /// whole inputs if not. `confirmed + unconfirmed + in_flight + uncertain`
     /// does not dip for fundings in flight or of unknown outcome. It does for
